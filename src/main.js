@@ -243,7 +243,11 @@ function isPubmedFeed(feed) {
 function clampPubmedLimit(limit) {
   const parsed = parseInt(limit, 10);
   if (!Number.isFinite(parsed)) return 15;
-  return Math.min(200, Math.max(5, parsed));
+  const allowed = [5, 10, 15, 20, 50, 100];
+  if (allowed.includes(parsed)) return parsed;
+  return allowed.reduce((closest, candidate) =>
+    Math.abs(candidate - parsed) < Math.abs(closest - parsed) ? candidate : closest
+  , 15);
 }
 
 function parsePubmedFeedConfig(feed) {
@@ -251,10 +255,14 @@ function parsePubmedFeedConfig(feed) {
 
   let query = (feed.pubmed_query || '').trim();
   let limit = feed.pubmed_limit == null ? 15 : clampPubmedLimit(feed.pubmed_limit);
+  let queryRecoveredFromUrl = false;
 
   try {
     const parsedUrl = new URL(feed.url);
-    if (!query) query = (parsedUrl.searchParams.get('term') || '').trim();
+    if (!query) {
+      query = (parsedUrl.searchParams.get('term') || '').trim();
+      queryRecoveredFromUrl = !!query;
+    }
     if (feed.pubmed_limit == null) {
       const limitFromUrl = parsedUrl.searchParams.get('limit');
       if (limitFromUrl) limit = clampPubmedLimit(limitFromUrl);
@@ -268,6 +276,7 @@ function parsePubmedFeedConfig(feed) {
     limit,
     title: (feed.title || '').trim(),
     url: feed.url,
+    missingStoredQuery: !query && !queryRecoveredFromUrl,
   };
 }
 
@@ -4761,6 +4770,7 @@ function initPubmedGenerator() {
   const nameEl  = document.getElementById('pubmed-feedname');
   const titleEl = document.getElementById('pubmed-card-title');
   const subtitleEl = document.getElementById('pubmed-card-subtitle');
+  const legacyHintEl = document.getElementById('pubmed-query-legacy-hint');
   const previewLink    = document.getElementById('pubmed-preview-link');
   const idleEl   = document.getElementById('pubmed-actions-idle');
   const resultEl = document.getElementById('pubmed-result');
@@ -4777,6 +4787,7 @@ function initPubmedGenerator() {
   let state = 'idle';
   let generatedUrl = '';
   let editingFeedId = null;
+  let legacyQueryMissing = false;
 
   function generateButtonHtml() {
     const label = editingFeedId == null ? '生成 RSS 链接' : '重新生成 RSS 链接';
@@ -4795,6 +4806,15 @@ function initPubmedGenerator() {
   function updatePreview() {
     const full = buildFullQuery();
     previewLink.href = full ? `https://pubmed.ncbi.nlm.nih.gov/?term=${encodeURIComponent(full)}` : '#';
+  }
+
+  function syncLegacyQueryHint(config = null) {
+    if (config && typeof config.missingStoredQuery === 'boolean') {
+      legacyQueryMissing = config.missingStoredQuery;
+    }
+    if (!legacyHintEl) return;
+    const show = !!(editingFeedId != null && legacyQueryMissing && !queryEl.value.trim());
+    legacyHintEl.classList.toggle('hidden', !show);
   }
 
   function setLimitValue(limit) {
@@ -4827,10 +4847,12 @@ function initPubmedGenerator() {
     btnGenerate.disabled = false;
     resultActionsEl.style.display = 'none';
     syncModeUi();
+    syncLegacyQueryHint();
   }
 
   function exitEditMode({ clearForm = false } = {}) {
     editingFeedId = null;
+    legacyQueryMissing = false;
     if (clearForm) {
       queryEl.value = '';
       nameEl.value = '';
@@ -4853,6 +4875,7 @@ function initPubmedGenerator() {
     setLimitValue(config.limit);
     updatePreview();
     reset();
+    syncLegacyQueryHint(config);
 
     queryEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
     setTimeout(() => {
@@ -4866,7 +4889,11 @@ function initPubmedGenerator() {
     return clampPubmedLimit(limitEl.value);
   }
 
-  queryEl.addEventListener('input', () => { updatePreview(); if (state !== 'idle') reset(); });
+  queryEl.addEventListener('input', () => {
+    updatePreview();
+    syncLegacyQueryHint();
+    if (state !== 'idle') reset();
+  });
   limitEl.addEventListener('change', () => { if (state !== 'idle') reset(); });
   btnCancelEdit?.addEventListener('click', () => exitEditMode({ clearForm: true }));
 

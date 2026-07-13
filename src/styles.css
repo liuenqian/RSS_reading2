@@ -4171,6 +4171,17 @@ body.sidebar-collapsed .toolbar {
   gap: 3px;
 }
 
+.pubmed-legacy-hint {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(199,101,71,0.08);
+  border: 0.5px solid rgba(199,101,71,0.20);
+  color: var(--accent-deep);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
 .pubmed-result {
   display: flex;
   flex-direction: column;

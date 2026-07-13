@@ -20,6 +20,7 @@ use serde_json::Value;
 const PUBMED_BASE: &str = "https://pubmed.ncbi.nlm.nih.gov";
 const USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) RSSReading/0.1";
+const ALLOWED_PUBMED_RSS_LIMITS: &[u32] = &[5, 10, 15, 20, 50, 100];
 
 // Per-call client (cookie store must be fresh for each request so we
 // don't leak PubMed sessions between unrelated calls).
@@ -44,7 +45,7 @@ pub async fn build_rss_url(query: &str, limit: u32) -> Result<String, String> {
     if query.is_empty() {
         return Err("检索式不能为空".to_string());
     }
-    let limit = limit.clamp(5, 200);
+    let limit = normalize_pubmed_rss_limit(limit);
 
     let client = build_client()?;
     let search_url = format!(
@@ -113,6 +114,17 @@ pub async fn build_rss_url(query: &str, limit: u32) -> Result<String, String> {
         .ok_or_else(|| "PubMed 响应缺少 rss_feed_url 字段".to_string())?;
 
     enforce_limit_param(&rss_url, limit)
+}
+
+fn normalize_pubmed_rss_limit(limit: u32) -> u32 {
+    if ALLOWED_PUBMED_RSS_LIMITS.contains(&limit) {
+        return limit;
+    }
+    ALLOWED_PUBMED_RSS_LIMITS
+        .iter()
+        .copied()
+        .min_by_key(|candidate| candidate.abs_diff(limit))
+        .unwrap_or(15)
 }
 
 fn enforce_limit_param(url: &str, limit: u32) -> Result<String, String> {
