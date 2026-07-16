@@ -1,3 +1,7 @@
+import {
+  DEFAULT_TRANSLATION_CONCURRENCY,
+  runConcurrentQueue,
+} from './translation_queue.js';
 const { invoke } = window.__TAURI__.core;
 const markdownitFactory = globalThis.markdownit;
 const markdownitTaskLists = globalThis.markdownitTaskLists;
@@ -109,31 +113,44 @@ function decorateMarkdownHtml(html) {
 // ── DOM refs ──────────────────────────────────────
 let settingsView, mainView, contentArea;
 let btnSettings, btnSidebar, btnRefresh, refreshIcon, btnTogglePaperChatToolbar;
-let toolbarSubtitle;
-let apiKeyInput, baseUrlInput, modelInput, systemPromptInput;
+let toolbarSubtitle, toolbarApiTokenSelect;
+let providerSelect, apiKeyInput, baseUrlInput, modelInput, systemPromptInput;
 let btnToggleApiKey, btnTest, btnSaveSettings, btnSaveGeneral;
+let apiTokenProfileSelect, apiTokenProfileNameInput, btnNewApiToken, btnDeleteApiToken;
 let settingsStatus, generalStatus;
-let retentionSelect, themeControl, accentSwatches, fontscaleControl;
+let retentionSelect, themeControl, accentSwatches, fontscaleControl, titleDisplaySelect;
 let feedUrlInput, btnAddFeed, addFeedRow, addFeedIcon, feedListEl, globalStatusEl;
+let literatureSearchInput, btnClearLiteratureSearch, literatureSearchRow;
+let pubmedSearchListEl, pubmedBatchHeader, pubmedBatchMeta;
+let pubmedStatusFilter, pubmedSort, pubmedStarFilter, pubmedDateFilters, pubmedPublishedFrom, pubmedPublishedTo, pubmedAddedFrom, pubmedAddedTo;
+let pubmedProgressEl, pubmedProgressFill, pubmedProgressLabel, btnRunPubmedSearch, btnCancelPubmedRun;
+let pubmedExportFormat, btnExportPubmed;
+let pubmedSnapshotSelect, btnSavePubmedSnapshot, btnDeletePubmedSnapshot;
+let pubmedBulkStatus, btnPubmedAiScreen;
 let entryListEl, briefingListEl, briefingItemsEl;
 let entryItemsEl, entryFilter;
 let entryMetricIfFilter, entryMetricQFilter, entryMetricBFilter, entryMetricTopFilter, entryTagFilter;
-let entryBulkActions, entryBulkCount, btnEntrySelectMode, btnEntryBulkSelectAll, btnEntryBulkSelectUnnoted, btnEntryBulkSelectNoted, btnEntryBulkInvert, btnEntryBulkDeselect, entryBulkExistingMode, btnEntryBulkGenerate, btnEntryBulkClear;
+let entryMetricFilterSummaryCount;
+let entryBulkActions, entryBulkCount, btnEntrySelectMode, btnEntryBulkSelectAll, btnEntryBulkSelectUnnoted, btnEntryBulkSelectNoted, btnEntryBulkInvert, btnEntryBulkDeselect, entryBulkExportFormat, btnEntryBulkExport, entryBulkExistingMode, btnEntryBulkGenerate, btnEntryBulkClear;
 let detailPanelEl, paperChatPanelEl, briefingDetailEl;
-let paperChatResizerEl;
+let sidebarResizerEl, listResizerEl, paperChatResizerEl;
 let detailEmpty, detailContent, detailTitle, detailJournal, detailAffiliation;
 let detailIdentifierStrip;
 let detailPublicationDate, detailDateSub;
 let detailSummaryContent, detailSummarySection, detailSummaryRetry;
 let detailReadingNotesContent;
-let detailPaperChatHint, detailPaperChatMessages, detailPaperChatScopes, paperChatInput;
+let detailPaperChatHint, detailPaperChatMessages, detailPaperChatScopes, paperChatInput, paperChatComposer;
 let paperChatScopeCaption, btnSendPaperChat, btnClearPaperChat, btnTogglePaperChat, btnShowPaperChat;
 let paperChatPickedList, btnPaperChatAddCurrent, btnPaperChatClearPicked;
 let paperChatPickedLabel;
 let paperChatProfileSelect;
+let paperChatAttachmentsEl, paperChatAttachmentList, btnPaperChatAddFiles, btnPaperChatAddFolder;
+let btnClearPaperChatAttachments;
 let readingProfileSortSelect, btnReadingProfilesSort;
-let detailBadgeRow, detailSourceBadge, btnOpenUrl, btnRetrySummary;
+let detailBadgeRow, detailSourceBadge, btnOpenUrl, btnRetrySummary, btnPaperGraph;
+let btnDetailPdf, btnDetailSciHub;
 let detailTagList, detailTagInput, btnDetailAddTag;
+let detailPaperGraphSection, paperGraphStage, paperGraphNodeDetail, paperGraphCounts;
 let briefingDetailEmpty, briefingDetailContent;
 
 // ── App state ────────────────────────────────────
@@ -141,8 +158,16 @@ let currentEntry = null;
 let allEntries = [];
 let globalEntries = [];
 let allFeeds = [];
+let allPubmedSearches = [];
+let currentPubmedSearch = null;
+let activePubmedRunId = null;
+let pubmedRenderLimit = 200;
+let pubmedPreview = null;
+let pubmedPreviewAssessment = null;
+let pubmedPreviewSettingsReturnPending = false;
 let contextMenu = null;
 let renamingFeedId = null;
+let renamingPubmedSearchId = null;
 let pubmedGeneratorApi = null;
 let hasConfiguredApiKey = false;
 let sidebarCollapsed = false;
@@ -153,8 +178,11 @@ let currentAccent = 'coral';
 let currentFontScale = 'md';
 let selectedFeedId = null;
 let abstractLang = 'zh';
-let mode = 'feed';              // 'feed' | 'briefing'
+let mode = 'feed';              // 'feed' | 'pubmed' | 'kept' | 'briefing'
 let selectedBriefingId = null;
+let literatureSearchTimer = null;
+let literatureSearchRequestId = 0;
+let literatureSearchRestoreState = null;
 let journalMetricsIndex = null;
 let journalMetricsLoadPromise = null;
 let readingProfiles = [];
@@ -162,22 +190,77 @@ let editingReadingProfileId = null;
 let editingReadingNoteId = null;
 const entryMetricFilters = { if: 'all', q: 'all', b: 'all', top: 'all' };
 const freeFulltextCheckInFlight = new Set();
+const entryPdfLinkCache = new Map();
+const entryPdfLinkCheckInFlight = new Map();
 let entrySelectionMode = false;
 let selectedEntryIds = new Set();
+let apiTokenProfileData = { provider: 'deepseek', active_id: null, profiles: [] };
+
+const SCI_HUB_BASE_URL = 'https://www.sci-hub.st/';
+const SCI_HUB_LAST_RELIABLE_PUBLICATION_YEAR = 2020;
+
+const AI_PROVIDER_META = {
+  deepseek: {
+    label: 'DeepSeek',
+    baseUrl: 'https://api.deepseek.com',
+    model: 'deepseek-v4-flash',
+  },
+  openai: {
+    label: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-5.4-mini',
+  },
+  anthropic: {
+    label: 'Anthropic',
+    baseUrl: 'https://api.anthropic.com/v1',
+    model: 'claude-sonnet-5',
+  },
+  gemini: {
+    label: 'Google Gemini',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+    model: 'gemini-3.5-flash',
+  },
+  openai_compatible: {
+    label: 'OpenAI-compatible',
+    baseUrl: 'https://example.com/v1',
+    model: 'model-name',
+  },
+};
 let entrySelectionAnchorId = null;
 let entryBulkExistingStrategy = 'skip';
 let paperChatScope = 'single';
 let paperChatPinnedEntries = [];
 let currentPaperChatProfileId = '';
 let paperChatCollapsed = false;
-const PAPER_CHAT_MULTI_LIMIT = 5;
+let paperChatAttachments = [];
+let paperChatAttachmentsBusy = false;
+let activePaperChatRequest = null;
+const PAPER_CHAT_ATTACHMENT_LIMIT = 20;
+const PAPER_CHAT_ATTACHMENT_CHAR_LIMIT = 100_000;
+let currentPaperGraph = null;
+let paperGraphFilter = 'all';
+let selectedPaperGraphNodeId = null;
+let paperGraphHistory = [];
+let paperGraphRequestToken = 0;
+let paperGraphViewport = { x: 0, y: 0, scale: 1 };
+let paperGraphSuppressClickUntil = 0;
+const SIDEBAR_WIDTH_STORAGE_KEY = 'sidebar-width-v1';
+const SIDEBAR_DEFAULT_WIDTH = 252;
+const SIDEBAR_MIN_WIDTH = 220;
+const SIDEBAR_MAX_WIDTH = 420;
+const LIST_WIDTH_STORAGE_KEY = 'entry-list-width-v1';
+const LIST_DEFAULT_WIDTH = 416;
+const LIST_MIN_WIDTH = 320;
+const LIST_MAX_WIDTH = 760;
 const PAPER_CHAT_WIDTH_STORAGE_KEY = 'paper-chat-width-v1';
 const PAPER_CHAT_COLLAPSED_STORAGE_KEY = 'paper-chat-collapsed-v1';
 const PAPER_CHAT_DEFAULT_WIDTH = 430;
 const PAPER_CHAT_MIN_WIDTH = 320;
 const PAPER_CHAT_MIN_APP_WIDTH = 1420;
 const DETAIL_PANEL_MIN_WIDTH = 420;
+const BRIEFING_DETAIL_MIN_WIDTH = 360;
 const PANEL_RESIZER_WIDTH = 12;
+const SIDEBAR_SECTION_COLLAPSED_STORAGE_KEY = 'sidebar-section-collapsed-v1';
 const ENTRY_FILTER_STORAGE_KEY = 'entry-filter-v1';
 const ENTRY_FILTER_OPTIONS = ['all', 'unread', 'starred', 'reading-notes'];
 const ENTRY_METRIC_FILTER_STORAGE_KEY = 'entry-metric-filters-v1';
@@ -186,6 +269,57 @@ const ENTRY_METRIC_FILTER_OPTIONS = {
   q: ['all', 'Q1', 'Q2', 'Q3', 'Q4', 'na'],
   b: ['all', 'B1', 'B2', 'B3', 'B4', 'na'],
   top: ['all', 'top', 'non-top', 'na'],
+};
+const PUBMED_SNAPSHOT_STORAGE_KEY = 'pubmed-filter-snapshots-v1';
+const PUBMED_EXPORT_FIELDS_STORAGE_KEY = 'pubmed-export-fields-v1';
+const NATURE_DOWNLOAD_PREFS_STORAGE_KEY = 'nature-download-prefs-v1';
+const TITLE_DISPLAY_STORAGE_KEY = 'title-display-mode-v1';
+const TITLE_DISPLAY_MODES = new Set(['both', 'zh', 'en']);
+const PUBMED_EXPORT_FIELDS = [
+  ['number', '编号'],
+  ['screening_status', '筛选状态'],
+  ['title_translated', '标题中文'],
+  ['title', '标题英文'],
+  ['summary_translated', '摘要中文'],
+  ['summary', '摘要英文'],
+  ['authors', '作者'],
+  ['journal', '期刊'],
+  ['publication_date', '发表日期'],
+  ['publication_date_raw', '发表日期原文'],
+  ['first_seen_at', '加入批次时间'],
+  ['pmid', 'PMID'],
+  ['pmcid', 'PMCID'],
+  ['doi', 'DOI'],
+  ['affiliation', '作者单位'],
+  ['has_free_fulltext', '免费全文'],
+  ['is_read', '已读状态'],
+  ['tags', '标签'],
+  ['impact_factor', '影响因子'],
+  ['jcr_quartile', 'JCR 分区'],
+  ['cas_partition', '中科院分区'],
+  ['is_top', 'Top 期刊'],
+  ['reading_notes', '阅读笔记正文'],
+];
+const DEFAULT_PUBMED_EXPORT_FIELDS = [
+  'number', 'screening_status', 'title_translated', 'title', 'summary_translated',
+  'summary', 'authors', 'journal', 'publication_date', 'first_seen_at', 'pmid',
+  'doi', 'is_read', 'tags', 'impact_factor', 'jcr_quartile', 'cas_partition',
+  'is_top', 'reading_notes',
+];
+const PUBMED_DOWNLOADER_XLSX_FIELD_ORDER = [
+  'pmid', 'title', 'summary', 'authors', 'journal', 'publication_date', 'doi',
+  'impact_factor', 'jcr_quartile', 'cas_partition',
+];
+let pubmedSnapshots = loadPubmedSnapshots();
+let activePubmedSnapshotId = null;
+const pubmedFilters = {
+  status: 'all',
+  sort: 'publication-desc',
+  star: 'all',
+  publishedFrom: '',
+  publishedTo: '',
+  addedFrom: '',
+  addedTo: '',
 };
 
 const DRAG_BLOCK_SELECTOR = [
@@ -294,6 +428,15 @@ function normalizeEntryFilterValue(value) {
   return ENTRY_FILTER_OPTIONS.includes(value) ? value : 'all';
 }
 
+function entryFilterLabel(value) {
+  return {
+    all: '全部文章',
+    unread: '未读',
+    starred: '星标',
+    'reading-notes': '阅读笔记',
+  }[normalizeEntryFilterValue(value)] || '全部文章';
+}
+
 function persistEntryFilter() {
   try {
     localStorage.setItem(ENTRY_FILTER_STORAGE_KEY, normalizeEntryFilterValue(entryFilterValue));
@@ -322,7 +465,9 @@ function syncEntryFilterControls() {
 
   const activeSidebarView = mode === 'briefing'
     ? 'briefing'
-    : (selectedFeedId ? null : entryFilterValue);
+    : (mode === 'kept'
+      ? 'kept'
+      : (mode === 'pubmed' || selectedFeedId ? null : entryFilterValue));
   document.querySelectorAll('.sidebar-row').forEach(row => {
     row.classList.toggle('active', !!activeSidebarView && row.dataset.view === activeSidebarView);
   });
@@ -350,7 +495,7 @@ function setupWindowDragFallback() {
   });
 }
 
-// ── Translation cost meter (real DeepSeek token usage) ─────────────
+// ── Provider-normalized AI token and cost meter ────────────────────
 // The Rust pipeline records every API call's `usage` block into SQLite and
 // emits `cost-updated` after each successful translation. We just render
 // whatever the backend reports. The old `addTranslationCost(chars)` helper
@@ -374,11 +519,11 @@ function updateCostMeter() {
   const el = (id) => document.getElementById(id);
   if (!el('cost-value')) return;
   const summary = currentCostSummary;
-  const total = summary?.total_cny ?? 0;
+  const total = summary?.total_cny;
   const tokens = (summary?.breakdown || []).reduce((acc, row) =>
     acc + row.prompt_cache_hit_tokens + row.prompt_cache_miss_tokens + row.completion_tokens,
   0);
-  el('cost-value').textContent = formatCny(total);
+  el('cost-value').textContent = total == null ? '未计价' : formatCny(total);
   // Tokens accumulate visibly with every translation — much more responsive
   // than the ¥ value for tracking "did my translations register". For
   // Chinese output, one token ≈ one Chinese character, so the count also
@@ -387,12 +532,14 @@ function updateCostMeter() {
   // The progress bar is now scaled against a 20 ¥/month soft cap — a
   // reasonable monthly budget for a heavy reader. Adjust if needed; this
   // ratio is presentation-only and doesn't affect billing.
-  const pct = Math.min(100, total / 20 * 100);
+  const pct = total == null ? 0 : Math.min(100, total / 20 * 100);
   el('cost-fill').style.width = pct + '%';
   const breakdown = summary?.breakdown || [];
+  const activeProvider = providerSelect?.value || 'deepseek';
+  const activeMeta = AI_PROVIDER_META[activeProvider] || AI_PROVIDER_META.deepseek;
   el('cost-model').textContent = breakdown.length > 0
-    ? breakdown[0].model
-    : ((modelInput?.value || 'deepseek-chat').trim() || 'deepseek-chat');
+    ? `${AI_PROVIDER_META[breakdown[0].provider]?.label || breakdown[0].provider} · ${breakdown[0].model}`
+    : `${activeMeta.label} · ${(modelInput?.value || activeMeta.model).trim()}`;
   // Detailed hover-tooltip so curious users can see the full breakdown
   // (cache hit/miss/output tokens per model).
   const meter = document.getElementById('cost-meter');
@@ -402,9 +549,10 @@ function updateCostMeter() {
     } else {
       meter.title = breakdown
         .map(b =>
-          `${b.model}: 缓存命中 ${b.prompt_cache_hit_tokens.toLocaleString()} · `
-          + `缓存未命中 ${b.prompt_cache_miss_tokens.toLocaleString()} · `
-          + `输出 ${b.completion_tokens.toLocaleString()} = ${formatCny(b.cny)}`
+          `${AI_PROVIDER_META[b.provider]?.label || b.provider} · ${b.model}: 缓存输入 ${b.prompt_cache_hit_tokens.toLocaleString()} · `
+          + `非缓存输入 ${b.prompt_cache_miss_tokens.toLocaleString()} · `
+          + `输出 ${b.completion_tokens.toLocaleString()}`
+          + (b.cny == null ? ' · 未计价' : ` = ${formatCny(b.cny)}`)
         )
         .join('\n');
     }
@@ -439,14 +587,214 @@ function showGeneralStatus(msg, type) {
   generalStatus.className = 'settings-status ' + (type || '');
 }
 
+function titleDisplayMode() {
+  const saved = localStorage.getItem(TITLE_DISPLAY_STORAGE_KEY) || 'both';
+  return TITLE_DISPLAY_MODES.has(saved) ? saved : 'both';
+}
+
+function displayTitles(entry) {
+  const original = (entry?.title || '').trim();
+  const translated = (entry?.title_translated || '').trim();
+  const mode = titleDisplayMode();
+
+  if (mode === 'en') return { primary: original || translated, secondary: '' };
+  if (mode === 'zh') return { primary: translated || original, secondary: '' };
+  return {
+    primary: translated || original,
+    secondary: translated && original && translated !== original ? original : '',
+  };
+}
+
+function renderDetailTitle(entry) {
+  if (!detailTitle) return;
+  const titles = displayTitles(entry);
+  const primary = document.createElement('span');
+  primary.className = 'detail-title-primary';
+  primary.textContent = titles.primary;
+  detailTitle.replaceChildren(primary);
+  if (titles.secondary) {
+    const secondary = document.createElement('span');
+    secondary.className = 'detail-title-original';
+    secondary.textContent = titles.secondary;
+    detailTitle.appendChild(secondary);
+  }
+}
+
+function activeProviderId() {
+  return providerSelect?.value || 'deepseek';
+}
+
+function syncProviderUi() {
+  const provider = activeProviderId();
+  const meta = AI_PROVIDER_META[provider] || AI_PROVIDER_META.deepseek;
+  if (baseUrlInput) baseUrlInput.placeholder = meta.baseUrl;
+  if (modelInput) modelInput.placeholder = meta.model;
+  const modelLabel = `${meta.label} · ${(modelInput?.value || meta.model).trim()}`;
+  const briefingSettingsModel = document.getElementById('briefing-settings-model');
+  const briefingDetailModel = document.getElementById('briefing-detail-model');
+  if (briefingSettingsModel) briefingSettingsModel.textContent = modelLabel;
+  if (briefingDetailModel) briefingDetailModel.textContent = modelLabel;
+  document.getElementById('deepseek-balance-card')?.classList.toggle('hidden', provider !== 'deepseek');
+  updateCostMeter();
+}
+
+function applyProviderSettings(settings, { includeGlobal = false } = {}) {
+  if (providerSelect) providerSelect.value = settings.provider || 'deepseek';
+  apiKeyInput.value = settings.api_key || '';
+  baseUrlInput.value = settings.base_url || '';
+  modelInput.value = settings.model || '';
+  if (includeGlobal) {
+    systemPromptInput.value = settings.system_prompt || '';
+    retentionSelect.value = String(settings.read_retention_days ?? 0);
+  }
+  syncProviderUi();
+}
+
+function activeTokenProfile() {
+  return apiTokenProfileData.profiles.find(
+    profile => profile.id === apiTokenProfileData.active_id
+  ) || null;
+}
+
+function fillTokenProfileSelect(select, profiles, activeId, { toolbar = false } = {}) {
+  if (!select) return;
+  select.replaceChildren();
+  profiles.forEach(profile => {
+    const option = document.createElement('option');
+    option.value = profile.id;
+    option.textContent = toolbar
+      ? `${AI_PROVIDER_META[apiTokenProfileData.provider]?.label || apiTokenProfileData.provider} · ${profile.name}`
+      : `${profile.name} · ${profile.masked_key}`;
+    select.appendChild(option);
+  });
+  if (activeId) select.value = activeId;
+}
+
+function renderApiTokenProfiles({ preserveDraft = false } = {}) {
+  const profiles = apiTokenProfileData.profiles || [];
+  fillTokenProfileSelect(
+    apiTokenProfileSelect,
+    profiles,
+    apiTokenProfileData.active_id
+  );
+  fillTokenProfileSelect(
+    toolbarApiTokenSelect,
+    profiles,
+    apiTokenProfileData.active_id,
+    { toolbar: true }
+  );
+
+  if (toolbarApiTokenSelect) {
+    toolbarApiTokenSelect.classList.toggle('hidden', profiles.length < 2);
+    toolbarApiTokenSelect.disabled = profiles.length < 2;
+  }
+  if (btnDeleteApiToken) btnDeleteApiToken.disabled = profiles.length === 0;
+
+  if (preserveDraft && apiTokenProfileSelect) {
+    const option = document.createElement('option');
+    option.value = '__new__';
+    option.textContent = '新 Token';
+    apiTokenProfileSelect.appendChild(option);
+    apiTokenProfileSelect.value = '__new__';
+    return;
+  }
+
+  const active = activeTokenProfile();
+  if (apiTokenProfileNameInput) apiTokenProfileNameInput.value = active?.name || '';
+}
+
+async function loadApiTokenProfiles(provider) {
+  try {
+    const data = await invoke('list_api_token_profiles', { provider });
+    if (activeProviderId() !== provider) return;
+    apiTokenProfileData = data;
+    renderApiTokenProfiles();
+  } catch (error) {
+    showSettingsStatus('加载 Token 档案失败: ' + error, 'error');
+  }
+}
+
+async function activateApiTokenProfile(profileId) {
+  const provider = activeProviderId();
+  if (!profileId || profileId === '__new__') return;
+  try {
+    apiTokenProfileData = await invoke('activate_api_token_profile', {
+      provider,
+      profileId,
+    });
+    const settings = await invoke('get_provider_settings', { provider });
+    if (activeProviderId() !== provider) return;
+    applyProviderSettings(settings);
+    renderApiTokenProfiles();
+    updateView(!!settings.api_key);
+    showSettingsStatus(`已切换到 ${activeTokenProfile()?.name || '当前 Token'}`, 'success');
+    setTimeout(() => showSettingsStatus('', ''), 2200);
+    invoke('start_translation_pipeline').catch(() => {});
+    if (provider === 'deepseek') refreshDeepSeekBalance({ silent: true });
+  } catch (error) {
+    renderApiTokenProfiles();
+    showSettingsStatus('切换失败: ' + error, 'error');
+  }
+}
+
+function beginNewApiTokenProfile() {
+  renderApiTokenProfiles({ preserveDraft: true });
+  if (apiTokenProfileNameInput) {
+    apiTokenProfileNameInput.value = '';
+    apiTokenProfileNameInput.focus();
+  }
+  if (apiKeyInput) apiKeyInput.value = '';
+  if (btnDeleteApiToken) btnDeleteApiToken.disabled = true;
+  showSettingsStatus('', '');
+}
+
+async function deleteCurrentApiTokenProfile() {
+  const profile = activeTokenProfile();
+  if (!profile || !window.confirm(`删除 Token 档案“${profile.name}”？`)) return;
+  const provider = activeProviderId();
+  try {
+    apiTokenProfileData = await invoke('delete_api_token_profile', {
+      provider,
+      profileId: profile.id,
+    });
+    const settings = await invoke('get_provider_settings', { provider });
+    applyProviderSettings(settings);
+    renderApiTokenProfiles();
+    updateView(!!settings.api_key);
+    showSettingsStatus('Token 已删除', 'success');
+  } catch (error) {
+    showSettingsStatus('删除失败: ' + error, 'error');
+  }
+}
+
+async function loadProviderSettings(provider) {
+  try {
+    const settings = await invoke('get_provider_settings', { provider });
+    if (activeProviderId() !== provider) return;
+    applyProviderSettings(settings);
+    await loadApiTokenProfiles(provider);
+    showSettingsStatus('', '');
+  } catch (e) {
+    showSettingsStatus('加载服务商配置失败: ' + e, 'error');
+  }
+}
+
+function collectAiSettings() {
+  return {
+    provider: activeProviderId(),
+    api_key: apiKeyInput.value.trim(),
+    base_url: baseUrlInput.value.trim(),
+    model: modelInput.value.trim(),
+    system_prompt: systemPromptInput.value.trim(),
+    read_retention_days: parseInt(retentionSelect?.value, 10) || 0,
+  };
+}
+
 async function loadSettings() {
   try {
     const s = await invoke('get_settings');
-    apiKeyInput.value = s.api_key || '';
-    baseUrlInput.value = s.base_url || '';
-    modelInput.value = s.model || '';
-    systemPromptInput.value = s.system_prompt || '';
-    retentionSelect.value = String(s.read_retention_days ?? 0);
+    applyProviderSettings(s, { includeGlobal: true });
+    await loadApiTokenProfiles(s.provider || 'deepseek');
     updateView(!!s.api_key);
   } catch (e) {
     showSettingsStatus('加载设置失败: ' + e, 'error');
@@ -517,6 +865,7 @@ function renderBalance(balance) {
 }
 async function refreshDeepSeekBalance({ silent = false } = {}) {
   if (balanceLoadInFlight) return;
+  if (activeProviderId() !== 'deepseek') return;
   const apiKey = apiKeyInput?.value.trim();
   if (!apiKey) {
     if (!silent) setBalanceStatus('请先填写并保存 API Key', 'error');
@@ -547,23 +896,33 @@ async function refreshDeepSeekBalance({ silent = false } = {}) {
 }
 
 async function saveTranslationSettings() {
-  const settings = {
-    api_key: apiKeyInput.value.trim(),
-    base_url: baseUrlInput.value.trim(),
-    model: modelInput.value.trim(),
-    system_prompt: systemPromptInput.value.trim(),
-    read_retention_days: parseInt(retentionSelect?.value, 10) || 0,
-  };
+  const settings = collectAiSettings();
   try {
+    if (settings.api_key) {
+      apiTokenProfileData = await invoke('upsert_api_token_profile', {
+        provider: settings.provider,
+        profileId: apiTokenProfileSelect?.value === '__new__'
+          ? null
+          : (apiTokenProfileSelect?.value || apiTokenProfileData.active_id),
+        name: apiTokenProfileNameInput?.value.trim() || '默认 Token',
+        apiKey: settings.api_key,
+      });
+    }
     await invoke('save_settings', { settings });
+    renderApiTokenProfiles();
     showSettingsStatus('设置已保存', 'success');
     updateView(!!settings.api_key);
     // If the user just configured (or updated) the API key, kick the pipeline so
     // any entries that were waiting for a key start translating immediately,
     // and refresh the balance card with the new credentials.
-    if (settings.api_key) {
+    if (settings.api_key && !pubmedPreviewSettingsReturnPending) {
       invoke('start_translation_pipeline').catch(() => {});
-      refreshDeepSeekBalance({ silent: true });
+      if (settings.provider === 'deepseek') refreshDeepSeekBalance({ silent: true });
+    }
+    if (pubmedPreviewSettingsReturnPending) {
+      showMain();
+      document.getElementById('pubmed-search-modal')?.classList.remove('hidden');
+      document.getElementById('pubmed-preview-status').textContent = 'AI 设置已保存，可重试初判';
     }
   } catch (e) {
     showSettingsStatus('保存失败: ' + e, 'error');
@@ -571,13 +930,7 @@ async function saveTranslationSettings() {
 }
 
 async function saveGeneralSettings() {
-  const settings = {
-    api_key: apiKeyInput.value.trim(),
-    base_url: baseUrlInput.value.trim(),
-    model: modelInput.value.trim(),
-    system_prompt: systemPromptInput.value.trim(),
-    read_retention_days: parseInt(retentionSelect?.value, 10) || 0,
-  };
+  const settings = collectAiSettings();
   try {
     await invoke('save_settings', { settings });
     localStorage.setItem('theme', currentTheme);
@@ -594,13 +947,7 @@ async function testConnection() {
   btnTest.disabled = true;
   btnTest.textContent = '测试中…';
   showSettingsStatus('', '');
-  const settings = {
-    api_key: apiKeyInput.value.trim(),
-    base_url: baseUrlInput.value.trim() || 'https://api.deepseek.com',
-    model: modelInput.value.trim() || 'deepseek-v4-flash',
-    system_prompt: systemPromptInput.value.trim(),
-    read_retention_days: parseInt(retentionSelect?.value, 10) || 0,
-  };
+  const settings = collectAiSettings();
   try {
     await invoke('test_connection', { settings });
     showSettingsStatus('连接成功 · 延迟 287ms', 'success');
@@ -633,6 +980,7 @@ function updateView(hasApiKey) {
   // Settings → 翻译 at any time.
   showMain();
   loadFeeds();
+  loadPubmedSearches();
   loadEntries();
   startSchedulerListener();
 }
@@ -663,7 +1011,10 @@ function showMain() {
   btnSidebar.title = '侧栏';
   if (!sidebarCollapsed) btnSidebar.classList.add('active');
   document.body.classList.remove('settings-mode');
-  setToolbarSubtitle(mode === 'briefing' ? 'briefing' : 'main');
+  setToolbarSubtitle(mode === 'briefing' ? 'briefing' : (mode === 'search' ? 'search' : 'main'));
+  if (pubmedPreviewSettingsReturnPending && pubmedPreview) {
+    document.getElementById('pubmed-search-modal')?.classList.remove('hidden');
+  }
 }
 
 function setToolbarSubtitle(context) {
@@ -678,6 +1029,14 @@ function setToolbarSubtitle(context) {
       <span>AI 简报</span>
       <span class="ts-meta">·</span>
       <span class="ts-tertiary">${BRIEFINGS.length} 份</span>
+    `;
+    return;
+  }
+  if (context === 'search') {
+    toolbarSubtitle.innerHTML = `
+      <span>检索</span>
+      <span class="ts-meta">·</span>
+      <span class="ts-tertiary">${allEntries.length} 篇</span>
     `;
     return;
   }
@@ -699,6 +1058,7 @@ function applyCollapsedState() {
   // itself drives the translate transform. `.sidebar-hidden` on mainView
   // is kept for any legacy CSS that still keys off it.
   sidebar.classList.toggle('collapsed', sidebarCollapsed);
+  sidebarResizerEl?.classList.toggle('hidden', sidebarCollapsed);
   mainView.classList.toggle('sidebar-hidden', sidebarCollapsed);
   document.body.classList.toggle('sidebar-collapsed', sidebarCollapsed);
   btnSidebar.classList.toggle('active', !sidebarCollapsed);
@@ -706,6 +1066,121 @@ function applyCollapsedState() {
     applyPaperChatPanelWidth(loadPaperChatPanelWidth());
     syncPaperChatResizerVisibility();
   });
+}
+
+function loadSidebarSectionCollapsedState() {
+  try {
+    const state = JSON.parse(localStorage.getItem(SIDEBAR_SECTION_COLLAPSED_STORAGE_KEY) || '{}');
+    return state && typeof state === 'object' ? state : {};
+  } catch {
+    return {};
+  }
+}
+
+function setSidebarSectionCollapsed(section, collapsed, { persist = true } = {}) {
+  const toggle = document.querySelector(`[data-sidebar-section-toggle="${section}"]`);
+  const listId = toggle?.getAttribute('aria-controls');
+  const list = listId ? document.getElementById(listId) : null;
+  if (!toggle || !list) return;
+
+  toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  toggle.title = `${collapsed ? '展开' : '折叠'}${section === 'pubmed' ? ' PubMed 检索' : '订阅源'}`;
+  list.hidden = collapsed;
+
+  if (persist) {
+    const state = loadSidebarSectionCollapsedState();
+    state[section] = collapsed;
+    localStorage.setItem(SIDEBAR_SECTION_COLLAPSED_STORAGE_KEY, JSON.stringify(state));
+  }
+}
+
+function setupSidebarSectionToggles() {
+  const state = loadSidebarSectionCollapsedState();
+  document.querySelectorAll('[data-sidebar-section-toggle]').forEach(toggle => {
+    const section = toggle.dataset.sidebarSectionToggle;
+    setSidebarSectionCollapsed(section, state[section] === true, { persist: false });
+    toggle.addEventListener('click', () => {
+      setSidebarSectionCollapsed(section, toggle.getAttribute('aria-expanded') === 'true');
+    });
+  });
+}
+
+function setupSidebarResizer() {
+  if (!sidebarResizerEl) return;
+
+  applySidebarWidth(loadSidebarWidth());
+  requestAnimationFrame(() => applySidebarWidth(loadSidebarWidth()));
+
+  let dragging = false;
+
+  const finishDrag = () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove('sidebar-resizing');
+  };
+
+  const handleMove = (event) => {
+    if (!dragging) return;
+    const gutter = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--sidebar-gutter')) || 0;
+    const nextWidth = event.clientX - gutter;
+    applySidebarWidth(nextWidth, { persist: true });
+  };
+
+  sidebarResizerEl.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    dragging = true;
+    document.body.classList.add('sidebar-resizing');
+    sidebarResizerEl.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+  });
+
+  sidebarResizerEl.addEventListener('pointermove', handleMove);
+  sidebarResizerEl.addEventListener('pointerup', (event) => {
+    sidebarResizerEl.releasePointerCapture?.(event.pointerId);
+    finishDrag();
+  });
+  sidebarResizerEl.addEventListener('pointercancel', finishDrag);
+  window.addEventListener('pointerup', finishDrag);
+  window.addEventListener('resize', () => applySidebarWidth(loadSidebarWidth()));
+}
+
+function setupListResizer() {
+  if (!listResizerEl) return;
+
+  applyListPanelWidth(loadListPanelWidth());
+  requestAnimationFrame(() => applyListPanelWidth(loadListPanelWidth()));
+
+  let dragging = false;
+
+  const finishDrag = () => {
+    if (!dragging) return;
+    dragging = false;
+    contentArea.classList.remove('is-resizing');
+  };
+
+  const handleMove = (event) => {
+    if (!dragging) return;
+    const rect = contentArea.getBoundingClientRect();
+    const nextWidth = event.clientX - rect.left;
+    applyListPanelWidth(nextWidth, { persist: true });
+  };
+
+  listResizerEl.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    dragging = true;
+    contentArea.classList.add('is-resizing');
+    listResizerEl.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+  });
+
+  listResizerEl.addEventListener('pointermove', handleMove);
+  listResizerEl.addEventListener('pointerup', (event) => {
+    listResizerEl.releasePointerCapture?.(event.pointerId);
+    finishDrag();
+  });
+  listResizerEl.addEventListener('pointercancel', finishDrag);
+  window.addEventListener('pointerup', finishDrag);
+  window.addEventListener('resize', () => applyListPanelWidth(loadListPanelWidth()));
 }
 
 // ── Settings rail navigation ───────────────────
@@ -802,6 +1277,525 @@ async function exportOpml() {
   }
 }
 
+function selectedPubmedExportFields() {
+  try {
+    const fields = JSON.parse(localStorage.getItem(PUBMED_EXPORT_FIELDS_STORAGE_KEY) || '[]');
+    const allowed = new Set(PUBMED_EXPORT_FIELDS.map(([key]) => key));
+    const valid = Array.isArray(fields) ? fields.filter(field => allowed.has(field)) : [];
+    return valid.length ? valid : [...DEFAULT_PUBMED_EXPORT_FIELDS];
+  } catch {
+    return [...DEFAULT_PUBMED_EXPORT_FIELDS];
+  }
+}
+
+function choosePubmedExportFields(format, count) {
+  return new Promise(resolve => {
+    const selected = new Set(selectedPubmedExportFields());
+    const required = new Set(format === 'xlsx' ? ['pmid'] : []);
+    required.forEach(field => selected.add(field));
+    const overlay = document.createElement('div');
+    overlay.className = 'pubmed-modal';
+    overlay.innerHTML = `
+      <div class="pubmed-modal-backdrop"></div>
+      <section class="pubmed-modal-panel pubmed-export-panel">
+        <header class="pubmed-modal-header">
+          <div><h2>选择导出字段</h2><p>${format.toUpperCase()} · ${count} 篇文献</p></div>
+          <button class="pubmed-modal-close" data-close type="button" aria-label="关闭">×</button>
+        </header>
+        <div class="pubmed-modal-body">
+          <div class="pubmed-export-field-actions">
+            <button class="btn btn-secondary btn-sm" data-all type="button">全选</button>
+            <button class="btn btn-secondary btn-sm" data-default type="button">常用字段</button>
+            <button class="btn btn-secondary btn-sm" data-none type="button">清空</button>
+          </div>
+          <div class="pubmed-export-field-grid">
+            ${PUBMED_EXPORT_FIELDS.map(([key, label]) => `
+              <label class="pubmed-export-field">
+                <input type="checkbox" value="${key}" ${selected.has(key) ? 'checked' : ''} ${required.has(key) ? 'disabled' : ''} />
+                <span>${escapeHtml(label)}</span>
+              </label>
+            `).join('')}
+          </div>
+          <p class="pubmed-export-field-status"></p>
+        </div>
+        <footer class="pubmed-modal-footer">
+          <button class="btn btn-secondary" data-close type="button">取消</button>
+          <button class="btn btn-primary" data-confirm type="button">继续选择保存位置</button>
+        </footer>
+      </section>
+    `;
+    const cleanup = value => {
+      overlay.remove();
+      resolve(value);
+    };
+    const setChecks = fields => {
+      const values = new Set(fields);
+      overlay.querySelectorAll('input[type="checkbox"]').forEach(input => {
+        input.checked = input.disabled || values.has(input.value);
+      });
+    };
+    overlay.querySelectorAll('[data-close], .pubmed-modal-backdrop').forEach(el => {
+      el.addEventListener('click', () => cleanup(null));
+    });
+    overlay.querySelector('[data-all]').addEventListener('click', () => setChecks(PUBMED_EXPORT_FIELDS.map(([key]) => key)));
+    overlay.querySelector('[data-default]').addEventListener('click', () => setChecks(DEFAULT_PUBMED_EXPORT_FIELDS));
+    overlay.querySelector('[data-none]').addEventListener('click', () => setChecks([]));
+    overlay.querySelector('[data-confirm]').addEventListener('click', () => {
+      const fields = [...overlay.querySelectorAll('input[type="checkbox"]:checked')].map(input => input.value);
+      if (!fields.length) {
+        overlay.querySelector('.pubmed-export-field-status').textContent = '请至少选择一个字段';
+        return;
+      }
+      localStorage.setItem(PUBMED_EXPORT_FIELDS_STORAGE_KEY, JSON.stringify(fields));
+      cleanup(fields);
+    });
+    document.body.appendChild(overlay);
+  });
+}
+
+function orderPubmedXlsxFields(fields) {
+  const selected = new Set(fields);
+  return [
+    ...PUBMED_DOWNLOADER_XLSX_FIELD_ORDER.filter(field => selected.delete(field)),
+    ...fields.filter(field => selected.delete(field)),
+  ];
+}
+
+function loadNatureDownloadPrefs() {
+  try {
+    const value = JSON.parse(localStorage.getItem(NATURE_DOWNLOAD_PREFS_STORAGE_KEY) || '{}');
+    return {
+      accessMode: value.accessMode === 'institution' ? 'institution' : 'oa',
+      pathMode: value.pathMode === 'fixed' ? 'fixed' : 'ask',
+      fixedFolder: typeof value.fixedFolder === 'string' ? value.fixedFolder : '',
+    };
+  } catch {
+    return { accessMode: 'oa', pathMode: 'ask', fixedFolder: '' };
+  }
+}
+
+function formatNatureDownloadError(error) {
+  const raw = String(error || '').trim();
+  if (/CDP proxy not reachable|healthCheck|127\.0\.0\.1:3456\/targets/i.test(raw)) {
+    return '未连接到 Chrome 下载会话，请启用 Chrome 远程调试后重试';
+  }
+
+  const summary = raw
+    .split(/\r?\n/, 1)[0]
+    .replace(/\s+at\s+(?:async\s+)?[\s\S]*$/, '')
+    .trim();
+  if (!summary) return '请稍后重试';
+  return summary.length > 80 ? `${summary.slice(0, 80)}…` : summary;
+}
+
+function chooseNatureDownloadOptions(count) {
+  return new Promise(resolve => {
+    const prefs = loadNatureDownloadPrefs();
+    let fixedFolder = prefs.fixedFolder;
+    const overlay = document.createElement('div');
+    overlay.className = 'pubmed-modal';
+    overlay.innerHTML = `
+      <div class="pubmed-modal-backdrop"></div>
+      <section class="pubmed-modal-panel nature-download-panel">
+        <header class="pubmed-modal-header">
+          <div><h2>智能下载 PDF</h2><p>多源解析 · ${count} 篇文献</p></div>
+          <button class="pubmed-modal-close" data-close type="button" aria-label="关闭">×</button>
+        </header>
+        <div class="pubmed-modal-body">
+          <label class="pubmed-field">
+            <span>全文访问方式</span>
+            <select class="settings-select" data-access>
+              <option value="oa" ${prefs.accessMode === 'oa' ? 'selected' : ''}>仅使用开放获取来源</option>
+              <option value="institution" ${prefs.accessMode === 'institution' ? 'selected' : ''}>使用已配置的机构授权</option>
+            </select>
+          </label>
+          <label class="pubmed-field">
+            <span>保存位置</span>
+            <select class="settings-select" data-path-mode>
+              <option value="ask" ${prefs.pathMode === 'ask' ? 'selected' : ''}>每次询问保存文件夹</option>
+              <option value="fixed" ${prefs.pathMode === 'fixed' ? 'selected' : ''}>使用固定下载文件夹</option>
+            </select>
+          </label>
+          <div class="nature-download-folder-row ${prefs.pathMode === 'fixed' ? '' : 'hidden'}" data-folder-row>
+            <div class="nature-download-folder" data-folder>${escapeHtml(fixedFolder || '尚未选择文件夹')}</div>
+            <button class="btn btn-secondary btn-sm" data-choose-folder type="button">选择文件夹</button>
+          </div>
+          <p class="nature-download-note">机构授权模式只使用你本人已登录并获授权的浏览器会话；不会读取或保存账号、密码和验证码。</p>
+          <p class="pubmed-export-field-status" data-status></p>
+        </div>
+        <footer class="pubmed-modal-footer">
+          <button class="btn btn-secondary" data-close type="button">取消</button>
+          <button class="btn btn-primary" data-confirm type="button">开始下载</button>
+        </footer>
+      </section>
+    `;
+    const pathMode = overlay.querySelector('[data-path-mode]');
+    const folderRow = overlay.querySelector('[data-folder-row]');
+    const folderLabel = overlay.querySelector('[data-folder]');
+    const cleanup = value => {
+      overlay.remove();
+      resolve(value);
+    };
+    overlay.querySelectorAll('[data-close], .pubmed-modal-backdrop').forEach(el => {
+      el.addEventListener('click', () => cleanup(null));
+    });
+    pathMode.addEventListener('change', () => folderRow.classList.toggle('hidden', pathMode.value !== 'fixed'));
+    overlay.querySelector('[data-choose-folder]').addEventListener('click', async () => {
+      const path = await window.__TAURI__?.dialog?.open({ title: '选择固定 PDF 下载文件夹', directory: true, multiple: false });
+      if (!path) return;
+      fixedFolder = Array.isArray(path) ? path[0] : path;
+      folderLabel.textContent = fixedFolder;
+    });
+    overlay.querySelector('[data-confirm]').addEventListener('click', () => {
+      const value = {
+        accessMode: overlay.querySelector('[data-access]').value,
+        pathMode: pathMode.value,
+        fixedFolder,
+      };
+      if (value.pathMode === 'fixed' && !value.fixedFolder) {
+        overlay.querySelector('[data-status]').textContent = '请先选择固定下载文件夹';
+        return;
+      }
+      localStorage.setItem(NATURE_DOWNLOAD_PREFS_STORAGE_KEY, JSON.stringify(value));
+      cleanup(value);
+    });
+    document.body.appendChild(overlay);
+  });
+}
+
+async function downloadEntriesWithNature(entries) {
+  if (!entries.length) return;
+  if (entries.length > 20) {
+    setGlobalStatus('智能 PDF 下载单次最多支持 20 篇，请缩小勾选范围', 'error');
+    return;
+  }
+  const options = await chooseNatureDownloadOptions(entries.length);
+  if (!options) return;
+  let outputDir = options.fixedFolder;
+  if (options.pathMode === 'ask') {
+    const path = await window.__TAURI__?.dialog?.open({ title: '选择 PDF 保存文件夹', directory: true, multiple: false });
+    if (!path) return;
+    outputDir = Array.isArray(path) ? path[0] : path;
+  }
+  setGlobalStatus(`正在下载 ${entries.length} 篇 PDF…`, 'progress');
+  try {
+    const report = await invoke('download_papers_with_nature', {
+      items: entries.map(entry => ({
+        title: entry.title || entry.title_translated || '',
+        doi: entry.doi || null,
+        pmid: entry.pmid || null,
+        pmcid: entry.pmcid || null,
+      })),
+      outputDir,
+      openAccess: options.accessMode === 'oa',
+    });
+    const handoff = report.needs_user_action ? `，${report.needs_user_action} 篇需要在浏览器完成登录或验证` : '';
+    setGlobalStatus(`PDF 下载完成：成功 ${report.downloaded}/${report.total}${handoff}`, report.needs_user_action ? 'error' : 'success');
+  } catch (e) {
+    console.error('PDF 下载失败:', e);
+    setGlobalStatus(`PDF 下载失败：${formatNatureDownloadError(e)}`, 'error');
+  }
+}
+
+function pubmedExportMetrics(entries) {
+  return entries.map(entry => {
+    const metric = lookupJournalMetrics(entry);
+    const hasTop = metric && ['0', '1'].includes(String(metric.top));
+    return {
+      entry_id: entry.id,
+      impact_factor: metric && hasVisibleMetric(metric.if) ? String(metric.if) : null,
+      jcr_quartile: metric && hasVisibleMetric(metric.q) ? String(metric.q) : null,
+      cas_partition: metric && hasVisibleMetric(metric.b) ? formatCasPartition(metric.b) : null,
+      is_top: hasTop ? String(metric.top) === '1' : null,
+    };
+  });
+}
+
+function safeExportFileName(value) {
+  return String(value || 'pubmed').replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-').replace(/\s+/g, '-').slice(0, 60);
+}
+
+async function exportCurrentPubmedEntries(formatOverride = null, sourceButton = btnExportPubmed) {
+  if (!['pubmed', 'kept'].includes(mode)) return;
+  const selected = getSelectedEntries();
+  const entries = selected.length ? selected : getFilteredPubmedEntries(allEntries);
+  if (!entries.length) {
+    setGlobalStatus('当前没有可导出的文献', 'error');
+    return;
+  }
+  const format = (formatOverride || pubmedExportFormat?.value) === 'txt' ? 'txt' : 'xlsx';
+  const selectedFields = await choosePubmedExportFields(format, entries.length);
+  if (!selectedFields) return;
+  const fields = format === 'xlsx' ? orderPubmedXlsxFields(selectedFields) : selectedFields;
+  const dialog = window.__TAURI__?.dialog;
+  if (!dialog) {
+    setGlobalStatus('对话框插件不可用', 'error');
+    return;
+  }
+  const stamp = new Date().toISOString().slice(0, 10);
+  const scopeName = mode === 'kept' ? '保留文献' : currentPubmedSearch?.name;
+  const path = await dialog.save({
+    title: `导出 PubMed ${format.toUpperCase()}`,
+    defaultPath: `${safeExportFileName(scopeName)}-${stamp}.${format}`,
+    filters: [{ name: format === 'xlsx' ? 'Excel' : 'PubMed TXT', extensions: [format] }],
+  });
+  if (!path) return;
+  if (sourceButton) sourceButton.disabled = true;
+  try {
+    const count = await invoke('export_pubmed_entries', {
+      path,
+      format,
+      searchId: mode === 'pubmed' ? currentPubmedSearch?.id : null,
+      entryIds: entries.map(entry => entry.id),
+      fields,
+      metrics: pubmedExportMetrics(entries),
+    });
+    setGlobalStatus(`已导出 ${count} 篇文献${selected.length ? '（当前勾选）' : '（当前筛选结果）'}`, 'success');
+  } catch (e) {
+    setGlobalStatus('导出失败: ' + e, 'error');
+  } finally {
+    if (sourceButton) sourceButton.disabled = false;
+  }
+}
+
+function loadPubmedSnapshots() {
+  try {
+    const snapshots = JSON.parse(localStorage.getItem(PUBMED_SNAPSHOT_STORAGE_KEY) || '[]');
+    return Array.isArray(snapshots) ? snapshots.filter(item => item?.id && item?.scope && Array.isArray(item.entryIds)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistPubmedSnapshots() {
+  localStorage.setItem(PUBMED_SNAPSHOT_STORAGE_KEY, JSON.stringify(pubmedSnapshots));
+}
+
+function currentPubmedSnapshotScope() {
+  if (mode === 'kept') return 'kept';
+  return currentPubmedSearch ? `search:${currentPubmedSearch.id}` : '';
+}
+
+function currentPubmedSnapshots() {
+  const scope = currentPubmedSnapshotScope();
+  return scope ? pubmedSnapshots.filter(snapshot => snapshot.scope === scope) : [];
+}
+
+function currentPubmedSnapshot() {
+  return activePubmedSnapshotId
+    ? currentPubmedSnapshots().find(snapshot => snapshot.id === activePubmedSnapshotId) || null
+    : null;
+}
+
+function refreshPubmedSnapshotControls() {
+  if (!pubmedSnapshotSelect) return;
+  const snapshots = currentPubmedSnapshots();
+  if (activePubmedSnapshotId && !snapshots.some(snapshot => snapshot.id === activePubmedSnapshotId)) {
+    activePubmedSnapshotId = null;
+  }
+  pubmedSnapshotSelect.innerHTML = '<option value="">实时筛选</option>' + snapshots.map(snapshot => (
+    `<option value="${escapeHtml(snapshot.id)}">${escapeHtml(snapshot.name)} (${snapshot.entryIds.length})</option>`
+  )).join('');
+  pubmedSnapshotSelect.value = activePubmedSnapshotId || '';
+  btnDeletePubmedSnapshot?.classList.toggle('hidden', !activePubmedSnapshotId);
+}
+
+let activePubmedMonthPicker = null;
+
+function closePubmedMonthPicker() {
+  if (!activePubmedMonthPicker) return;
+  const { picker, onOutsidePointerDown, onKeyDown, onResize } = activePubmedMonthPicker;
+  document.removeEventListener('pointerdown', onOutsidePointerDown, true);
+  document.removeEventListener('keydown', onKeyDown, true);
+  window.removeEventListener('resize', onResize);
+  picker.remove();
+  activePubmedMonthPicker = null;
+}
+
+function openPubmedMonthPicker(input) {
+  closePubmedMonthPicker();
+  const current = input.value.match(/^(\d{4})-(\d{2})$/);
+  let year = current ? Number(current[1]) : new Date().getFullYear();
+  const selectedMonth = current ? Number(current[2]) : null;
+  const picker = document.createElement('div');
+  picker.className = 'pubmed-month-picker';
+  picker.setAttribute('role', 'dialog');
+  picker.setAttribute('aria-label', input.getAttribute('aria-label') || '选择月份');
+
+  const positionPicker = () => {
+    const rect = input.getBoundingClientRect();
+    const left = Math.min(Math.max(8, rect.left), window.innerWidth - picker.offsetWidth - 8);
+    const below = rect.bottom + 6;
+    const top = below + picker.offsetHeight <= window.innerHeight - 8
+      ? below
+      : Math.max(8, rect.top - picker.offsetHeight - 6);
+    picker.style.left = `${left}px`;
+    picker.style.top = `${top}px`;
+  };
+
+  const renderPicker = () => {
+    picker.innerHTML = `
+      <div class="pubmed-month-picker-header">
+        <button class="pubmed-month-picker-nav" type="button" data-year-step="-1" aria-label="上一年">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9.5 4.5-3.5 3.5 3.5 3.5" /></svg>
+        </button>
+        <strong>${year} 年</strong>
+        <button class="pubmed-month-picker-nav" type="button" data-year-step="1" aria-label="下一年">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6.5 4.5 3.5 3.5-3.5 3.5" /></svg>
+        </button>
+      </div>
+      <div class="pubmed-month-picker-grid">
+        ${Array.from({ length: 12 }, (_, index) => {
+          const month = index + 1;
+          const selected = year === Number(current?.[1]) && month === selectedMonth;
+          return `<button class="pubmed-month-picker-month${selected ? ' selected' : ''}" type="button" data-month="${month}"${selected ? ' aria-current="date"' : ''}>${month} 月</button>`;
+        }).join('')}
+      </div>
+      <button class="pubmed-month-picker-clear" type="button">清除</button>
+    `;
+    picker.querySelectorAll('[data-year-step]').forEach(button => {
+      button.addEventListener('click', () => {
+        year += Number(button.dataset.yearStep);
+        renderPicker();
+        positionPicker();
+      });
+    });
+    picker.querySelectorAll('[data-month]').forEach(button => {
+      button.addEventListener('click', () => {
+        input.value = `${year}-${String(button.dataset.month).padStart(2, '0')}`;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        closePubmedMonthPicker();
+        input.focus();
+      });
+    });
+    picker.querySelector('.pubmed-month-picker-clear')?.addEventListener('click', () => {
+      input.value = '';
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      closePubmedMonthPicker();
+      input.focus();
+    });
+  };
+
+  const onOutsidePointerDown = event => {
+    if (event.target !== input && !picker.contains(event.target)) closePubmedMonthPicker();
+  };
+  const onKeyDown = event => {
+    if (event.key === 'Escape') closePubmedMonthPicker();
+  };
+  const onResize = () => positionPicker();
+  activePubmedMonthPicker = { picker, onOutsidePointerDown, onKeyDown, onResize };
+  document.body.appendChild(picker);
+  renderPicker();
+  positionPicker();
+  document.addEventListener('pointerdown', onOutsidePointerDown, true);
+  document.addEventListener('keydown', onKeyDown, true);
+  window.addEventListener('resize', onResize);
+}
+
+function setupPubmedMonthPicker(input) {
+  input?.addEventListener('click', () => openPubmedMonthPicker(input));
+  input?.addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === ' ' || event.key === 'ArrowDown') {
+      event.preventDefault();
+      openPubmedMonthPicker(input);
+    }
+  });
+}
+
+function syncPubmedFilterInputs() {
+  if (pubmedStatusFilter) pubmedStatusFilter.value = pubmedFilters.status;
+  if (pubmedSort) pubmedSort.value = pubmedFilters.sort;
+  if (pubmedStarFilter) pubmedStarFilter.value = pubmedFilters.star;
+  if (pubmedPublishedFrom) pubmedPublishedFrom.value = pubmedFilters.publishedFrom;
+  if (pubmedPublishedTo) pubmedPublishedTo.value = pubmedFilters.publishedTo;
+  if (pubmedAddedFrom) pubmedAddedFrom.value = pubmedFilters.addedFrom;
+  if (pubmedAddedTo) pubmedAddedTo.value = pubmedFilters.addedTo;
+}
+
+function syncCompactFilterSummaries() {
+  const pubmedActiveCount = [
+    pubmedFilters.status !== 'all',
+    pubmedFilters.sort !== 'publication-desc',
+    Boolean(pubmedFilters.publishedFrom),
+    Boolean(pubmedFilters.publishedTo),
+    Boolean(pubmedFilters.addedFrom),
+    Boolean(pubmedFilters.addedTo),
+    Boolean(activePubmedSnapshotId),
+  ].filter(Boolean).length;
+  const metricActiveCount = Object.values(entryMetricFilters).filter(value => value !== 'all').length
+    + (entryTagFilterValue !== 'all' ? 1 : 0)
+    + (['pubmed', 'kept'].includes(mode) && pubmedFilters.star !== 'all' ? 1 : 0);
+  if (entryMetricFilterSummaryCount) {
+    const activeCount = metricActiveCount + (['pubmed', 'kept'].includes(mode) ? pubmedActiveCount : 0);
+    entryMetricFilterSummaryCount.textContent = activeCount ? `${activeCount} 项` : '';
+  }
+}
+
+function activatePubmedSnapshot(snapshotId) {
+  activePubmedSnapshotId = snapshotId || null;
+  const snapshot = currentPubmedSnapshot();
+  if (snapshot) {
+    pubmedFilters.star = 'all';
+    Object.assign(pubmedFilters, snapshot.filters || {});
+    Object.assign(entryMetricFilters, snapshot.metricFilters || {});
+    entryTagFilterValue = snapshot.tagFilter || 'all';
+    syncPubmedFilterInputs();
+    syncEntryMetricFilterControls();
+    persistEntryMetricFilters();
+    refreshEntryTagFilterOptions(allEntries);
+    if (entryTagFilter) entryTagFilter.value = entryTagFilterValue;
+  }
+  clearEntrySelection({ render: false, syncPaperChat: false });
+  pubmedRenderLimit = 200;
+  refreshPubmedSnapshotControls();
+  renderEntryList(allEntries);
+  refreshPaperChatAfterScopeDataChange();
+}
+
+function saveCurrentPubmedSnapshot() {
+  if (!['pubmed', 'kept'].includes(mode)) return;
+  const entries = getFilteredPubmedEntries(allEntries);
+  if (!entries.length) {
+    setGlobalStatus('当前筛选结果为空，无法保存快照', 'error');
+    return;
+  }
+  const now = new Date();
+  const defaultName = `快照 ${now.toLocaleDateString('zh-CN')} ${now.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`;
+  const name = window.prompt('快照名称', defaultName)?.trim();
+  if (!name) return;
+  const snapshot = {
+    id: `snapshot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    scope: currentPubmedSnapshotScope(),
+    name: name.slice(0, 60),
+    entryIds: entries.map(entry => entry.id),
+    filters: { ...pubmedFilters },
+    metricFilters: { ...entryMetricFilters },
+    tagFilter: entryTagFilterValue,
+    createdAt: now.toISOString(),
+  };
+  pubmedSnapshots.push(snapshot);
+  persistPubmedSnapshots();
+  activePubmedSnapshotId = snapshot.id;
+  refreshPubmedSnapshotControls();
+  renderEntryList(allEntries);
+  setGlobalStatus(`已保存快照“${snapshot.name}”，共 ${snapshot.entryIds.length} 篇`, 'success');
+}
+
+async function deleteCurrentPubmedSnapshot() {
+  const snapshot = currentPubmedSnapshot();
+  if (!snapshot) return;
+  const confirmed = await confirmDialog(`删除筛选快照“${snapshot.name}”？`, {
+    okLabel: '删除', cancelLabel: '取消', danger: true,
+  });
+  if (!confirmed) return;
+  pubmedSnapshots = pubmedSnapshots.filter(item => item.id !== snapshot.id);
+  persistPubmedSnapshots();
+  activePubmedSnapshotId = null;
+  refreshPubmedSnapshotControls();
+  renderEntryList(allEntries);
+  setGlobalStatus('筛选快照已删除', 'success');
+}
+
 async function importOpml() {
   try {
     const dialog = window.__TAURI__?.dialog;
@@ -828,6 +1822,935 @@ async function importOpml() {
 }
 
 // ── Feed management ────────────────────────────
+let pubmedEditingSearchId = null;
+let pubmedSearchBuilderMode = 'topic';
+
+function pubmedRetrievalScope() {
+  return document.querySelector('input[name="pubmed-retrieval-scope"]:checked')?.value || '';
+}
+
+function pubmedRetrievalOptionsFromForm() {
+  const scope = pubmedRetrievalScope();
+  const rawLimit = Number(document.getElementById('pubmed-retrieval-limit')?.value || 0);
+  const dateFrom = document.getElementById('pubmed-retrieval-date-from')?.value || '';
+  const dateTo = document.getElementById('pubmed-retrieval-date-to')?.value || '';
+  if (!scope) throw new Error('请选择正式抓取范围');
+  if (scope === 'custom' && (!Number.isSafeInteger(rawLimit) || rawLimit < 1)) {
+    throw new Error('自定义抓取数量必须是正整数');
+  }
+  if (scope === 'date_range' || (scope === 'custom' && (dateFrom || dateTo))) {
+    if (!dateFrom || !dateTo) throw new Error('请选择完整的开始和结束日期');
+    if (dateFrom > dateTo) throw new Error('开始日期不能晚于结束日期');
+  }
+  const usesDateRange = scope === 'date_range' || (scope === 'custom' && dateFrom && dateTo);
+  return {
+    scope,
+    limit: scope === 'top' ? 10000 : (scope === 'custom' ? rawLimit : null),
+    date_from: usesDateRange ? dateFrom : null,
+    date_to: usesDateRange ? dateTo : null,
+    sort: document.getElementById('pubmed-retrieval-sort')?.value || 'most_recent',
+  };
+}
+
+function updatePubmedRetrievalUi() {
+  const scope = pubmedRetrievalScope();
+  document.getElementById('pubmed-retrieval-custom-row')?.classList.toggle('hidden', scope !== 'custom');
+  document.getElementById('pubmed-retrieval-date-row')?.classList.toggle('hidden', !['custom', 'date_range'].includes(scope));
+  const optionalDate = scope === 'custom';
+  const fromLabel = document.getElementById('pubmed-retrieval-date-from-label');
+  const toLabel = document.getElementById('pubmed-retrieval-date-to-label');
+  if (fromLabel) fromLabel.textContent = optionalDate ? '开始日期（可选）' : '开始日期';
+  if (toLabel) toLabel.textContent = optionalDate ? '结束日期（可选）' : '结束日期';
+  const total = Number(pubmedPreview?.total_count || 0);
+  const count = document.getElementById('pubmed-retrieval-all-count');
+  if (count) count.textContent = total ? `(${total.toLocaleString('zh-CN')} 篇)` : '';
+  const button = document.getElementById('btn-create-pubmed-search');
+  if (!button) return;
+  const prefix = pubmedEditingSearchId ? '保存并更新' : '创建并抓取';
+  if (pubmedPreview && !scope) {
+    button.textContent = '请选择抓取范围';
+    button.disabled = true;
+    return;
+  }
+  button.disabled = !pubmedPreview;
+  let suffix = '';
+  if (pubmedPreview) {
+    if (scope === 'all') {
+      suffix = `全部 ${total.toLocaleString('zh-CN')} 篇`;
+    } else if (scope === 'date_range') {
+      suffix = '所选日期范围';
+    } else if (scope === 'top') {
+      suffix = `前 ${Math.min(10000, total).toLocaleString('zh-CN')} 篇`;
+    } else if (scope === 'custom') {
+      const limit = Number(document.getElementById('pubmed-retrieval-limit')?.value || 0);
+      if (limit > 0) {
+        const hasDates = document.getElementById('pubmed-retrieval-date-from')?.value
+          && document.getElementById('pubmed-retrieval-date-to')?.value;
+        suffix = `${hasDates ? '所选日期内' : ''}最多 ${Math.min(limit, total).toLocaleString('zh-CN')} 篇`;
+      }
+    }
+  }
+  button.textContent = suffix ? `${prefix}${suffix}` : prefix;
+}
+
+function invalidatePubmedPreview() {
+  const hadPreview = !!pubmedPreview;
+  pubmedPreview = null;
+  pubmedPreviewAssessment = null;
+  pubmedPreviewSettingsReturnPending = false;
+  document.getElementById('btn-create-pubmed-search').disabled = true;
+  document.getElementById('pubmed-retrieval-panel').disabled = true;
+  document.getElementById('pubmed-preview-results')?.classList.add('hidden');
+  if (hadPreview) {
+    document.getElementById('pubmed-preview-status').textContent = '检索式有变化，请重新预览';
+  }
+  updatePubmedRetrievalUi();
+}
+
+function setPubmedRetrievalForm(source) {
+  document.querySelectorAll('input[name="pubmed-retrieval-scope"]').forEach(input => {
+    input.checked = false;
+  });
+  const scope = source?.retrieval_scope || '';
+  const target = scope
+    ? document.querySelector(`input[name="pubmed-retrieval-scope"][value="${scope}"]`)
+    : null;
+  if (target) target.checked = true;
+  const limit = document.getElementById('pubmed-retrieval-limit');
+  if (limit) limit.value = String(source?.retrieval_limit || 10000);
+  const dateFrom = document.getElementById('pubmed-retrieval-date-from');
+  const dateTo = document.getElementById('pubmed-retrieval-date-to');
+  if (dateFrom) dateFrom.value = source?.retrieval_date_from || '';
+  if (dateTo) dateTo.value = source?.retrieval_date_to || '';
+  const sort = document.getElementById('pubmed-retrieval-sort');
+  if (sort) sort.value = source?.retrieval_sort || 'most_recent';
+  updatePubmedRetrievalUi();
+}
+
+function setPubmedSearchBuilderMode(nextMode) {
+  pubmedSearchBuilderMode = nextMode === 'author' ? 'author' : 'topic';
+  document.querySelectorAll('[data-pubmed-search-mode]').forEach(button => {
+    button.classList.toggle('active', button.dataset.pubmedSearchMode === pubmedSearchBuilderMode);
+  });
+  document.getElementById('pubmed-topic-builder')?.classList.toggle('hidden', pubmedSearchBuilderMode !== 'topic');
+  document.getElementById('pubmed-author-builder')?.classList.toggle('hidden', pubmedSearchBuilderMode !== 'author');
+  invalidatePubmedPreview();
+}
+
+function openPubmedSearchModal({ source = null, editing = false } = {}) {
+  const modal = document.getElementById('pubmed-search-modal');
+  if (!modal) return;
+  pubmedEditingSearchId = editing ? source?.id || null : null;
+  document.getElementById('pubmed-question').value = source?.question || '';
+  document.getElementById('pubmed-batch-query-input').value = source?.query || '';
+  document.getElementById('pubmed-author-name').value = '';
+  document.getElementById('pubmed-author-affiliation').value = '';
+  document.getElementById('pubmed-author-start-date').value = '';
+  document.getElementById('pubmed-author-end-date').value = '';
+  document.getElementById('pubmed-search-name').value = source
+    ? (editing ? source.name : `${source.name} 副本`)
+    : '';
+  setPubmedRetrievalForm(source);
+  document.getElementById('pubmed-modal-title').textContent = editing ? '编辑 PubMed 检索' : '新建 PubMed 检索';
+  document.getElementById('pubmed-modal-description').textContent = editing
+    ? '保存后保留历史文献与筛选记录，后续更新使用新的检索式。'
+    : '确认检索式后，Cento 将直接从 PubMed 抓取并持续更新。';
+  document.getElementById('pubmed-preview-status').textContent = '';
+  document.getElementById('pubmed-preview-results').innerHTML = '';
+  document.getElementById('pubmed-preview-results').classList.add('hidden');
+  document.getElementById('btn-create-pubmed-search').disabled = true;
+  document.getElementById('pubmed-retrieval-panel').disabled = true;
+  pubmedPreview = null;
+  pubmedPreviewAssessment = null;
+  updatePubmedRetrievalUi();
+  setPubmedSearchBuilderMode('topic');
+  modal.classList.remove('hidden');
+  setTimeout(() => document.getElementById(source ? 'pubmed-batch-query-input' : 'pubmed-question')?.focus(), 0);
+}
+
+async function buildPubmedAuthorQuery() {
+  const authorName = document.getElementById('pubmed-author-name').value.trim();
+  const affiliation = document.getElementById('pubmed-author-affiliation').value.trim();
+  const startDate = document.getElementById('pubmed-author-start-date').value;
+  const endDate = document.getElementById('pubmed-author-end-date').value;
+  const button = document.getElementById('btn-build-pubmed-author-query');
+  const status = document.getElementById('pubmed-preview-status');
+  button.disabled = true;
+  try {
+    const query = await invoke('build_pubmed_author_query', {
+      authorName,
+      affiliation: affiliation || null,
+      startDate: startDate || null,
+      endDate: endDate || null,
+    });
+    document.getElementById('pubmed-batch-query-input').value = query;
+    const nameInput = document.getElementById('pubmed-search-name');
+    if (!nameInput.value.trim()) nameInput.value = `${authorName} 文献`;
+    document.getElementById('pubmed-question').value = `持续关注作者 ${authorName}${affiliation ? `（${affiliation}）` : ''} 的 PubMed 文献`;
+    invalidatePubmedPreview();
+    status.textContent = '作者检索式已构建，请预览并核对作者与机构';
+  } catch (e) {
+    status.textContent = `构建失败：${e}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function closePubmedSearchModal() {
+  document.getElementById('pubmed-search-modal')?.classList.add('hidden');
+  pubmedEditingSearchId = null;
+  pubmedPreviewSettingsReturnPending = false;
+}
+
+async function generatePubmedQuery() {
+  const question = document.getElementById('pubmed-question').value.trim();
+  const button = document.getElementById('btn-generate-pubmed-query');
+  const status = document.getElementById('pubmed-preview-status');
+  if (!question) {
+    status.textContent = '请先填写研究问题';
+    return;
+  }
+  button.disabled = true;
+  status.textContent = '正在生成检索式…';
+  try {
+    const query = await invoke('natural_to_pubmed_query', { text: question });
+    loadCostSummary();
+    document.getElementById('pubmed-batch-query-input').value = query;
+    invalidatePubmedPreview();
+    status.textContent = '检索式已生成，可继续修改';
+  } catch (e) {
+    status.textContent = `AI 生成失败：${e}。仍可手工输入检索式。`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function pubmedPreviewEntryAssessmentMeta(status) {
+  return {
+    relevant: { label: '符合', className: 'relevant' },
+    maybe: { label: '待确认', className: 'maybe' },
+    irrelevant: { label: '不符合', className: 'irrelevant' },
+  }[status] || { label: '待确认', className: 'maybe' };
+}
+
+function pubmedPreviewVerdictMeta(verdict) {
+  return {
+    good: { label: '匹配较好', className: 'good' },
+    refine: { label: '建议调整', className: 'refine' },
+    poor: { label: '偏题较多', className: 'poor' },
+  }[verdict] || { label: '建议复核', className: 'refine' };
+}
+
+function pubmedPreviewRecallRiskMeta(risk) {
+  return {
+    low: { label: '低', className: 'low' },
+    moderate: { label: '中', className: 'moderate' },
+    high: { label: '高', className: 'high' },
+  }[risk] || { label: '中', className: 'moderate' };
+}
+
+function truncatePubmedPreviewText(value, limit = 320) {
+  const text = String(value || '').trim();
+  return text.length > limit ? `${text.slice(0, limit)}…` : text;
+}
+
+function renderPubmedPreviewResults(preview, assessment = null, assessmentError = '') {
+  const results = document.getElementById('pubmed-preview-results');
+  if (!results || !preview) return;
+  const assessmentByPmid = new Map((assessment?.entries || []).map(item => [item.pmid, item]));
+  const renderSampleEntry = entry => {
+    const itemAssessment = assessmentByPmid.get(entry.pmid);
+    const assessmentMeta = itemAssessment
+      ? pubmedPreviewEntryAssessmentMeta(itemAssessment.status)
+      : null;
+    const abstractText = truncatePubmedPreviewText(entry.abstract_text || '暂无摘要');
+    return `
+      <div class="pubmed-preview-item">
+        <div class="pubmed-preview-item-heading">
+          <div class="pubmed-preview-item-title">${escapeHtml(entry.title)}</div>
+          ${assessmentMeta ? `<span class="pubmed-preview-entry-status ${assessmentMeta.className}">${assessmentMeta.label}</span>` : ''}
+        </div>
+        <div class="pubmed-preview-item-meta">${escapeHtml(entry.journal || '期刊待确认')} · ${escapeHtml(formatPubmedPublicationDate(entry) || '日期待确认')} · PMID ${escapeHtml(entry.pmid)}</div>
+        <div class="pubmed-preview-item-abstract">${escapeHtml(abstractText)}</div>
+        ${itemAssessment?.reason ? `<div class="pubmed-preview-item-reason">${escapeHtml(itemAssessment.reason)}</div>` : ''}
+        ${pubmedSearchBuilderMode === 'author' ? `<div class="pubmed-preview-item-meta">作者：${escapeHtml(entry.authors || '作者待确认')}</div><div class="pubmed-preview-item-meta">机构：${escapeHtml(entry.affiliation || '机构待确认')}</div>` : ''}
+      </div>`;
+  };
+  const sampleEntries = preview.entries || [];
+  const previews = sampleEntries.slice(0, 5).map(renderSampleEntry).join('');
+  const remainingSamples = sampleEntries.slice(5).map(renderSampleEntry).join('');
+
+  let assessmentHtml = '';
+  if (assessment) {
+    const verdict = pubmedPreviewVerdictMeta(assessment.verdict);
+    const recallRisk = pubmedPreviewRecallRiskMeta(assessment.recall_risk);
+    const coverageGaps = (assessment.coverage_gaps || [])
+      .map(gap => `<li>${escapeHtml(gap)}</li>`)
+      .join('');
+    assessmentHtml = `
+      <section class="pubmed-preview-assessment ${verdict.className}">
+        <div class="pubmed-preview-assessment-heading">
+          <strong>AI 检索式质量评估</strong>
+          <span class="pubmed-preview-verdict ${verdict.className}">${verdict.label}</span>
+        </div>
+        <div class="pubmed-preview-quality-grid">
+          <div><span>查准率估计</span><strong>${Number(assessment.precision_percent || 0).toFixed(1)}%</strong><small>95% CI ${Number(assessment.precision_low_percent || 0).toFixed(1)}–${Number(assessment.precision_high_percent || 0).toFixed(1)}%</small></div>
+          <div><span>查全风险</span><strong class="${recallRisk.className}">${recallRisk.label}</strong><small>不等同于真实查全率</small></div>
+          <div><span>抽样规模</span><strong>${assessment.sample_size || assessment.entries?.length || 0}</strong><small>当前排序结果等距抽样</small></div>
+          <div><span>摘要可用</span><strong>${assessment.abstract_count || 0}</strong><small>其余仅依据题名判断</small></div>
+        </div>
+        <div class="pubmed-preview-assessment-counts">
+          <span class="relevant">符合 ${assessment.relevant_count}</span>
+          <span class="maybe">待确认 ${assessment.maybe_count}</span>
+          <span class="irrelevant">不符合 ${assessment.irrelevant_count}</span>
+        </div>
+        <p>${escapeHtml(assessment.summary || '')}</p>
+        <div class="pubmed-preview-recall-note">${escapeHtml(assessment.recall_assessment || '')}</div>
+        ${coverageGaps ? `<div class="pubmed-preview-coverage-gaps"><strong>可能的覆盖缺口</strong><ul>${coverageGaps}</ul></div>` : ''}
+        ${assessment.suggested_query ? `
+          <div class="pubmed-preview-suggested-query">
+            <div class="pubmed-preview-suggested-query-heading">
+              <strong>建议检索式</strong>
+              <button class="btn btn-secondary btn-sm" type="button" data-use-suggested-query>采用建议检索式</button>
+            </div>
+            <code>${escapeHtml(assessment.suggested_query)}</code>
+          </div>` : ''}
+      </section>`;
+  } else if (assessmentError) {
+    const friendlyError = formatPubmedPreviewAssessmentError(assessmentError);
+    assessmentHtml = `
+      <div class="pubmed-preview-assessment-error">
+        <span>${escapeHtml(friendlyError)}</span>
+        <div class="pubmed-preview-error-actions">
+          <button class="btn btn-secondary btn-sm" type="button" data-open-ai-settings>前往 AI 设置</button>
+          <button class="btn btn-secondary btn-sm" type="button" data-retry-ai-assessment>重试 AI 初判</button>
+        </div>
+      </div>`;
+  }
+
+  results.innerHTML = `
+    ${assessmentHtml}
+    <div class="pubmed-preview-summary">抽样题名与摘要 · 显示前 ${Math.min(5, sampleEntries.length)} 篇${assessment ? ` · AI 已判断 ${assessment.entries?.length || 0} 篇` : ''}</div>
+    ${previews || '<div class="pubmed-preview-item-meta">没有可预览记录</div>'}
+    ${remainingSamples ? `<details class="pubmed-preview-sample-details"><summary>查看其余 ${sampleEntries.length - 5} 篇抽样文献</summary><div>${remainingSamples}</div></details>` : ''}
+  `;
+  results.classList.remove('hidden');
+
+  results.querySelector('[data-use-suggested-query]')?.addEventListener('click', () => {
+    const queryInput = document.getElementById('pubmed-batch-query-input');
+    if (!queryInput || !assessment?.suggested_query) return;
+    queryInput.value = assessment.suggested_query;
+    invalidatePubmedPreview();
+    document.getElementById('pubmed-preview-status').textContent = '已采用 AI 建议检索式，请重新预览';
+    queryInput.focus();
+  });
+  results.querySelector('[data-open-ai-settings]')?.addEventListener('click', () => {
+    pubmedPreviewSettingsReturnPending = true;
+    document.getElementById('pubmed-search-modal')?.classList.add('hidden');
+    showSettings('translation');
+  });
+  results.querySelector('[data-retry-ai-assessment]')?.addEventListener('click', retryPubmedPreviewAssessment);
+}
+
+function formatPubmedPreviewAssessmentError(error) {
+  const message = String(error || '未知错误');
+  if (/token plan limit exhausted|insufficient quota|quota exceeded|额度已用尽/i.test(message)) {
+    return '当前 AI 服务额度已用尽。请更换可用的 API Key 或服务商后重试；PubMed 预览结果已保留。';
+  }
+  if (/429|请求过于频繁|rate limit/i.test(message)) {
+    return '当前 AI 服务请求过于频繁。请稍后重试或更换服务商；PubMed 预览结果已保留。';
+  }
+  return `AI 初判失败：${message}。你仍可人工检查预览结果。`;
+}
+
+async function retryPubmedPreviewAssessment() {
+  if (!pubmedPreview) return;
+  const question = document.getElementById('pubmed-question')?.value.trim() || '';
+  const status = document.getElementById('pubmed-preview-status');
+  const button = document.getElementById('btn-preview-pubmed-search');
+  if (!question) {
+    status.textContent = '请先填写研究问题';
+    return;
+  }
+
+  button.disabled = true;
+  status.textContent = `AI 正在重新评估 ${pubmedPreview.entries.length} 篇样本…`;
+  try {
+    pubmedPreviewAssessment = await invoke('assess_pubmed_search_preview', {
+      question,
+      query: pubmedPreview.query,
+      entries: pubmedPreview.entries,
+    });
+    pubmedPreviewSettingsReturnPending = false;
+    loadCostSummary();
+    renderPubmedPreviewResults(pubmedPreview, pubmedPreviewAssessment);
+    const verdict = pubmedPreviewVerdictMeta(pubmedPreviewAssessment.verdict);
+    status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇 · 抽样 ${pubmedPreviewAssessment.sample_size} 篇 · ${verdict.label}`;
+    invoke('start_translation_pipeline').catch(() => {});
+  } catch (error) {
+    renderPubmedPreviewResults(pubmedPreview, null, String(error));
+    status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇 · AI 初判失败`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function previewPubmedSearch() {
+  const query = document.getElementById('pubmed-batch-query-input').value.trim();
+  const question = document.getElementById('pubmed-question').value.trim();
+  const button = document.getElementById('btn-preview-pubmed-search');
+  const status = document.getElementById('pubmed-preview-status');
+  const results = document.getElementById('pubmed-preview-results');
+  if (!query) {
+    status.textContent = '请输入检索式';
+    return;
+  }
+  const options = {
+    scope: 'all',
+    limit: null,
+    date_from: null,
+    date_to: null,
+    sort: document.getElementById('pubmed-retrieval-sort')?.value || 'most_recent',
+  };
+  button.disabled = true;
+  status.textContent = '正在查询 PubMed…';
+  results.classList.add('hidden');
+  pubmedPreviewAssessment = null;
+  try {
+    pubmedPreview = await invoke('preview_pubmed_search', { query, options });
+    renderPubmedPreviewResults(pubmedPreview);
+
+    const shouldAssess = pubmedSearchBuilderMode === 'topic'
+      && question
+      && (pubmedPreview.entries || []).length > 0;
+    if (shouldAssess) {
+      status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇，AI 正在评估 ${pubmedPreview.entries.length} 篇题名与摘要…`;
+      try {
+        pubmedPreviewAssessment = await invoke('assess_pubmed_search_preview', {
+          question,
+          query: pubmedPreview.query,
+          entries: pubmedPreview.entries,
+        });
+        loadCostSummary();
+        renderPubmedPreviewResults(pubmedPreview, pubmedPreviewAssessment);
+        const verdict = pubmedPreviewVerdictMeta(pubmedPreviewAssessment.verdict);
+        status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇 · 抽样 ${pubmedPreviewAssessment.sample_size} 篇 · ${verdict.label}`;
+      } catch (assessmentError) {
+        renderPubmedPreviewResults(pubmedPreview, null, String(assessmentError));
+        status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇 · AI 初判失败`;
+      }
+    } else {
+      status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇${pubmedSearchBuilderMode === 'topic' ? ' · 填写研究问题后可进行 AI 初判' : ''}`;
+    }
+    document.getElementById('pubmed-retrieval-panel').disabled = false;
+    updatePubmedRetrievalUi();
+  } catch (e) {
+    pubmedPreview = null;
+    pubmedPreviewAssessment = null;
+    document.getElementById('pubmed-retrieval-panel').disabled = true;
+    status.textContent = `预览失败：${e}`;
+    document.getElementById('btn-create-pubmed-search').disabled = true;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function createAndRunPubmedSearch() {
+  const name = document.getElementById('pubmed-search-name').value.trim();
+  const question = document.getElementById('pubmed-question').value.trim();
+  const query = document.getElementById('pubmed-batch-query-input').value.trim();
+  const button = document.getElementById('btn-create-pubmed-search');
+  const status = document.getElementById('pubmed-preview-status');
+  let options;
+  try {
+    options = pubmedRetrievalOptionsFromForm();
+  } catch (error) {
+    status.textContent = String(error.message || error);
+    return;
+  }
+  if (!pubmedPreview || pubmedPreview.query !== query) {
+    status.textContent = '检索式有变化，请重新预览';
+    button.disabled = true;
+    return;
+  }
+  if (!name) {
+    status.textContent = '请填写检索名称';
+    return;
+  }
+  button.disabled = true;
+  status.textContent = pubmedEditingSearchId ? '正在保存检索式…' : '正在创建检索批次…';
+  try {
+    const search = pubmedEditingSearchId
+      ? await invoke('update_pubmed_search', {
+          id: pubmedEditingSearchId,
+          name,
+          question: question || null,
+          query,
+          options,
+        })
+      : await invoke('create_pubmed_search', { name, question: question || null, query, options });
+    closePubmedSearchModal();
+    await loadPubmedSearches();
+    await selectPubmedSearch(search.id);
+    await runCurrentPubmedSearch();
+  } catch (e) {
+    status.textContent = `${pubmedEditingSearchId ? '保存' : '创建'}失败：${e}`;
+    button.disabled = false;
+  }
+}
+
+async function runCurrentPubmedSearch() {
+  if (!currentPubmedSearch || activePubmedRunId) return;
+  btnRunPubmedSearch.disabled = true;
+  pubmedProgressEl.classList.remove('hidden');
+  pubmedProgressLabel.textContent = '正在建立 PMID 快照…';
+  pubmedProgressFill.style.width = '0%';
+  setGlobalStatus(`正在更新「${currentPubmedSearch.name}」`, 'progress');
+  try {
+    const result = await invoke('run_pubmed_search', { searchId: currentPubmedSearch.id });
+    if (result.status === 'completed') {
+      setGlobalStatus(`更新完成：新增 ${result.added_count}，已有 ${result.reused_count}`, 'success');
+    } else {
+      const detail = result.error_message ? `：${result.error_message}` : `：失败 ${result.failed_count}`;
+      setGlobalStatus(`更新${pubmedRunStatusLabel(result.status)}${detail}`, 'error');
+    }
+    await loadPubmedSearches();
+    await selectPubmedSearch(currentPubmedSearch.id);
+  } catch (e) {
+    setGlobalStatus('PubMed 更新失败: ' + e, 'error');
+  } finally {
+    activePubmedRunId = null;
+    btnRunPubmedSearch.disabled = false;
+    setTimeout(() => pubmedProgressEl?.classList.add('hidden'), 1600);
+  }
+}
+
+function pubmedRunStatusLabel(status) {
+  return { partial: '部分完成', failed: '失败', cancelled: '已取消', completed: '完成' }[status] || status;
+}
+
+async function applyBulkPubmedStatus(status) {
+  if (!currentPubmedSearch || !selectedEntryIds.size || !status) return;
+  try {
+    await invoke('bulk_set_pubmed_screening_status', {
+      searchId: currentPubmedSearch.id,
+      entryIds: [...selectedEntryIds],
+      status,
+    });
+    allEntries.forEach(entry => {
+      if (selectedEntryIds.has(entry.id)) entry.screening_status = status;
+    });
+    clearEntrySelection({ keepMode: true, render: false });
+    renderEntryList(allEntries);
+    await loadPubmedSearches();
+    setGlobalStatus(`已将所选文献设为${pubmedStatusLabel(status)}`, 'success');
+  } catch (e) {
+    setGlobalStatus('批量筛选失败: ' + e, 'error');
+  }
+}
+
+function requestPubmedScreeningCriteria() {
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.className = 'pubmed-modal';
+    overlay.innerHTML = `
+      <div class="pubmed-modal-backdrop"></div>
+      <section class="pubmed-modal-panel pubmed-criteria-panel">
+        <header class="pubmed-modal-header"><div><h2>AI 辅助筛选</h2><p>AI 只生成建议，确认前不会修改筛选状态。</p></div></header>
+        <div class="pubmed-modal-body">
+          <label class="pubmed-field"><span>纳入与排除标准</span><textarea rows="6" placeholder="例如：保留成人脓毒症患者的单细胞研究；排除动物实验、综述和无免疫表型数据的研究。"></textarea></label>
+        </div>
+        <footer class="pubmed-modal-footer"><button class="btn btn-secondary" data-cancel type="button">取消</button><button class="btn btn-primary" data-submit type="button">生成建议</button></footer>
+      </section>`;
+    const textarea = overlay.querySelector('textarea');
+    const cleanup = value => { overlay.remove(); resolve(value); };
+    overlay.querySelector('.pubmed-modal-backdrop').addEventListener('click', () => cleanup(null));
+    overlay.querySelector('[data-cancel]').addEventListener('click', () => cleanup(null));
+    overlay.querySelector('[data-submit]').addEventListener('click', () => {
+      const criteria = textarea.value.trim();
+      if (!criteria) { textarea.focus(); return; }
+      cleanup(criteria);
+    });
+    document.body.appendChild(overlay);
+    setTimeout(() => textarea.focus(), 0);
+  });
+}
+
+async function startPubmedAiScreening() {
+  if (!currentPubmedSearch) return;
+  const entries = getSelectedEntries();
+  if (!entries.length) {
+    setGlobalStatus('请先勾选需要 AI 辅助筛选的文献', 'error');
+    return;
+  }
+  if (entries.length > 30) {
+    setGlobalStatus('AI 筛选单次最多支持 30 篇文献', 'error');
+    return;
+  }
+  const criteria = await requestPubmedScreeningCriteria();
+  if (!criteria) return;
+  btnPubmedAiScreen.disabled = true;
+  setGlobalStatus(`正在分析 ${entries.length} 篇文献…`, 'progress');
+  try {
+    const result = await invoke('suggest_pubmed_screening', {
+      searchId: currentPubmedSearch.id,
+      entryIds: entries.map(entry => entry.id),
+      criteria,
+    });
+    loadCostSummary();
+    showPubmedSuggestionReview(result, entries);
+    setGlobalStatus('AI 建议已生成，等待确认', 'success');
+  } catch (e) {
+    setGlobalStatus('AI 筛选失败: ' + e, 'error');
+  } finally {
+    btnPubmedAiScreen.disabled = false;
+  }
+}
+
+function showPubmedSuggestionReview(result, selectedEntries) {
+  const byId = new Map(selectedEntries.map(entry => [entry.id, entry]));
+  const overlay = document.createElement('div');
+  overlay.className = 'pubmed-modal';
+  const rows = (result.suggestions || []).map(suggestion => {
+    const entry = byId.get(suggestion.entry_id);
+    if (!entry) return '';
+    return `
+      <div class="pubmed-suggestion-row" data-entry-id="${entry.id}" data-pmid="${escapeHtml(suggestion.pmid || entry.pmid || '')}">
+        <div class="pubmed-suggestion-index">${escapeHtml(entry.pmid ? `PMID ${entry.pmid}` : `ID ${entry.id}`)}</div>
+        <div class="pubmed-suggestion-paper"><strong>${escapeHtml(entry.title_translated || entry.title)}</strong><span>${escapeHtml(suggestion.reason || '未提供理由')}</span></div>
+        <select class="pubmed-status-select status-${escapeHtml(suggestion.status)}">
+          <option value="keep" ${suggestion.status === 'keep' ? 'selected' : ''}>保留</option>
+          <option value="maybe" ${suggestion.status === 'maybe' ? 'selected' : ''}>待定</option>
+          <option value="exclude" ${suggestion.status === 'exclude' ? 'selected' : ''}>排除</option>
+        </select>
+      </div>`;
+  }).join('');
+  const empty = !rows
+    ? `<div class="pubmed-suggestion-raw"><p>AI 回答未能解析为可应用建议，数据库未改变。</p><pre>${escapeHtml(result.raw_answer || '')}</pre></div>`
+    : rows;
+  overlay.innerHTML = `
+    <div class="pubmed-modal-backdrop"></div>
+    <section class="pubmed-modal-panel pubmed-suggestion-panel">
+      <header class="pubmed-modal-header"><div><h2>确认 AI 筛选建议</h2><p>逐篇检查并调整状态，点击应用后才写入当前批次。</p></div><button class="pubmed-modal-close" data-close type="button" aria-label="关闭">×</button></header>
+      <div class="pubmed-modal-body pubmed-suggestion-list">${empty}</div>
+      <footer class="pubmed-modal-footer"><button class="btn btn-secondary" data-close type="button">取消</button>${rows ? '<button class="btn btn-primary" data-apply type="button">应用建议</button>' : ''}</footer>
+    </section>`;
+  const close = () => overlay.remove();
+  overlay.querySelector('.pubmed-modal-backdrop').addEventListener('click', close);
+  overlay.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', close));
+  overlay.querySelector('[data-apply]')?.addEventListener('click', async event => {
+    const button = event.currentTarget;
+    const suggestions = [...overlay.querySelectorAll('.pubmed-suggestion-row')].map(row => ({
+      entry_id: Number(row.dataset.entryId),
+      pmid: row.dataset.pmid || null,
+      status: row.querySelector('select').value,
+      reason: row.querySelector('.pubmed-suggestion-paper span').textContent,
+    }));
+    button.disabled = true;
+    try {
+      await invoke('apply_pubmed_screening_suggestions', {
+        searchId: currentPubmedSearch.id,
+        suggestions,
+      });
+      const statusById = new Map(suggestions.map(item => [item.entry_id, item.status]));
+      allEntries.forEach(entry => {
+        if (statusById.has(entry.id)) entry.screening_status = statusById.get(entry.id);
+      });
+      close();
+      clearEntrySelection({ render: false });
+      renderEntryList(allEntries);
+      await loadPubmedSearches();
+      setGlobalStatus(`已应用 ${suggestions.length} 条 AI 筛选建议`, 'success');
+    } catch (e) {
+      button.disabled = false;
+      setGlobalStatus('应用 AI 建议失败: ' + e, 'error');
+    }
+  });
+  document.body.appendChild(overlay);
+}
+
+function setupPubmedSearchEvents() {
+  const event = window.__TAURI__?.event;
+  event?.listen?.('pubmed-search-progress', eventPayload => {
+    const progress = eventPayload.payload || {};
+    if (currentPubmedSearch && progress.search_id !== currentPubmedSearch.id) return;
+    activePubmedRunId = progress.run_id || activePubmedRunId;
+    const total = Math.max(1, Number(progress.total || 0));
+    const processed = Number(progress.processed || 0);
+    pubmedProgressEl?.classList.remove('hidden');
+    if (pubmedProgressFill) pubmedProgressFill.style.width = `${Math.min(100, processed / total * 100)}%`;
+    if (pubmedProgressLabel) pubmedProgressLabel.textContent = `${processed}/${progress.total || 0} · 新增 ${progress.added || 0} · 失败 ${progress.failed || 0}`;
+  });
+}
+
+async function loadPubmedSearches() {
+  try {
+    allPubmedSearches = await invoke('list_pubmed_searches');
+    renderPubmedSearchList();
+    let keptCount = 0;
+    try { keptCount = (await invoke('list_kept_pubmed_entries')).length; } catch {}
+    const countEl = document.getElementById('count-kept');
+    if (countEl) countEl.textContent = keptCount || '';
+  } catch (e) {
+    allPubmedSearches = [];
+    renderPubmedSearchList();
+    setGlobalStatus('加载 PubMed 检索失败: ' + e, 'error');
+  }
+}
+
+function renderPubmedSearchList() {
+  if (!pubmedSearchListEl) return;
+  pubmedSearchListEl.innerHTML = '';
+  if (!allPubmedSearches.length) {
+    pubmedSearchListEl.innerHTML = '<li class="pubmed-search-empty">点击 + 新建持续检索</li>';
+    return;
+  }
+  allPubmedSearches.forEach(search => {
+    const li = document.createElement('li');
+    li.className = 'pubmed-search-item';
+    li.dataset.searchId = search.id;
+    li.classList.toggle('selected', mode === 'pubmed' && currentPubmedSearch?.id === search.id);
+
+    if (renamingPubmedSearchId === search.id) {
+      li.innerHTML = `<input class="pubmed-search-rename-input" type="text" value="${escapeHtml(search.name)}" />`;
+      const input = li.querySelector('.pubmed-search-rename-input');
+      input.addEventListener('click', event => event.stopPropagation());
+      input.addEventListener('keydown', event => {
+        if (event.key === 'Enter') finishRenamePubmedSearch(search.id, input.value);
+        if (event.key === 'Escape') cancelRenamePubmedSearch();
+      });
+      input.addEventListener('blur', () => finishRenamePubmedSearch(search.id, input.value));
+      pubmedSearchListEl.appendChild(li);
+      setTimeout(() => { input.focus(); input.select(); }, 0);
+      return;
+    }
+
+    li.innerHTML = `
+      <span class="pubmed-search-item-icon" aria-hidden="true">
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="4"/><path d="m10 10 3 3"/></svg>
+      </span>
+      <span class="pubmed-search-item-main">
+        <span class="pubmed-search-item-title">${escapeHtml(search.name)}</span>
+      </span>
+      <span class="pubmed-search-item-count">${search.total_entries || ''}</span>
+    `;
+    li.addEventListener('click', () => selectPubmedSearch(search.id));
+    li.addEventListener('contextmenu', event => {
+      event.preventDefault();
+      showPubmedSearchContextMenu(event.clientX, event.clientY, search);
+    });
+    pubmedSearchListEl.appendChild(li);
+  });
+}
+
+function showPubmedSearchContextMenu(x, y, search) {
+  hideContextMenu();
+  const menu = document.createElement('div');
+  menu.className = 'context-menu';
+  menu.innerHTML = `
+    <div class="context-item" data-action="refresh">更新检索批次</div>
+    <div class="context-separator"></div>
+    <div class="context-item" data-action="translate-title">批量翻译标题</div>
+    <div class="context-item" data-action="translate-summary">批量翻译摘要</div>
+    <div class="context-separator"></div>
+    <div class="context-item" data-action="edit">编辑检索词</div>
+    <div class="context-item" data-action="rename">重命名</div>
+    <div class="context-item" data-action="clone">复制为新检索</div>
+    <div class="context-item" data-action="convert-to-rss">转为 RSS 订阅</div>
+    <div class="context-separator"></div>
+    <div class="context-item context-item-danger" data-action="delete">删除</div>
+  `;
+  menu.addEventListener('click', async event => {
+    const action = event.target.closest('[data-action]')?.dataset.action;
+    if (!action) return;
+    hideContextMenu();
+    if (action === 'refresh') {
+      await selectPubmedSearch(search.id);
+      await runCurrentPubmedSearch();
+    } else if (action === 'translate-title') {
+      await translatePubmedSearchEntries(search, 'title');
+    } else if (action === 'translate-summary') {
+      await translatePubmedSearchEntries(search, 'summary');
+    } else if (action === 'edit') {
+      openPubmedSearchModal({ source: search, editing: true });
+    } else if (action === 'rename') {
+      startRenamePubmedSearch(search.id);
+    } else if (action === 'clone') {
+      openPubmedSearchModal({ source: search });
+    } else if (action === 'convert-to-rss') {
+      await convertPubmedSearchToFeed(search);
+    } else if (action === 'delete') {
+      const confirmed = await confirmDialog(`删除检索批次“${search.name}”？筛选记录会删除，但文献阅读记录会保留。`, {
+        okLabel: '删除', cancelLabel: '取消', danger: true,
+      });
+      if (!confirmed) return;
+      await invoke('delete_pubmed_search', { id: search.id });
+      if (currentPubmedSearch?.id === search.id) await enterKeptMode();
+      await loadPubmedSearches();
+    }
+  });
+  mountContextMenu(menu, x, y);
+  document.addEventListener('click', hideContextMenu, { once: true });
+}
+
+function startRenamePubmedSearch(id) {
+  renamingPubmedSearchId = id;
+  renderPubmedSearchList();
+}
+
+function cancelRenamePubmedSearch() {
+  renamingPubmedSearchId = null;
+  renderPubmedSearchList();
+}
+
+async function finishRenamePubmedSearch(id, name) {
+  if (renamingPubmedSearchId !== id) return;
+  const trimmed = name.trim();
+  const original = allPubmedSearches.find(search => search.id === id);
+  if (!trimmed || trimmed === original?.name) {
+    cancelRenamePubmedSearch();
+    return;
+  }
+
+  renamingPubmedSearchId = null;
+  try {
+    await invoke('rename_pubmed_search', { id, name: trimmed });
+    await loadPubmedSearches();
+    if (currentPubmedSearch?.id === id) {
+      currentPubmedSearch = allPubmedSearches.find(search => search.id === id) || currentPubmedSearch;
+      updatePubmedBatchHeader();
+    }
+    setGlobalStatus('重命名完成', 'success');
+  } catch (error) {
+    setGlobalStatus('重命名失败: ' + error, 'error');
+    await loadPubmedSearches();
+  }
+}
+
+function normalizePubmedEntry(entry) {
+  const pmid = entry.pmid || '';
+  return {
+    ...entry,
+    id: entry.entry_id,
+    author: entry.authors,
+    source: entry.journal,
+    published_at: entry.publication_date || entry.publication_date_raw || null,
+    link: pmid ? `https://pubmed.ncbi.nlm.nih.gov/${pmid}/` : '',
+    guid: pmid ? `pubmed:${pmid}` : `entry:${entry.entry_id}`,
+    feed_id: null,
+    is_read: !!entry.is_read,
+    has_reading_note: !!entry.has_reading_note,
+    tags: Array.isArray(entry.tags) ? entry.tags : [],
+  };
+}
+
+function entryMatchesLiteratureSearchQuery(entry, query) {
+  const terms = String(query || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return true;
+  const tags = Array.isArray(entry.tags) ? entry.tags : [];
+  const haystack = [
+    entry.title,
+    entry.translated_title,
+    entry.summary,
+    entry.translated_summary,
+    entry.author,
+    entry.authors,
+    entry.source,
+    entry.journal,
+    entry.pmid,
+    entry.pmcid,
+    entry.doi,
+    entry.affiliation,
+    ...tags,
+  ].filter(Boolean).join('\n').toLowerCase();
+  return terms.every(term => haystack.includes(term));
+}
+
+async function selectPubmedSearch(searchId) {
+  cancelLiteratureSearchForNavigation();
+  const search = allPubmedSearches.find(item => item.id === Number(searchId));
+  if (!search) return;
+  clearEntrySelection({ render: false, syncPaperChat: false });
+  mode = 'pubmed';
+  currentPubmedSearch = search;
+  selectedFeedId = null;
+  pubmedRenderLimit = 200;
+  activePubmedSnapshotId = null;
+  enterLiteratureMode();
+  document.body.classList.add('pubmed-mode');
+  document.querySelectorAll('.feed-item').forEach(el => el.classList.remove('selected'));
+  renderPubmedSearchList();
+  updatePubmedBatchHeader();
+  entryItemsEl.innerHTML = '<li class="entry-empty">正在读取检索结果…</li>';
+  try {
+    const entries = await invoke('list_pubmed_search_entries', { searchId: search.id });
+    allEntries = entries.map(normalizePubmedEntry);
+    refreshEntryTagFilterOptions(allEntries);
+    renderEntryList(allEntries);
+    refreshPaperChatAfterScopeDataChange();
+  } catch (e) {
+    entryItemsEl.innerHTML = `<li class="entry-empty">加载检索结果失败: ${escapeHtml(String(e))}</li>`;
+  }
+}
+
+async function enterKeptMode(options = {}) {
+  const preserveSearch = !!options.preserveSearch;
+  if (!preserveSearch) cancelLiteratureSearchForNavigation();
+  clearEntrySelection({ render: false, syncPaperChat: false });
+  mode = 'kept';
+  currentPubmedSearch = null;
+  selectedFeedId = null;
+  pubmedRenderLimit = 200;
+  activePubmedSnapshotId = null;
+  enterLiteratureMode();
+  document.body.classList.add('pubmed-mode');
+  renderPubmedSearchList();
+  updatePubmedBatchHeader();
+  entryItemsEl.innerHTML = '<li class="entry-empty">正在读取保留文献…</li>';
+  try {
+    const entries = await invoke('list_kept_pubmed_entries');
+    allEntries = entries.map(normalizePubmedEntry);
+    refreshEntryTagFilterOptions(allEntries);
+    renderEntryList(allEntries);
+    refreshPaperChatAfterScopeDataChange();
+  } catch (e) {
+    entryItemsEl.innerHTML = `<li class="entry-empty">加载保留文献失败: ${escapeHtml(String(e))}</li>`;
+  }
+}
+
+function enterLiteratureMode() {
+  briefingListEl.classList.add('hidden');
+  briefingDetailEl.classList.add('hidden');
+  entryListEl.classList.remove('hidden');
+  detailPanelEl.classList.remove('hidden');
+  applyListPanelWidth(loadListPanelWidth());
+  applyPaperChatPanelWidth(loadPaperChatPanelWidth());
+  syncPaperChatResizerVisibility();
+  syncEntryFilterControls();
+}
+
+function updatePubmedBatchHeader() {
+  if (!pubmedBatchHeader) return;
+  pubmedBatchHeader.classList.toggle('hidden', !['pubmed', 'kept'].includes(mode));
+  if (mode === 'kept') {
+    pubmedBatchMeta.textContent = '';
+    btnRunPubmedSearch?.classList.add('hidden');
+  } else if (currentPubmedSearch) {
+    const updated = currentPubmedSearch.last_success_at
+      ? `上次更新 ${formatCompactDateTime(currentPubmedSearch.last_success_at)}`
+      : '尚未完成首次抓取';
+    pubmedBatchMeta.textContent = updated;
+    btnRunPubmedSearch?.classList.remove('hidden');
+  }
+  refreshPubmedSnapshotControls();
+}
+
+function formatCompactDateTime(value) {
+  if (!value) return '';
+  const date = new Date(String(value).replace(' ', 'T') + (String(value).includes('Z') ? '' : 'Z'));
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
 async function loadFeeds() {
   try {
     allFeeds = await invoke('list_feeds');
@@ -878,8 +2801,21 @@ function updateOverviewCounts() {
   // "全部" (total entries), so users always see how many briefings exist
   // regardless of read state.
   if (elBriefing) elBriefing.textContent = BRIEFINGS.length || '';
+  updateTopEntryFilterCounts(allEntries.length ? allEntries : globalEntries);
   // Keep the macOS tray badge in sync with the unread count.
   pushTrayUnread();
+}
+
+function updateTopEntryFilterCounts(entries = allEntries) {
+  const elTopAll = document.getElementById('top-count-all');
+  const elTopUnread = document.getElementById('top-count-unread');
+  const elTopStarred = document.getElementById('top-count-starred');
+  const elTopReadingNotes = document.getElementById('top-count-reading-notes');
+  const stars = starredIds();
+  if (elTopAll) elTopAll.textContent = entries.length || '';
+  if (elTopUnread) elTopUnread.textContent = entries.filter(e => !e.is_read).length || '';
+  if (elTopStarred) elTopStarred.textContent = entries.filter(e => stars.has(e.id)).length || '';
+  if (elTopReadingNotes) elTopReadingNotes.textContent = entries.filter(e => e.has_reading_note).length || '';
 }
 
 function renderFeedList(feeds) {
@@ -941,6 +2877,7 @@ function renderFeedList(feeds) {
 }
 
 function selectFeed(feedId) {
+  const query = literatureSearchInput?.value.trim() || '';
   mode = 'feed';
   enterFeedMode();
   document.querySelectorAll('.feed-item').forEach(el => el.classList.toggle('selected', parseInt(el.dataset.feedId) === feedId));
@@ -948,13 +2885,173 @@ function selectFeed(feedId) {
   syncEntryFilterControls();
   const feed = allFeeds.find(f => f.id === feedId);
   if (feed) updateToolbarFeedInfo(feed);
+  if (query) {
+    runLiteratureSearch(query);
+    return;
+  }
+  cancelLiteratureSearchForNavigation();
   loadEntries(feedId);
+}
+
+function captureLiteratureSearchRestoreState() {
+  if (literatureSearchRestoreState) return;
+  literatureSearchRestoreState = {
+    mode,
+    selectedFeedId,
+    entryFilterValue,
+    pubmedSearchId: currentPubmedSearch?.id || null,
+    selectedBriefingId,
+  };
+}
+
+function syncLiteratureSearchUi() {
+  if (!literatureSearchInput || !literatureSearchRow || !btnClearLiteratureSearch) return;
+  const hasQuery = literatureSearchInput.value.trim().length > 0;
+  literatureSearchRow.classList.toggle('active', hasQuery);
+  btnClearLiteratureSearch.classList.toggle('hidden', !hasQuery);
+}
+
+function enterLiteratureSearchMode() {
+  clearEntrySelection({ render: false, syncPaperChat: false });
+  mode = 'search';
+  currentPubmedSearch = null;
+  document.body.classList.remove('pubmed-mode');
+  pubmedBatchHeader?.classList.add('hidden');
+  briefingListEl.classList.add('hidden');
+  briefingDetailEl.classList.add('hidden');
+  entryListEl.classList.remove('hidden');
+  detailPanelEl.classList.remove('hidden');
+  applyListPanelWidth(loadListPanelWidth());
+  applyPaperChatPanelWidth(loadPaperChatPanelWidth());
+  syncPaperChatResizerVisibility();
+  document.querySelectorAll('.feed-item').forEach(element => {
+    element.classList.toggle('selected', selectedFeedId && parseInt(element.dataset.feedId) === selectedFeedId);
+  });
+  syncEntryFilterControls();
+}
+
+async function runLiteratureSearch(query) {
+  const requestId = ++literatureSearchRequestId;
+  const searchFeedId = selectedFeedId || null;
+  enterLiteratureSearchMode();
+  entryItemsEl.innerHTML = '<li class="entry-empty">正在检索…</li>';
+  const feed = searchFeedId ? allFeeds.find(f => f.id === searchFeedId) : null;
+  const scopeLabel = feed ? (feed.title || feed.url || '当前订阅源') : entryFilterLabel(entryFilterValue);
+  toolbarSubtitle.innerHTML = `<span>检索</span><span class="ts-meta">·</span><span class="ts-tertiary">${escapeHtml(scopeLabel)} · ${escapeHtml(query)}</span>`;
+  try {
+    const entries = await invoke('search_entries', { query, feedId: searchFeedId });
+    if (
+      requestId !== literatureSearchRequestId ||
+      literatureSearchInput.value.trim() !== query ||
+      (selectedFeedId || null) !== searchFeedId
+    ) return;
+    allEntries = entries;
+    refreshEntryTagFilterOptions(allEntries);
+    renderEntryList(allEntries);
+    toolbarSubtitle.innerHTML = `
+      <span>检索</span>
+      <span class="ts-meta">·</span>
+      <span class="ts-tertiary">${escapeHtml(scopeLabel)} · ${getFilteredEntries(entries).length} 篇</span>
+    `;
+    refreshPaperChatAfterScopeDataChange();
+  } catch (e) {
+    if (requestId !== literatureSearchRequestId) return;
+    entryItemsEl.innerHTML = `<li class="entry-empty">检索失败: ${escapeHtml(String(e))}</li>`;
+  }
+}
+
+function scheduleLiteratureSearch() {
+  syncLiteratureSearchUi();
+  clearTimeout(literatureSearchTimer);
+  const query = literatureSearchInput.value.trim();
+  if (mode === 'briefing') {
+    renderBriefingList();
+    if (query) {
+      const visibleBriefings = filteredBriefingsForCurrentQuery();
+      const selectedVisible = selectedBriefingId && visibleBriefings.some(b => b.id === selectedBriefingId);
+      if (!selectedVisible && visibleBriefings.length) selectBriefing(visibleBriefings[0].id);
+      else if (!visibleBriefings.length) showBriefingEmpty();
+    }
+    return;
+  }
+  if (!query) {
+    clearLiteratureSearch();
+    return;
+  }
+  captureLiteratureSearchRestoreState();
+  literatureSearchTimer = setTimeout(() => runLiteratureSearch(query), 180);
+}
+
+function cancelLiteratureSearchForNavigation() {
+  if (!literatureSearchInput || (!literatureSearchRestoreState && !literatureSearchInput.value)) return;
+  clearTimeout(literatureSearchTimer);
+  literatureSearchRequestId += 1;
+  literatureSearchRestoreState = null;
+  literatureSearchInput.value = '';
+  syncLiteratureSearchUi();
+}
+
+function clearLiteratureSearch() {
+  clearTimeout(literatureSearchTimer);
+  literatureSearchRequestId += 1;
+  const wasSearchMode = mode === 'search';
+  const wasKeptMode = mode === 'kept';
+  const wasBriefingMode = mode === 'briefing';
+  const currentSearchFeedId = selectedFeedId;
+  const currentSearchFilterValue = entryFilterValue;
+  if (literatureSearchInput) literatureSearchInput.value = '';
+  syncLiteratureSearchUi();
+  const restore = literatureSearchRestoreState;
+  literatureSearchRestoreState = null;
+  if (wasKeptMode) {
+    enterKeptMode();
+    return;
+  }
+  if (wasBriefingMode) {
+    enterBriefingMode();
+    return;
+  }
+  if (wasSearchMode) {
+    entryFilterValue = currentSearchFilterValue;
+    if (currentSearchFeedId) {
+      selectFeed(currentSearchFeedId);
+    } else {
+      enterFeedMode();
+      selectedFeedId = null;
+      document.querySelectorAll('.feed-item').forEach(el => el.classList.remove('selected'));
+      syncEntryFilterControls();
+      setToolbarSubtitle('main');
+      loadEntries(null);
+    }
+    return;
+  }
+  if (!restore) return;
+
+  selectedBriefingId = restore.selectedBriefingId;
+  if (restore.mode === 'pubmed' && restore.pubmedSearchId) {
+    selectPubmedSearch(restore.pubmedSearchId);
+  } else if (restore.mode === 'kept') {
+    enterKeptMode();
+  } else if (restore.mode === 'briefing') {
+    enterBriefingMode();
+  } else {
+    entryFilterValue = restore.entryFilterValue;
+    if (restore.selectedFeedId) selectFeed(restore.selectedFeedId);
+    else {
+      enterFeedMode();
+      selectedFeedId = null;
+      syncEntryFilterControls();
+      setToolbarSubtitle('main');
+      loadEntries(null);
+    }
+  }
 }
 
 function updateToolbarFeedInfo(feed) {
   if (!toolbarSubtitle) return;
   if (!settingsView.classList.contains('hidden')) return;
   if (mode === 'briefing') { setToolbarSubtitle('briefing'); return; }
+  if (mode === 'search') { setToolbarSubtitle('search'); return; }
   if (!feed) { toolbarSubtitle.innerHTML = ''; return; }
   const unread = unreadCountForFeed(feed.id);
   const total = totalCountForFeed(feed.id);
@@ -1027,6 +3124,22 @@ async function finishRenameFeed(id, name) {
   }
 }
 
+async function persistNewFeed(url, { title = null, pubmedQuery = null, pubmedLimit = null } = {}) {
+  const added = await invoke('add_feed', { url });
+  if (title || pubmedQuery || pubmedLimit != null) {
+    await invoke('update_feed', {
+      id: added.id,
+      url,
+      title,
+      pubmedQuery,
+      pubmedLimit,
+    });
+  }
+  await loadFeeds();
+  if (!document.getElementById('section-feeds').classList.contains('hidden')) renderFeedSettingsList();
+  return added;
+}
+
 // ── Add Feed input (pill with animated states) ─
 async function addFeed() {
   const url = feedUrlInput.value.trim();
@@ -1036,7 +3149,7 @@ async function addFeed() {
   addFeedRow.classList.add('adding');
   feedUrlInput.placeholder = '正在拉取…';
   try {
-    await invoke('add_feed', { url });
+    await persistNewFeed(url);
     addFeedRow.classList.remove('adding');
     addFeedRow.classList.add('added');
     if (addFeedIcon) addFeedIcon.innerHTML = `<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.3 6.5 11 12.5 4.8"/></svg>`;
@@ -1045,17 +3158,103 @@ async function addFeed() {
     btnAddFeed.classList.add('hidden');
     setTimeout(() => {
       addFeedRow.classList.remove('added');
-      feedUrlInput.placeholder = '添加订阅源 · 粘贴 RSS URL';
+      feedUrlInput.placeholder = '粘贴 RSS URL';
       if (addFeedIcon) addFeedIcon.innerHTML = `<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="3.5" x2="8" y2="12.5"/><line x1="3.5" y1="8" x2="12.5" y2="8"/></svg>`;
     }, 1400);
-    await loadFeeds();
-    if (!document.getElementById('section-feeds').classList.contains('hidden')) renderFeedSettingsList();
   } catch (e) {
     addFeedRow.classList.remove('adding');
-    feedUrlInput.placeholder = '添加订阅源 · 粘贴 RSS URL';
+    feedUrlInput.placeholder = '粘贴 RSS URL';
     setGlobalStatus('添加失败: ' + e, 'error');
   } finally {
     btnAddFeed.disabled = false;
+  }
+}
+
+let feedAddMode = 'url';
+
+function setFeedAddMode(nextMode) {
+  feedAddMode = nextMode === 'author' ? 'author' : 'url';
+  document.querySelectorAll('[data-feed-add-mode]').forEach(button => {
+    button.classList.toggle('active', button.dataset.feedAddMode === feedAddMode);
+  });
+  document.getElementById('feed-add-url-builder')?.classList.toggle('hidden', feedAddMode !== 'url');
+  document.getElementById('feed-add-author-builder')?.classList.toggle('hidden', feedAddMode !== 'author');
+  document.getElementById('btn-create-feed').textContent = feedAddMode === 'author' ? '创建并添加' : '添加订阅';
+  syncFeedAddModalState();
+}
+
+function openFeedAddModal() {
+  const modal = document.getElementById('feed-add-modal');
+  const input = document.getElementById('feed-add-url');
+  if (!modal || !input) return;
+  input.value = '';
+  document.getElementById('feed-author-name').value = '';
+  document.getElementById('feed-author-affiliation').value = '';
+  document.getElementById('feed-author-start-date').value = '';
+  document.getElementById('feed-author-end-date').value = '';
+  document.getElementById('feed-author-limit').value = '15';
+  document.getElementById('feed-author-title').value = '';
+  document.getElementById('feed-add-status').textContent = '';
+  setFeedAddMode('url');
+  modal.classList.remove('hidden');
+  setTimeout(() => input.focus(), 0);
+}
+
+function closeFeedAddModal() {
+  document.getElementById('feed-add-modal')?.classList.add('hidden');
+}
+
+function syncFeedAddModalState({ clearStatus = true } = {}) {
+  const input = document.getElementById('feed-add-url');
+  const button = document.getElementById('btn-create-feed');
+  if (!input || !button) return;
+  const hasRequiredValue = feedAddMode === 'author'
+    ? !!document.getElementById('feed-author-name')?.value.trim()
+    : !!input.value.trim();
+  button.disabled = !hasRequiredValue;
+  if (clearStatus) document.getElementById('feed-add-status').textContent = '';
+}
+
+async function createFeedFromModal() {
+  const input = document.getElementById('feed-add-url');
+  const button = document.getElementById('btn-create-feed');
+  const status = document.getElementById('feed-add-status');
+  const url = input?.value.trim() || '';
+  const authorName = document.getElementById('feed-author-name')?.value.trim() || '';
+  if (!button || !status || (feedAddMode === 'url' ? !url : !authorName)) return;
+
+  button.disabled = true;
+  button.textContent = feedAddMode === 'author' ? '正在创建…' : '正在添加…';
+  status.textContent = '';
+  try {
+    if (feedAddMode === 'author') {
+      status.textContent = '正在生成作者检索式…';
+      const query = await invoke('build_pubmed_author_query', {
+        authorName,
+        affiliation: document.getElementById('feed-author-affiliation').value.trim() || null,
+        startDate: document.getElementById('feed-author-start-date').value || null,
+        endDate: document.getElementById('feed-author-end-date').value || null,
+      });
+      const pubmedLimit = clampPubmedLimit(document.getElementById('feed-author-limit').value);
+      status.textContent = '正在生成 PubMed RSS…';
+      const generatedUrl = await invoke('build_pubmed_rss_url', { query, limit: pubmedLimit });
+      const customTitle = document.getElementById('feed-author-title').value.trim();
+      await persistNewFeed(generatedUrl, {
+        title: customTitle || `${authorName} 文献`,
+        pubmedQuery: query,
+        pubmedLimit,
+      });
+    } else {
+      await persistNewFeed(url);
+    }
+    closeFeedAddModal();
+    setGlobalStatus('订阅源已添加', 'success');
+  } catch (e) {
+    status.textContent = `添加失败：${e}`;
+    (feedAddMode === 'author' ? document.getElementById('feed-author-name') : input)?.focus();
+  } finally {
+    button.textContent = feedAddMode === 'author' ? '创建并添加' : '添加订阅';
+    syncFeedAddModalState({ clearStatus: false });
   }
 }
 
@@ -1202,16 +3401,36 @@ async function deleteFeed(id) {
 }
 
 // ── Context menus ──────────────────────────────
+function mountContextMenu(menu, x, y) {
+  const viewportGap = 8;
+  const maxWidth = Math.max(0, window.innerWidth - viewportGap * 2);
+  const maxHeight = Math.max(0, window.innerHeight - viewportGap * 2);
+
+  menu.style.maxWidth = `${maxWidth}px`;
+  menu.style.maxHeight = `${maxHeight}px`;
+  menu.style.overflowY = 'auto';
+  document.body.appendChild(menu);
+
+  const rect = menu.getBoundingClientRect();
+  const maxLeft = Math.max(viewportGap, window.innerWidth - rect.width - viewportGap);
+  const maxTop = Math.max(viewportGap, window.innerHeight - rect.height - viewportGap);
+  menu.style.left = `${Math.max(viewportGap, Math.min(x, maxLeft))}px`;
+  menu.style.top = `${Math.max(viewportGap, Math.min(y, maxTop))}px`;
+  contextMenu = menu;
+}
+
 function showContextMenu(x, y, feed) {
   hideContextMenu();
   const menu = document.createElement('div');
   menu.className = 'context-menu';
-  menu.style.left = x + 'px';
-  menu.style.top = y + 'px';
   menu.innerHTML = `
     <div class="context-item" data-action="refresh">更新订阅源</div>
     <div class="context-separator"></div>
+    <div class="context-item" data-action="translate-title">翻译标题</div>
+    <div class="context-item" data-action="translate-summary">翻译摘要</div>
+    <div class="context-separator"></div>
     <div class="context-item" data-action="rename">重命名</div>
+    ${isPubmedFeed(feed) ? '<div class="context-item" data-action="convert-to-search">转为 PubMed 检索</div>' : ''}
     <div class="context-separator"></div>
     <div class="context-item context-item-danger" data-action="delete">删除</div>
   `;
@@ -1221,15 +3440,65 @@ function showContextMenu(x, y, feed) {
     hideContextMenu();
     if (action === 'refresh') {
       await refreshFeed(feed);
+    } else if (action === 'translate-title') {
+      await translateFeedEntries(feed, 'title');
+    } else if (action === 'translate-summary') {
+      await translateFeedEntries(feed, 'summary');
     } else if (action === 'rename') {
       startRenameFeed(feed.id);
+    } else if (action === 'convert-to-search') {
+      await convertPubmedFeedToSearch(feed);
     } else if (action === 'delete') {
       if (await confirmDialog('确定删除该订阅源及其所有文章？')) deleteFeed(feed.id);
     }
   });
-  document.body.appendChild(menu);
-  contextMenu = menu;
+  mountContextMenu(menu, x, y);
   document.addEventListener('click', hideContextMenu, { once: true });
+}
+
+async function convertPubmedFeedToSearch(feed) {
+  const config = parsePubmedFeedConfig(feed);
+  if (!config?.query) {
+    setGlobalStatus('这条旧 PubMed RSS 没有保存检索式，请先补充检索式', 'error');
+    pubmedGeneratorApi?.beginEdit(feed);
+    return;
+  }
+  const confirmed = await confirmDialog(
+    `把“${escapeHtml(feed.title || 'PubMed RSS')}”转为 PubMed 检索？转换完成后将停止 RSS 刷新，并保留已有文章和阅读记录。`,
+    { okLabel: '转为 PubMed 检索', cancelLabel: '取消', danger: false },
+  );
+  if (!confirmed) return;
+
+  setGlobalStatus(`正在把“${feed.title || 'PubMed RSS'}”转为 PubMed 检索…`, 'progress');
+  try {
+    const search = await invoke('convert_pubmed_feed_to_search', { feedId: feed.id });
+    await Promise.all([loadFeeds(), loadPubmedSearches()]);
+    await selectPubmedSearch(search.id);
+    setGlobalStatus('已转为 PubMed 检索，原 RSS 入口已移除', 'success');
+  } catch (error) {
+    setGlobalStatus('转换失败，原 RSS 已保留: ' + error, 'error');
+  } finally {
+    activePubmedRunId = null;
+  }
+}
+
+async function convertPubmedSearchToFeed(search) {
+  const confirmed = await confirmDialog(
+    `把“${escapeHtml(search.name)}”转为 RSS 订阅？现有文章和阅读记录会保留，检索筛选状态将不再显示。`,
+    { okLabel: '转为 RSS 订阅', cancelLabel: '取消', danger: false },
+  );
+  if (!confirmed) return;
+
+  setGlobalStatus(`正在为“${search.name}”生成 PubMed RSS…`, 'progress');
+  try {
+    const feed = await invoke('convert_pubmed_search_to_feed', { searchId: search.id });
+    currentPubmedSearch = null;
+    await Promise.all([loadPubmedSearches(), loadFeeds()]);
+    selectFeed(feed.id);
+    setGlobalStatus('已转为 RSS 订阅，原 PubMed 检索入口已移除', 'success');
+  } catch (error) {
+    setGlobalStatus('转换失败，原 PubMed 检索已保留: ' + error, 'error');
+  }
 }
 
 async function refreshFeed(feed) {
@@ -1278,8 +3547,6 @@ function showBriefingContextMenu(x, y, briefing) {
   hideContextMenu();
   const menu = document.createElement('div');
   menu.className = 'context-menu';
-  menu.style.left = x + 'px';
-  menu.style.top = y + 'px';
   menu.innerHTML = `<div class="context-item context-item-danger" data-action="delete">删除</div>`;
   menu.addEventListener('click', async e => {
     const action = e.target.dataset.action;
@@ -1291,26 +3558,31 @@ function showBriefingContextMenu(x, y, briefing) {
       }
     }
   });
-  document.body.appendChild(menu);
-  contextMenu = menu;
+  mountContextMenu(menu, x, y);
   document.addEventListener('click', hideContextMenu, { once: true });
 }
 
 function showEntryContextMenu(x, y, entry) {
   const targetEntries = getContextMenuEntries(entry);
   const isBatch = targetEntries.length > 1;
-  const translatableEntries = targetEntries.filter(entryNeedsManualTranslation);
+  const titleEntries = targetEntries.filter(entryNeedsTitleTranslation);
+  const summaryEntries = targetEntries.filter(entryNeedsSummaryTranslation);
 
   hideContextMenu();
   const menu = document.createElement('div');
   menu.className = 'context-menu';
-  menu.style.left = x + 'px';
-  menu.style.top = y + 'px';
 
   let items = '';
-  if (translatableEntries.length) {
-    items += `<div class="context-item" data-action="translate">${isBatch ? `翻译所选 ${translatableEntries.length} 篇` : '翻译'}</div>`;
+  if (titleEntries.length || summaryEntries.length) {
+    if (titleEntries.length) {
+      items += `<div class="context-item" data-action="translate-title">${isBatch ? `翻译所选 ${titleEntries.length} 篇标题` : '翻译标题'}</div>`;
+    }
+    if (summaryEntries.length) {
+      items += `<div class="context-item" data-action="translate-summary">${isBatch ? `翻译所选 ${summaryEntries.length} 篇摘要` : '翻译摘要'}</div>`;
+    }
+    items += '<div class="context-separator"></div>';
   }
+  items += `<div class="context-item" data-action="download-pdf">${isBatch ? `下载所选 ${targetEntries.length} 篇 PDF` : '下载 PDF'}</div>`;
   if (!isBatch) {
     if (items) items += '<div class="context-separator"></div>';
     items += `<div class="context-item" data-action="${entry.is_read ? 'mark-unread' : 'mark-read'}">${entry.is_read ? '标为未读' : '标为已读'}</div>`;
@@ -1332,8 +3604,12 @@ function showEntryContextMenu(x, y, entry) {
     const action = target?.dataset?.action;
     if (!action) return;
     hideContextMenu();
-    if (action === 'translate') {
-      await translateEntries(targetEntries);
+    if (action === 'download-pdf') {
+      await downloadEntriesWithNature(targetEntries);
+    } else if (action === 'translate-title') {
+      await translateEntries(targetEntries, 'title');
+    } else if (action === 'translate-summary') {
+      await translateEntries(targetEntries, 'summary');
     } else if (action === 'mark-read') await setEntryRead(entry, true);
     else if (action === 'mark-unread') await setEntryRead(entry, false);
     else if (action === 'star' || action === 'unstar') {
@@ -1345,8 +3621,7 @@ function showEntryContextMenu(x, y, entry) {
       else await generateReadingNoteForEntry(entry, target.dataset.profileId);
     }
   });
-  document.body.appendChild(menu);
-  contextMenu = menu;
+  mountContextMenu(menu, x, y);
   document.addEventListener('click', hideContextMenu, { once: true });
 }
 
@@ -1355,6 +3630,7 @@ function hideContextMenu() {
 }
 
 function getFilteredEntries(entries = allEntries) {
+  if (mode === 'pubmed' || mode === 'kept') return getFilteredPubmedEntries(entries);
   let filtered = entries;
   const stars = starredIds();
   if (entryFilterValue === 'unread') filtered = filtered.filter(e => !e.is_read);
@@ -1368,6 +3644,70 @@ function getFilteredEntries(entries = allEntries) {
     filtered = filtered.filter(matchesEntryMetricFilters);
   }
   return filtered;
+}
+
+function getFilteredPubmedEntries(entries = allEntries) {
+  let filtered = [...entries];
+  const query = literatureSearchInput?.value.trim() || '';
+  if (query) filtered = filtered.filter(entry => entryMatchesLiteratureSearchQuery(entry, query));
+  const stars = starredIds();
+  if (entryFilterValue === 'unread') filtered = filtered.filter(e => !e.is_read);
+  else if (entryFilterValue === 'starred') filtered = filtered.filter(e => stars.has(e.id));
+  else if (entryFilterValue === 'reading-notes') filtered = filtered.filter(e => e.has_reading_note);
+  const snapshot = currentPubmedSnapshot();
+  if (snapshot) {
+    const snapshotIds = new Set(snapshot.entryIds);
+    filtered = filtered.filter(entry => snapshotIds.has(entry.id));
+  }
+  if (pubmedFilters.status !== 'all') {
+    filtered = filtered.filter(entry => entry.screening_status === pubmedFilters.status);
+  }
+  if (pubmedFilters.star !== 'all') {
+    filtered = filtered.filter(entry => pubmedFilters.star === 'starred' ? stars.has(entry.id) : !stars.has(entry.id));
+  }
+  if (pubmedFilters.publishedFrom) {
+    filtered = filtered.filter(entry => String(entry.publication_date || '') >= pubmedFilters.publishedFrom);
+  }
+  if (pubmedFilters.publishedTo) {
+    filtered = filtered.filter(entry => String(entry.publication_date || '') <= `${pubmedFilters.publishedTo}-31`);
+  }
+  if (pubmedFilters.addedFrom) {
+    filtered = filtered.filter(entry => String(entry.first_seen_at || '').slice(0, 10) >= pubmedFilters.addedFrom);
+  }
+  if (pubmedFilters.addedTo) {
+    filtered = filtered.filter(entry => String(entry.first_seen_at || '').slice(0, 10) <= pubmedFilters.addedTo);
+  }
+  if (entryTagFilterValue !== 'all') {
+    filtered = filtered.filter(entry => (entry.tags || []).includes(entryTagFilterValue));
+  }
+  if (hasActiveEntryMetricFilters()) filtered = filtered.filter(matchesEntryMetricFilters);
+
+  const nullLast = (left, right, direction = 1) => {
+    const leftMissing = left == null || left === '';
+    const rightMissing = right == null || right === '';
+    if (leftMissing !== rightMissing) return leftMissing ? 1 : -1;
+    if (leftMissing) return 0;
+    if (left < right) return -direction;
+    if (left > right) return direction;
+    return 0;
+  };
+  filtered.sort((left, right) => {
+    switch (pubmedFilters.sort) {
+      case 'publication-asc': return nullLast(left.publication_sort_key, right.publication_sort_key, 1);
+      case 'added-desc': return nullLast(left.first_seen_at, right.first_seen_at, -1);
+      case 'added-asc': return nullLast(left.first_seen_at, right.first_seen_at, 1);
+      case 'if-desc': return nullLast(metricIfValue(left), metricIfValue(right), -1);
+      case 'if-asc': return nullLast(metricIfValue(left), metricIfValue(right), 1);
+      case 'rank': return nullLast(left.pubmed_rank, right.pubmed_rank, 1);
+      default: return nullLast(left.publication_sort_key, right.publication_sort_key, -1);
+    }
+  });
+  return filtered;
+}
+
+function metricIfValue(entry) {
+  const value = Number(lookupJournalMetrics(entry)?.if);
+  return Number.isFinite(value) ? value : null;
 }
 
 function collectEntryTagOptions(entries = allEntries) {
@@ -1461,6 +3801,47 @@ function canHandleEntrySelectAllShortcut(target) {
   return true;
 }
 
+function canHandleEntryArrowShortcut(event) {
+  if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return false;
+  if (entrySelectionMode || isEditableShortcutTarget(event.target)) return false;
+  if (!mainView || mainView.classList.contains('hidden')) return false;
+  if (!entryListEl || entryListEl.classList.contains('hidden')) return false;
+  return ![...document.querySelectorAll('[role="dialog"][aria-modal="true"]')]
+    .some(dialog => !dialog.closest('.hidden'));
+}
+
+function navigateEntryList(direction) {
+  const items = [...entryItemsEl.children]
+    .filter(item => item.matches('.entry-item, .pubmed-entry-item'));
+  if (!items.length) return;
+
+  const currentIndex = items.findIndex(item =>
+    currentEntry && item.dataset.entryId === String(currentEntry.id)
+  );
+  const nextIndex = currentIndex < 0
+    ? (direction > 0 ? 0 : items.length - 1)
+    : Math.max(0, Math.min(items.length - 1, currentIndex + direction));
+  const nextItem = items[nextIndex];
+  if (nextIndex === currentIndex) {
+    focusEntryList();
+    nextItem.scrollIntoView({ block: 'nearest' });
+    return;
+  }
+  const entry = allEntries.find(item => String(item.id) === nextItem.dataset.entryId);
+  if (!entry) return;
+
+  focusEntryList();
+  items.forEach(item => item.classList.remove('selected'));
+  nextItem.classList.add('selected');
+  showDetail(entry);
+  if (!entry.is_read) void setEntryRead(entry, true);
+
+  requestAnimationFrame(() => {
+    entryItemsEl.querySelector(`[data-entry-id="${CSS.escape(String(entry.id))}"]`)
+      ?.scrollIntoView({ block: 'nearest' });
+  });
+}
+
 function clearEntrySelection({ keepMode = false, render = true, syncPaperChat = true } = {}) {
   selectedEntryIds = new Set();
   entrySelectionAnchorId = null;
@@ -1495,6 +3876,10 @@ function syncEntryBulkActions() {
   btnEntryBulkInvert.disabled = visibleEntries.length === 0;
   btnEntryBulkDeselect.classList.toggle('hidden', !entrySelectionMode);
   btnEntryBulkDeselect.disabled = count === 0;
+  const canExportSelection = ['pubmed', 'kept'].includes(mode) && entrySelectionMode;
+  entryBulkExportFormat?.classList.toggle('hidden', !canExportSelection);
+  btnEntryBulkExport?.classList.toggle('hidden', !canExportSelection);
+  if (btnEntryBulkExport) btnEntryBulkExport.disabled = count === 0;
   entryBulkExistingMode.classList.toggle('hidden', !entrySelectionMode);
   entryBulkExistingMode.value = entryBulkExistingStrategy;
   btnEntryBulkGenerate.classList.toggle('hidden', !entrySelectionMode);
@@ -1502,6 +3887,11 @@ function syncEntryBulkActions() {
   btnEntryBulkClear.classList.toggle('hidden', !entrySelectionMode);
   btnEntrySelectMode.textContent = entrySelectionMode ? '退出多选' : '多选';
   btnEntrySelectMode.classList.toggle('active', entrySelectionMode);
+  const pubmedBatchMode = mode === 'pubmed';
+  pubmedBulkStatus?.classList.toggle('hidden', !pubmedBatchMode || !entrySelectionMode);
+  if (pubmedBulkStatus) pubmedBulkStatus.disabled = count === 0;
+  btnPubmedAiScreen?.classList.toggle('hidden', !pubmedBatchMode || !entrySelectionMode);
+  if (btnPubmedAiScreen) btnPubmedAiScreen.disabled = count === 0;
   if (currentEntry) refreshPaperChatScopeControls();
 }
 
@@ -1663,34 +4053,57 @@ function getContextMenuEntries(entry) {
   return batchEntries.length > 1 ? batchEntries : [entry];
 }
 
-function entryNeedsManualTranslation(entry) {
-  return !entry.title_translated || !entry.summary_translated;
-}
-
-async function translateEntries(entries) {
-  const targetEntries = entries.filter(entryNeedsManualTranslation);
+async function translateEntries(entries, field, contextLabel = '') {
+  const fieldLabel = field === 'title' ? '标题' : '摘要';
+  const contextPrefix = contextLabel || '';
+  const invokeName = field === 'title' ? 'translate_entry_title' : 'translate_entry_summary';
+  const needsTranslation = field === 'title' ? entryNeedsTitleTranslation : entryNeedsSummaryTranslation;
+  const targetEntries = entries.filter(needsTranslation);
   if (!targetEntries.length) {
-    setGlobalStatus('所选文章都已有翻译', 'success');
+    setGlobalStatus(`${contextPrefix}所选文章都已有${fieldLabel}翻译`, 'success');
     return;
   }
 
+  const total = targetEntries.length;
+  let completed = 0;
+  let translatedCount = 0;
+  let skippedCount = 0;
   const failures = [];
-  for (let index = 0; index < targetEntries.length; index += 1) {
-    const entry = targetEntries[index];
-    const title = entry.title_translated || entry.title || `文献 ${entry.id}`;
-    setGlobalStatus(`正在翻译（${index + 1}/${targetEntries.length}）：${title}`, 'progress');
-    try {
-      await invoke('translate_entry_missing', { entryId: entry.id });
-    } catch (e) {
-      failures.push({
-        entry,
-        message: typeof e === 'string' ? e : (e && e.message) || '翻译失败',
-      });
-    }
-  }
+  const updateProgress = () => {
+    const active = Math.min(DEFAULT_TRANSLATION_CONCURRENCY, total - completed);
+    setGlobalStatus(`${contextPrefix}正在翻译${fieldLabel}：已完成 ${completed}/${total}，处理中 ${active} 篇`, 'progress');
+  };
+  updateProgress();
+  await runConcurrentQueue(
+    targetEntries,
+    entry => invoke(invokeName, { entryId: entry.id }),
+    {
+      concurrency: DEFAULT_TRANSLATION_CONCURRENCY,
+      maxRetries: 2,
+      retryDelayMs: 800,
+      onSettled: result => {
+        completed += 1;
+        if (result.ok) {
+          if (result.value) translatedCount += 1;
+          else skippedCount += 1;
+        } else {
+          failures.push({
+            entry: result.item,
+            message: typeof result.error === 'string'
+              ? result.error
+              : (result.error && result.error.message) || '翻译失败',
+          });
+        }
+        if (completed < total) updateProgress();
+      },
+    },
+  );
 
   if (!failures.length) {
-    setGlobalStatus(`已完成 ${targetEntries.length} 篇文章的翻译`, 'success');
+    setGlobalStatus(
+      `${contextPrefix}${fieldLabel}处理完成：翻译 ${translatedCount} 篇，跳过 ${skippedCount} 篇`,
+      'success',
+    );
     return;
   }
 
@@ -1700,17 +4113,59 @@ async function translateEntries(entries) {
     .join('；');
   const suffix = failures.length > 3 ? ` 等 ${failures.length} 篇` : '';
   setGlobalStatus(
-    `翻译完成：成功 ${targetEntries.length - failures.length} 篇，失败 ${failures.length} 篇。${preview}${suffix}`,
+    `${contextPrefix}${fieldLabel}翻译完成：翻译 ${translatedCount} 篇，跳过 ${skippedCount} 篇，失败 ${failures.length} 篇。${preview}${suffix}`,
     'error',
   );
+}
+
+function entryNeedsTitleTranslation(entry) {
+  return !entry.title_translated;
+}
+
+function entryNeedsSummaryTranslation(entry) {
+  return !entry.summary_translated;
+}
+
+async function listEntriesForFeedAction(feed) {
+  if (selectedFeedId === feed.id) return allEntries;
+  return invoke('list_entries', { feedId: feed.id });
+}
+
+async function translatePubmedSearchEntries(search, field) {
+  if (!search?.id) return;
+
+  const fieldLabel = field === 'title' ? '标题' : '摘要';
+  setGlobalStatus(`正在读取「${search.name}」的文章…`, 'progress');
+  try {
+    const entries = mode === 'pubmed' && currentPubmedSearch?.id === search.id
+      ? allEntries
+      : (await invoke('list_pubmed_search_entries', { searchId: search.id })).map(normalizePubmedEntry);
+    await translateEntries(entries, field);
+  } catch (e) {
+    setGlobalStatus(`批量翻译「${search.name}」${fieldLabel}失败: ${e}`, 'error');
+  }
+}
+
+async function translateFeedEntries(feed, field) {
+  if (!feed?.id) return;
+
+  const feedName = feed.title || feed.url || `订阅源 ${feed.id}`;
+  const fieldLabel = field === 'title' ? '标题' : '摘要';
+  let entries = [];
+  try {
+    entries = await listEntriesForFeedAction(feed);
+  } catch (e) {
+    setGlobalStatus(`读取「${feedName}」文章失败: ${e}`, 'error');
+    return;
+  }
+
+  await translateEntries(entries, field, `「${feedName}」`);
 }
 
 function showReadingProfilePickerMenu(x, y, onSelect) {
   hideContextMenu();
   const menu = document.createElement('div');
   menu.className = 'context-menu';
-  menu.style.left = x + 'px';
-  menu.style.top = y + 'px';
 
   const items = buildReadingProfileMenuItems(profile =>
     `<div class="context-item" data-action="pick-profile" data-profile-id="${escapeHtml(profile.id)}">生成笔记 · ${escapeHtml(profile.name)}</div>`
@@ -1725,8 +4180,7 @@ function showReadingProfilePickerMenu(x, y, onSelect) {
     await onSelect(target.dataset.profileId);
   });
 
-  document.body.appendChild(menu);
-  contextMenu = menu;
+  mountContextMenu(menu, x, y);
   document.addEventListener('click', hideContextMenu, { once: true });
 }
 
@@ -2158,17 +4612,175 @@ function buildPaperChatQuestion(typedQuestion, profile = getCurrentPaperChatProf
 
 function refreshPaperChatComposerState() {
   if (!btnSendPaperChat) return;
+  if (activePaperChatRequest) {
+    btnSendPaperChat.textContent = activePaperChatRequest.stopping ? '正在停止' : '停止';
+    btnSendPaperChat.disabled = activePaperChatRequest.stopping;
+    btnSendPaperChat.title = '停止当前回答';
+    return;
+  }
   const typedQuestion = paperChatInput?.value.trim() || '';
   const activeProfile = getCurrentPaperChatProfile();
   const usesSkillTemplate = activeProfile?.source_kind === 'skill';
   btnSendPaperChat.textContent = usesSkillTemplate
     ? (typedQuestion ? '模板+要求发送' : '按模板发送')
-    : '发送';
+    : (!typedQuestion && paperChatAttachments.length ? '分析附件' : '发送');
+  btnSendPaperChat.disabled = paperChatAttachmentsBusy;
   btnSendPaperChat.title = usesSkillTemplate
     ? (typedQuestion
       ? `当前将按 ${activeProfile.name} 的默认模板并合并你的附加要求发送`
       : `当前将按 ${activeProfile.name} 的默认模板直接发送`)
     : '';
+}
+
+function createPaperChatRequestId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `paper-chat-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function formatPaperChatAttachmentChars(charCount) {
+  const count = Number(charCount) || 0;
+  return count >= 10_000 ? `${(count / 10_000).toFixed(1)} 万字` : `${count.toLocaleString('zh-CN')} 字`;
+}
+
+function renderPaperChatAttachments() {
+  if (!paperChatAttachmentsEl || !paperChatAttachmentList) return;
+  paperChatAttachmentsEl.classList.toggle('hidden', paperChatAttachments.length === 0);
+  paperChatAttachmentList.innerHTML = paperChatAttachments.map((attachment, index) => `
+    <div class="paper-chat-attachment-item" title="${escapeHtml(attachment.path || attachment.name)}">
+      <span class="paper-chat-attachment-icon" aria-hidden="true">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
+      </span>
+      <span class="paper-chat-attachment-text">
+        <span class="paper-chat-attachment-name">${escapeHtml(attachment.name)}</span>
+        <span class="paper-chat-attachment-meta">${formatPaperChatAttachmentChars(attachment.char_count)}${attachment.truncated ? ' · 已截断' : ''}</span>
+      </span>
+      <button class="paper-chat-attachment-remove" type="button" data-paper-chat-attachment-remove="${index}" title="移除附件" aria-label="移除附件">×</button>
+    </div>
+  `).join('');
+  refreshPaperChatComposerState();
+}
+
+function mergePaperChatAttachments(imported) {
+  const merged = [...paperChatAttachments];
+  const knownPaths = new Set(merged.map(item => item.path));
+  let totalChars = merged.reduce((sum, item) => sum + (Number(item.char_count) || 0), 0);
+  let added = 0;
+  let rejected = 0;
+
+  for (const source of imported || []) {
+    if (!source?.path || knownPaths.has(source.path)) continue;
+    if (merged.length >= PAPER_CHAT_ATTACHMENT_LIMIT || totalChars >= PAPER_CHAT_ATTACHMENT_CHAR_LIMIT) {
+      rejected += 1;
+      continue;
+    }
+    const remaining = PAPER_CHAT_ATTACHMENT_CHAR_LIMIT - totalChars;
+    const attachment = { ...source };
+    const contentChars = Array.from(attachment.content || '');
+    if (contentChars.length > remaining) {
+      attachment.content = contentChars.slice(0, remaining).join('');
+      attachment.char_count = remaining;
+      attachment.truncated = true;
+    }
+    if (!attachment.content) {
+      rejected += 1;
+      continue;
+    }
+    knownPaths.add(attachment.path);
+    totalChars += Number(attachment.char_count) || 0;
+    merged.push(attachment);
+    added += 1;
+  }
+
+  paperChatAttachments = merged;
+  renderPaperChatAttachments();
+  return { added, rejected };
+}
+
+function setPaperChatAttachmentsBusy(busy) {
+  paperChatAttachmentsBusy = busy;
+  if (btnPaperChatAddFiles) btnPaperChatAddFiles.disabled = busy;
+  if (btnPaperChatAddFolder) btnPaperChatAddFolder.disabled = busy;
+  if (btnClearPaperChatAttachments) btnClearPaperChatAttachments.disabled = busy;
+  refreshPaperChatComposerState();
+}
+
+async function importPaperChatAttachmentPaths(paths) {
+  const normalizedPaths = [...new Set((paths || []).filter(path => typeof path === 'string' && path.trim()))];
+  if (!normalizedPaths.length || paperChatAttachmentsBusy) return;
+  setPaperChatAttachmentsBusy(true);
+  setGlobalStatus('正在读取附件…', 'progress');
+  try {
+    const report = await invoke('import_paper_chat_attachments', { paths: normalizedPaths });
+    const { added, rejected } = mergePaperChatAttachments(report?.attachments || []);
+    const skipped = (report?.skipped?.length || 0) + rejected;
+    if (!added) {
+      setGlobalStatus(skipped ? '没有新增可用附件，可能已添加或超过容量限制' : '所选附件已经在列表中', 'error');
+      return;
+    }
+    setGlobalStatus(`已添加 ${added} 个附件${skipped ? `，另跳过 ${skipped} 个` : ''}`, 'success');
+  } catch (e) {
+    setGlobalStatus('读取附件失败: ' + e, 'error');
+  } finally {
+    setPaperChatAttachmentsBusy(false);
+  }
+}
+
+async function choosePaperChatAttachments({ directory = false } = {}) {
+  const dialog = window.__TAURI__?.dialog;
+  if (!dialog || paperChatAttachmentsBusy) {
+    if (!dialog) setGlobalStatus('对话框插件不可用', 'error');
+    return;
+  }
+  try {
+    const selection = await dialog.open({
+      directory,
+      multiple: !directory,
+      title: directory ? '选择附件文件夹' : '选择对话附件',
+      ...(directory ? {} : {
+        filters: [{
+          name: '支持的文献与文本文件',
+          extensions: ['pdf', 'txt', 'md', 'markdown', 'csv', 'tsv', 'json', 'jsonl', 'yaml', 'yml', 'xml', 'html', 'htm', 'tex', 'rst', 'log'],
+        }],
+      }),
+    });
+    if (!selection) return;
+    await importPaperChatAttachmentPaths(Array.isArray(selection) ? selection : [selection]);
+  } catch (e) {
+    setGlobalStatus('选择附件失败: ' + e, 'error');
+  }
+}
+
+function paperChatDropIsInside(position) {
+  if (!paperChatComposer || !position) return false;
+  const logical = typeof position.toLogical === 'function'
+    ? position.toLogical(window.devicePixelRatio || 1)
+    : position;
+  const rect = paperChatComposer.getBoundingClientRect();
+  return logical.x >= rect.left && logical.x <= rect.right
+    && logical.y >= rect.top && logical.y <= rect.bottom;
+}
+
+async function setupPaperChatAttachmentDrop() {
+  const currentWebview = window.__TAURI__?.webview?.getCurrentWebview?.();
+  if (!currentWebview?.onDragDropEvent || !paperChatComposer) return;
+  try {
+    await currentWebview.onDragDropEvent(event => {
+      const payload = event?.payload;
+      if (!payload) return;
+      if (payload.type === 'leave') {
+        paperChatComposer.classList.remove('is-file-drag-over');
+        return;
+      }
+      const isInside = paperChatDropIsInside(payload.position);
+      paperChatComposer.classList.toggle('is-file-drag-over', isInside);
+      if (payload.type === 'drop') {
+        paperChatComposer.classList.remove('is-file-drag-over');
+        if (isInside) void importPaperChatAttachmentPaths(payload.paths || []);
+      }
+    });
+  } catch (e) {
+    console.warn('初始化对话附件拖放失败', e);
+  }
 }
 
 function getPaperChatProfileSignature() {
@@ -2643,6 +5255,7 @@ async function generateReadingNoteForEntry(entry, profileId) {
   setGlobalStatus(`正在使用「${profile.name}」生成阅读笔记…`, 'progress');
   try {
     await invoke('generate_reading_note', { entryId: entry.id, profileId });
+    loadCostSummary();
     applyEntryUpdate(entry.id, x => { x.has_reading_note = true; });
     currentEntry = entry;
     renderEntryList(allEntries);
@@ -2690,7 +5303,7 @@ async function generateReadingNotesForEntries(entries, profileId) {
 
   for (let index = 0; index < targetEntries.length; index += 1) {
     const entry = targetEntries[index];
-    const title = entry.title_translated || entry.title;
+    const title = entry.title_translated || entry.title || `文献 ${entry.id}`;
     setGlobalStatus(`正在生成阅读笔记（${index + 1}/${targetEntries.length}）：${title}`, 'progress');
     try {
       await invoke('generate_reading_note', { entryId: entry.id, profileId });
@@ -2704,6 +5317,7 @@ async function generateReadingNotesForEntries(entries, profileId) {
       });
     }
   }
+  if (successCount > 0) loadCostSummary();
 
   if (failures.length) {
     selectedEntryIds = new Set(failures.map(item => item.entry.id));
@@ -2800,9 +5414,7 @@ function getPaperChatDisplayItems(scope = paperChatScope) {
     return {
       meta,
       allowRemove: true,
-      items: paperChatPinnedEntries
-        .slice(0, PAPER_CHAT_MULTI_LIMIT)
-        .map(item => ({
+      items: paperChatPinnedEntries.map(item => ({
           id: item.id,
           title: item.title || `文献 ${item.id}`,
           source: item.source || '',
@@ -2856,12 +5468,7 @@ function renderPaperChatPinnedEntries() {
     return;
   }
 
-  const overflowNote = meta.totalCount > items.length
-    ? `<div class="paper-chat-picked-note">当前范围共 ${meta.totalCount} 篇，本轮展示并使用前 ${items.length} 篇。</div>`
-    : '';
-
   paperChatPickedList.innerHTML = `
-    ${overflowNote}
     ${items.map((item, index) => `
     <div class="paper-chat-picked-item ${allowRemove ? '' : 'readonly'}">
       <button
@@ -2905,76 +5512,46 @@ function getPaperChatScopeMeta(scope = paperChatScope) {
   const pinnedEntries = getPaperChatPinnedScopeEntries();
 
   if (scope === 'manual' && pinnedEntries.length > 0) {
-    const effective = Math.min(pinnedEntries.length, PAPER_CHAT_MULTI_LIMIT);
     return {
       key: 'manual',
-      label: pinnedEntries.length > PAPER_CHAT_MULTI_LIMIT
-        ? `手动已选 ${pinnedEntries.length} 篇（取前 ${effective}）`
-        : `手动已选 ${effective} 篇`,
-      caption: pinnedEntries.length > PAPER_CHAT_MULTI_LIMIT
-        ? `手动已选 ${pinnedEntries.length} 篇，本轮取前 ${effective} 篇`
-        : `手动已选 ${effective} 篇文献`,
-      hint: pinnedEntries.length > PAPER_CHAT_MULTI_LIMIT
-        ? `当前按右侧手动加入的文献回答。本轮只使用前 ${effective} 篇。`
-        : '当前按右侧手动加入的文献回答。可持续增减文献后继续追问。',
-      entries: pinnedEntries
-        .slice(0, PAPER_CHAT_MULTI_LIMIT)
-        .map(item => item._entry || { id: item.id }),
+      label: `手动已选 ${pinnedEntries.length} 篇`,
+      caption: `手动已选 ${pinnedEntries.length} 篇文献`,
+      hint: '当前按右侧手动加入的全部文献摘要回答。可持续增减文献后继续追问。',
+      entries: pinnedEntries.map(item => item._entry || { id: item.id }),
       totalCount: pinnedEntries.length,
     };
   }
 
   if (scope === 'selection' && selectedEntries.length > 1) {
-    const effective = Math.min(selectedEntries.length, PAPER_CHAT_MULTI_LIMIT);
     return {
       key: 'selection',
-      label: selectedEntries.length > PAPER_CHAT_MULTI_LIMIT
-        ? `已选 ${selectedEntries.length} 篇（取前 ${effective}）`
-        : `已选 ${effective} 篇`,
-      caption: selectedEntries.length > PAPER_CHAT_MULTI_LIMIT
-        ? `已选 ${selectedEntries.length} 篇，本轮取前 ${effective} 篇`
-        : `已选 ${effective} 篇文献`,
-      hint: selectedEntries.length > PAPER_CHAT_MULTI_LIMIT
-        ? `当前按已选文献联合回答。为控制速度与长度，本轮只使用前 ${effective} 篇。`
-        : '当前按已选文献联合回答。',
-      entries: selectedEntries.slice(0, PAPER_CHAT_MULTI_LIMIT),
+      label: `已选 ${selectedEntries.length} 篇`,
+      caption: `已选 ${selectedEntries.length} 篇文献`,
+      hint: '当前按全部已选文献摘要联合回答。',
+      entries: selectedEntries,
       totalCount: selectedEntries.length,
     };
   }
 
   if (scope === 'feed' && selectedFeedId && sourceEntries.length > 1) {
-    const effective = Math.min(sourceEntries.length, PAPER_CHAT_MULTI_LIMIT);
     return {
       key: 'feed',
-      label: sourceEntries.length > PAPER_CHAT_MULTI_LIMIT
-        ? `当前订阅源 ${sourceEntries.length} 篇（取前 ${effective}）`
-        : `当前订阅源 ${effective} 篇`,
-      caption: sourceEntries.length > PAPER_CHAT_MULTI_LIMIT
-        ? `当前订阅源共 ${sourceEntries.length} 篇，本轮取前 ${effective} 篇`
-        : `当前订阅源 ${effective} 篇文献`,
-      hint: sourceEntries.length > PAPER_CHAT_MULTI_LIMIT
-        ? `当前按所选订阅源中的多篇文献联合回答。本轮只使用列表前 ${effective} 篇。`
-        : '当前按所选订阅源中的多篇文献联合回答。',
-      entries: sourceEntries.slice(0, PAPER_CHAT_MULTI_LIMIT),
+      label: `当前订阅源 ${sourceEntries.length} 篇`,
+      caption: `当前订阅源 ${sourceEntries.length} 篇文献`,
+      hint: '当前按所选订阅源中的全部文献摘要联合回答。',
+      entries: sourceEntries,
       totalCount: sourceEntries.length,
     };
   }
 
   if (scope === 'tag' && tagEntries.length > 1) {
-    const effective = Math.min(tagEntries.length, PAPER_CHAT_MULTI_LIMIT);
     const tagLabel = `标签“${entryTagFilterValue}”`;
     return {
       key: 'tag',
-      label: tagEntries.length > PAPER_CHAT_MULTI_LIMIT
-        ? `${tagLabel} ${tagEntries.length} 篇（取前 ${effective}）`
-        : `${tagLabel} ${effective} 篇`,
-      caption: tagEntries.length > PAPER_CHAT_MULTI_LIMIT
-        ? `${tagLabel}共 ${tagEntries.length} 篇，本轮取前 ${effective} 篇`
-        : `${tagLabel}${effective} 篇文献`,
-      hint: tagEntries.length > PAPER_CHAT_MULTI_LIMIT
-        ? `当前按标签“${entryTagFilterValue}”的文献联合回答。本轮只使用前 ${effective} 篇。`
-        : `当前按标签“${entryTagFilterValue}”的文献联合回答。`,
-      entries: tagEntries.slice(0, PAPER_CHAT_MULTI_LIMIT),
+      label: `${tagLabel} ${tagEntries.length} 篇`,
+      caption: `${tagLabel}${tagEntries.length} 篇文献`,
+      hint: `当前按标签“${entryTagFilterValue}”的全部文献摘要联合回答。`,
+      entries: tagEntries,
       totalCount: tagEntries.length,
     };
   }
@@ -3119,10 +5696,11 @@ async function loadPaperChatMessages() {
 }
 
 async function sendPaperChatQuestion() {
-  if (!currentEntry || !paperChatInput) return;
+  if (!currentEntry || !paperChatInput || activePaperChatRequest) return;
   const activeProfile = getCurrentPaperChatProfile();
   const typedQuestion = paperChatInput.value.trim();
-  const question = buildPaperChatQuestion(typedQuestion, activeProfile);
+  const question = buildPaperChatQuestion(typedQuestion, activeProfile)
+    || (paperChatAttachments.length ? '请分析本轮添加的附件，并总结关键内容、证据和局限。' : '');
   if (!question) {
     setGlobalStatus('请输入问题后再发送', 'error');
     paperChatInput.focus();
@@ -3136,9 +5714,14 @@ async function sendPaperChatQuestion() {
   }
 
   const draft = paperChatInput.value;
+  const request = {
+    id: createPaperChatRequestId(),
+    signature: getPaperChatRequestSignature(),
+    stopping: false,
+  };
+  activePaperChatRequest = request;
   paperChatInput.value = '';
   refreshPaperChatComposerState();
-  if (btnSendPaperChat) btnSendPaperChat.disabled = true;
   renderPaperChatMessages([], { loading: true });
   setGlobalStatus(`正在生成文献回答：${getPaperChatScopeLabel()}`, 'progress');
 
@@ -3147,17 +5730,51 @@ async function sendPaperChatQuestion() {
       entryIds,
       question,
       profileId: getPaperChatProfileId(),
+      attachments: paperChatAttachments,
+      requestId: request.id,
     });
-    renderPaperChatMessages(messages);
-    setGlobalStatus('文献对话已更新', 'success');
+    loadCostSummary();
+    if (request.signature === getPaperChatRequestSignature()) {
+      renderPaperChatMessages(messages);
+    }
+    setGlobalStatus(request.stopping ? '回答已完成，未能及时停止' : '文献对话已更新', 'success');
   } catch (e) {
     paperChatInput.value = draft;
-    refreshPaperChatComposerState();
     await loadPaperChatMessages();
-    setGlobalStatus('文献对话失败: ' + e, 'error');
+    if (request.stopping || String(e).includes('文献对话已停止')) {
+      setGlobalStatus('已停止生成回答', 'success');
+    } else {
+      setGlobalStatus('文献对话失败: ' + e, 'error');
+    }
   } finally {
-    if (btnSendPaperChat) btnSendPaperChat.disabled = false;
+    if (activePaperChatRequest === request) activePaperChatRequest = null;
     refreshPaperChatComposerState();
+  }
+}
+
+async function stopPaperChatAnswer() {
+  const request = activePaperChatRequest;
+  if (!request || request.stopping) return;
+  request.stopping = true;
+  refreshPaperChatComposerState();
+  setGlobalStatus('正在停止当前回答…', 'progress');
+  try {
+    const stopped = await invoke('cancel_paper_chat', { requestId: request.id });
+    if (!stopped && activePaperChatRequest === request) {
+      setGlobalStatus('回答已经结束，正在读取结果', 'progress');
+    }
+  } catch (e) {
+    request.stopping = false;
+    refreshPaperChatComposerState();
+    setGlobalStatus('停止回答失败: ' + e, 'error');
+  }
+}
+
+function handlePaperChatPrimaryAction() {
+  if (activePaperChatRequest) {
+    stopPaperChatAnswer();
+  } else {
+    sendPaperChatQuestion();
   }
 }
 
@@ -3237,6 +5854,11 @@ async function loadEntries(feedId) {
 }
 
 function renderEntryList(entries) {
+  syncCompactFilterSummaries();
+  if (mode === 'pubmed' || mode === 'kept' || mode !== 'search') {
+    renderPubmedEntryList(entries);
+    return;
+  }
   syncEntryFilterControls();
   syncEntryMetricFilterControls();
   const stars = starredIds();
@@ -3247,7 +5869,8 @@ function renderEntryList(entries) {
 
   if (filtered.length === 0) {
     let msg;
-    if (entryTagFilterValue !== 'all' && hasActiveEntryMetricFilters()) msg = '当前标签与分区筛选下没有文章';
+    if (mode === 'search') msg = `未找到与“${escapeHtml(literatureSearchInput?.value.trim() || '')}”匹配的文献`;
+    else if (entryTagFilterValue !== 'all' && hasActiveEntryMetricFilters()) msg = '当前标签与分区筛选下没有文章';
     else if (entryTagFilterValue !== 'all') msg = '当前标签筛选下没有文章';
     else if (hasActiveEntryMetricFilters()) msg = '当前影响因子 / 分区筛选下没有文章';
     else if (entryFilterValue === 'unread') msg = '没有未读文章';
@@ -3270,7 +5893,7 @@ function renderEntryList(entries) {
     const isStarred = stars.has(entry.id);
     const hasReadingNote = !!entry.has_reading_note;
     const isBulkSelected = entrySelectionMode && selectedEntryIds.has(entry.id);
-    const title = entry.title_translated || entry.title;
+    const titles = displayTitles(entry);
     const timeStr = entry.published_at ? timeAgo(entry.published_at) : '';
     const source = journalName(entry);
 
@@ -3293,7 +5916,7 @@ function renderEntryList(entries) {
 	    }
 	
 	    const badges = [];
-	    if (entry.title_translated && entry.summary_translated) {
+	    if (entry.summary_translated) {
 	      badges.push(`<span class="pill pill-accent">已翻译</span>`);
 	    }
 	    if (isStarred) {
@@ -3307,15 +5930,18 @@ function renderEntryList(entries) {
 	    }
 	    badges.push(...renderEntryTagBadges(entry.tags));
     const badgesHtml = badges.length ? `<div class="entry-badges">${badges.join('')}</div>` : '';
-    const leadMarkerHtml = entrySelectionMode
-      ? `<span class="entry-select-checkbox ${isBulkSelected ? 'checked' : ''}" aria-hidden="true"></span>`
-      : '<span class="entry-read-dot"></span>';
+    const selectionControlHtml = entrySelectionMode
+      ? `<div class="entry-select-col"><span class="entry-select-checkbox ${isBulkSelected ? 'checked' : ''}" aria-hidden="true"></span></div>`
+      : '';
 
     li.innerHTML = `
-      <div class="entry-dot-col">${leadMarkerHtml}</div>
+      ${selectionControlHtml}
       <div class="entry-body">
         <div class="entry-row-top">
-          <div class="entry-title">${escapeHtml(title)}${tagHtml}${isTranslating ? ' <span class="entry-spinner"></span>' : ''}</div>
+          <div>
+            <div class="entry-title">${escapeHtml(titles.primary)}${tagHtml}${isTranslating ? ' <span class="entry-spinner"></span>' : ''}</div>
+            ${titles.secondary ? `<div class="entry-title-original">${escapeHtml(titles.secondary)}</div>` : ''}
+          </div>
           <div class="entry-date">${timeStr}</div>
         </div>
         ${metaHtml}
@@ -3355,15 +5981,200 @@ function renderEntryList(entries) {
   syncEntryBulkActions();
 }
 
+function renderPubmedEntryList(entries) {
+  syncEntryFilterControls();
+  syncEntryMetricFilterControls();
+  updateTopEntryFilterCounts(entries);
+  const isPubmedList = mode === 'pubmed' || mode === 'kept';
+  const filtered = isPubmedList ? getFilteredPubmedEntries(entries) : getFilteredEntries(entries);
+  const visible = isPubmedList ? filtered.slice(0, pubmedRenderLimit) : filtered;
+  scheduleFreeFulltextChecks(visible);
+  entryItemsEl.innerHTML = '';
+  if (!filtered.length) {
+    let msg = '当前筛选条件下没有文献';
+    if (!isPubmedList) {
+      if (entryTagFilterValue !== 'all' && hasActiveEntryMetricFilters()) msg = '当前标签与分区筛选下没有文章';
+      else if (entryTagFilterValue !== 'all') msg = '当前标签筛选下没有文章';
+      else if (hasActiveEntryMetricFilters()) msg = '当前影响因子 / 分区筛选下没有文章';
+      else if (entryFilterValue === 'unread') msg = '没有未读文章';
+      else if (entryFilterValue === 'starred') msg = '尚未星标任何文章';
+      else if (entryFilterValue === 'reading-notes') msg = '尚无带阅读笔记的文章';
+      else msg = document.querySelector('.feed-item.selected')
+        ? '该订阅源暂无文章，点击刷新获取'
+        : '添加订阅源后点击刷新按钮获取文章';
+    }
+    entryItemsEl.innerHTML = `<li class="entry-empty">${msg}</li>`;
+    syncEntryBulkActions();
+    return;
+  }
+
+  visible.forEach((entry, index) => {
+    const li = document.createElement('li');
+    li.className = `pubmed-entry-item ${entry.is_read ? 'read' : 'unread'}`;
+    li.dataset.entryId = entry.id;
+    if (selectedEntryIds.has(entry.id)) li.classList.add('bulk-selected');
+    if (currentEntry?.id === entry.id) li.classList.add('selected');
+    const metrics = renderMetricBadges(lookupJournalMetrics(entry), { compact: true });
+    const publication = isPubmedList
+      ? formatPubmedPublicationDate(entry)
+      : (entry.publication_date || (entry.published_at ? timeAgo(entry.published_at) : ''));
+    const titles = displayTitles(entry);
+    const isStarred = starredIds().has(entry.id);
+    const source = entry.journal || journalName(entry);
+    const status = entry.screening_status || 'unreviewed';
+    const badges = [];
+    if (entry.summary_translated) {
+      badges.push('<span class="pill pill-accent">已翻译</span>');
+    }
+    if (entry.has_reading_note) {
+      badges.push('<span class="pill pill-note">阅读笔记</span>');
+    }
+    if (entry.has_free_fulltext) {
+      badges.push('<span class="pill pill-free">PMC全文</span>');
+    }
+    badges.push(...renderEntryTagBadges(entry.tags, { limit: 6 }));
+    li.innerHTML = `
+      <input class="pubmed-entry-checkbox" type="checkbox" ${selectedEntryIds.has(entry.id) ? 'checked' : ''} aria-label="选择第 ${index + 1} 篇文献" />
+      <span class="pubmed-entry-number">${index + 1}.</span>
+      <div class="pubmed-entry-content">
+        <div class="pubmed-entry-title-row">
+          <div class="pubmed-entry-title">${escapeHtml(titles.primary)}${entry._titleTranslating ? ' <span class="entry-spinner"></span>' : ''}</div>
+        </div>
+        ${titles.secondary ? `<div class="pubmed-entry-original">${escapeHtml(titles.secondary)}</div>` : ''}
+        <div class="pubmed-entry-info-row">
+          <div class="pubmed-entry-meta">
+            ${metrics ? `<span class="journal-metrics pubmed-entry-metrics">${metrics}</span>` : ''}
+            ${source ? `<span>《${escapeHtml(source)}》</span>` : ''}
+            ${publication ? `<span class="pubmed-entry-meta-sep">·</span><span>${escapeHtml(publication)}</span>` : ''}
+            ${entry.pmid ? `<span class="pubmed-entry-meta-sep">·</span><span>PMID ${escapeHtml(entry.pmid)}</span>` : ''}
+          </div>
+          <button
+            class="pubmed-star-button ${isStarred ? 'active' : ''}"
+            type="button"
+            aria-label="${isStarred ? '取消星标' : '标星'}"
+            aria-pressed="${isStarred}"
+            title="${isStarred ? '取消星标' : '标星'}"
+          >${isStarred ? '★' : '☆'}</button>
+          <select class="pubmed-status-select status-${escapeHtml(status)}" aria-label="筛选状态" ${mode === 'kept' ? 'disabled' : ''}>
+            <option value="unreviewed" ${status === 'unreviewed' ? 'selected' : ''}>未筛选</option>
+            <option value="keep" ${status === 'keep' ? 'selected' : ''}>保留</option>
+            <option value="maybe" ${status === 'maybe' ? 'selected' : ''}>待定</option>
+            <option value="exclude" ${status === 'exclude' ? 'selected' : ''}>排除</option>
+          </select>
+        </div>
+        ${badges.length ? `<div class="entry-badges pubmed-entry-tags">${badges.join('')}</div>` : ''}
+      </div>
+    `;
+
+    const checkbox = li.querySelector('.pubmed-entry-checkbox');
+    checkbox.addEventListener('click', event => {
+      event.stopPropagation();
+      if (!entrySelectionMode) entrySelectionMode = true;
+      toggleEntrySelection(entry.id, { shiftKey: event.shiftKey });
+      renderEntryList(allEntries);
+    });
+    li.querySelector('.pubmed-star-button')?.addEventListener('click', event => {
+      event.stopPropagation();
+      toggleStar(entry.id);
+      renderEntryList(allEntries);
+      updateOverviewCounts();
+    });
+    li.querySelector('.pubmed-status-select')?.addEventListener('change', async event => {
+      event.stopPropagation();
+      if (isPubmedList) await updatePubmedScreeningStatus(entry, event.target.value);
+      else await updateEntryScreeningStatus(entry, event.target.value);
+    });
+    li.addEventListener('click', async event => {
+      if (event.target.closest('input, select, button')) return;
+      showDetail(entry);
+      if (!entry.is_read) await setEntryRead(entry, true);
+      else renderEntryList(allEntries);
+    });
+    li.addEventListener('contextmenu', event => {
+      event.preventDefault();
+      if (event.ctrlKey) {
+        handleEntryMultiSelect(entry, { shiftKey: event.shiftKey });
+        return;
+      }
+      showEntryContextMenu(event.clientX, event.clientY, entry);
+    });
+    entryItemsEl.appendChild(li);
+  });
+
+  if (isPubmedList && visible.length < filtered.length) {
+    const more = document.createElement('li');
+    more.className = 'entry-empty';
+    more.innerHTML = `<button class="btn btn-secondary btn-sm" type="button">继续显示（${visible.length}/${filtered.length}）</button>`;
+    more.querySelector('button').addEventListener('click', () => {
+      pubmedRenderLimit += 200;
+      renderEntryList(allEntries);
+    });
+    entryItemsEl.appendChild(more);
+  }
+  syncEntryBulkActions();
+}
+
+function formatPubmedPublicationDate(entry) {
+  if (entry.publication_date_precision === 'season' || entry.publication_date_precision === 'medline') {
+    return entry.publication_date_raw || entry.publication_date || '';
+  }
+  const value = entry.publication_date || '';
+  if (/^\d{4}-\d{2}/.test(value)) {
+    const [year, month] = value.split('-');
+    return `${year}${month}`;
+  }
+  if (/^\d{4}$/.test(value)) return value;
+  return entry.publication_date_raw || value;
+}
+
+async function updatePubmedScreeningStatus(entry, status) {
+  if (!currentPubmedSearch || mode !== 'pubmed') return;
+  try {
+    await invoke('set_pubmed_screening_status', {
+      searchId: currentPubmedSearch.id,
+      entryId: entry.id,
+      status,
+    });
+    entry.screening_status = status;
+    renderEntryList(allEntries);
+    await loadPubmedSearches();
+    setGlobalStatus(`已设为${pubmedStatusLabel(status)}`, 'success');
+  } catch (e) {
+    renderEntryList(allEntries);
+    setGlobalStatus('更新筛选状态失败: ' + e, 'error');
+  }
+}
+
+async function updateEntryScreeningStatus(entry, status) {
+  try {
+    await invoke('set_entry_screening_status', {
+      entryId: entry.id,
+      status,
+    });
+    entry.screening_status = status;
+    renderEntryList(allEntries);
+    setGlobalStatus(`已设为${pubmedStatusLabel(status)}`, 'success');
+  } catch (e) {
+    renderEntryList(allEntries);
+    setGlobalStatus('更新筛选状态失败: ' + e, 'error');
+  }
+}
+
+function pubmedStatusLabel(status) {
+  return { unreviewed: '未筛选', keep: '保留', maybe: '待定', exclude: '排除' }[status] || status;
+}
+
 // ── Detail panel ───────────────────────────────
 function showDetail(entry) {
+  const entryChanged = currentEntry?.id !== entry.id;
   currentEntry = entry;
+  if (entryChanged) resetPaperGraph();
   paperChatScope = 'single';
   detailEmpty.classList.add('hidden');
   detailContent.classList.remove('hidden');
   renderPaperChatPinnedEntries();
 
-  detailTitle.textContent = entry.title_translated || entry.title;
+  renderDetailTitle(entry);
   renderDetailJournalMeta(entry);
 
   applyAffiliation(entry);
@@ -3387,7 +6198,7 @@ function showDetail(entry) {
   }
   detailPublicationDate.textContent = formatPublicationDate(entry);
 
-  if (entry.title_translated && entry.summary_translated) {
+  if (entry.summary_translated) {
     detailSourceBadge.textContent = '已翻译';
     detailBadgeRow.classList.remove('hidden');
   } else {
@@ -3398,8 +6209,9 @@ function showDetail(entry) {
   if (starBtn) starBtn.classList.toggle('active', starredIds().has(entry.id));
 
   const aiFooter = document.getElementById('detail-ai-footer');
-  const modelName = (modelInput?.value || 'DeepSeek').trim() || 'DeepSeek';
-  document.getElementById('ai-model-name').textContent = `由 ${modelName} 翻译`;
+  const providerMeta = AI_PROVIDER_META[activeProviderId()] || AI_PROVIDER_META.deepseek;
+  const modelName = (modelInput?.value || providerMeta.model).trim() || providerMeta.label;
+  document.getElementById('ai-model-name').textContent = `由 ${providerMeta.label} · ${modelName} 翻译`;
   if (entry.title_translated || entry.summary_translated) {
     aiFooter?.classList.remove('hidden');
   } else {
@@ -3419,6 +6231,444 @@ function showDetail(entry) {
   if (!entry.summary && !entry.summary_translated) loadAbstract(entry);
 
   btnOpenUrl.onclick = () => openUrl(entry.link);
+  syncDetailExternalActions(entry);
+}
+
+function syncDetailExternalActions(entry) {
+  syncDetailPdfAction(entry);
+
+  const sciHubUrl = buildSciHubUrl(entry.doi);
+  const publicationYear = entryPublicationYear(entry);
+  const isTooRecent = publicationYear !== null
+    && publicationYear > SCI_HUB_LAST_RELIABLE_PUBLICATION_YEAR;
+  btnDetailSciHub.disabled = !sciHubUrl || isTooRecent;
+  if (!sciHubUrl) {
+    btnDetailSciHub.title = '缺少 DOI，无法打开 Sci-Hub';
+  } else if (isTooRecent) {
+    btnDetailSciHub.title = `${publicationYear} 年发表；Sci-Hub 自 2021 年起通常不再收录新论文`;
+  } else {
+    btnDetailSciHub.title = '通过 Sci-Hub 查找全文';
+  }
+  btnDetailSciHub.onclick = btnDetailSciHub.disabled ? null : () => openUrl(sciHubUrl);
+}
+
+function entryPdfIdentity(entry) {
+  return [entry.id, entry.doi || '', entry.pmid || '', entry.pmcid || ''].join('|');
+}
+
+function syncDetailPdfAction(entry) {
+  const identity = entryPdfIdentity(entry);
+  const cached = entryPdfLinkCache.get(entry.id);
+  if (cached?.identity === identity) {
+    applyDetailPdfUrl(cached.url);
+    return;
+  }
+
+  btnDetailPdf.disabled = true;
+  btnDetailPdf.setAttribute('aria-busy', 'true');
+  btnDetailPdf.title = '正在检查全文 PDF…';
+  btnDetailPdf.onclick = null;
+  ensureEntryPdfLink(entry, identity);
+}
+
+function applyDetailPdfUrl(url) {
+  btnDetailPdf.removeAttribute('aria-busy');
+  btnDetailPdf.disabled = !url;
+  btnDetailPdf.title = url ? '打开全文 PDF' : '未找到可直接打开的全文 PDF';
+  btnDetailPdf.onclick = url ? () => openUrl(url) : null;
+}
+
+async function ensureEntryPdfLink(entry, identity) {
+  const existing = entryPdfLinkCheckInFlight.get(entry.id);
+  if (existing?.identity === identity) return existing.promise;
+
+  const promise = (async () => {
+    let url = '';
+    let failed = false;
+    try {
+      url = await invoke('resolve_entry_pdf_url', { entryId: entry.id }) || '';
+      entryPdfLinkCache.set(entry.id, { identity, url });
+    } catch (error) {
+      failed = true;
+      console.error('检查全文 PDF 失败:', error);
+    } finally {
+      const active = entryPdfLinkCheckInFlight.get(entry.id);
+      if (active?.identity === identity) entryPdfLinkCheckInFlight.delete(entry.id);
+      if (currentEntry?.id === entry.id && entryPdfIdentity(currentEntry) === identity) {
+        applyDetailPdfUrl(url);
+        if (failed) btnDetailPdf.title = '全文 PDF 检查失败，请重新打开文章后重试';
+      }
+    }
+  })();
+  entryPdfLinkCheckInFlight.set(entry.id, { identity, promise });
+  try {
+    await promise;
+  } catch {}
+}
+
+function entryPublicationYear(entry) {
+  for (const value of [entry?.publication_date, entry?.publication_date_raw, entry?.published_at]) {
+    const match = String(value || '').match(/(?:19|20)\d{2}/);
+    if (match) return Number(match[0]);
+  }
+  return null;
+}
+
+function buildSciHubUrl(value) {
+  const doi = String(value || '')
+    .trim()
+    .replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, '')
+    .replace(/^doi:\s*/i, '');
+  if (!doi) return '';
+  const encodedDoi = doi.split('/').map(part => encodeURIComponent(part)).join('/');
+  return `${SCI_HUB_BASE_URL}${encodedDoi}`;
+}
+
+function resetPaperGraph() {
+  paperGraphRequestToken += 1;
+  currentPaperGraph = null;
+  selectedPaperGraphNodeId = null;
+  paperGraphHistory = [];
+  paperGraphFilter = 'all';
+  paperGraphViewport = { x: 0, y: 0, scale: 1 };
+  detailPaperGraphSection?.classList.add('hidden');
+  btnPaperGraph?.classList.remove('active');
+  if (paperGraphStage) paperGraphStage.innerHTML = '';
+  if (paperGraphNodeDetail) {
+    paperGraphNodeDetail.innerHTML = '';
+    paperGraphNodeDetail.classList.add('hidden');
+  }
+  syncPaperGraphControls();
+}
+
+function syncPaperGraphControls() {
+  document.querySelectorAll('[data-graph-filter]').forEach(button => {
+    button.classList.toggle('active', button.dataset.graphFilter === paperGraphFilter);
+  });
+  document.getElementById('btn-paper-graph-back')?.classList.toggle('hidden', !paperGraphHistory.length);
+}
+
+async function togglePaperGraph() {
+  if (!currentEntry || !detailPaperGraphSection) return;
+  const willShow = detailPaperGraphSection.classList.contains('hidden');
+  detailPaperGraphSection.classList.toggle('hidden', !willShow);
+  btnPaperGraph?.classList.toggle('active', willShow);
+  if (!willShow) return;
+  detailPaperGraphSection.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  if (!currentPaperGraph) await loadPaperGraph({ entryId: currentEntry.id });
+}
+
+async function loadPaperGraph({ entryId = null, paperId = null, pushHistory = false } = {}) {
+  if (!paperGraphStage) return;
+  if (pushHistory && currentPaperGraph?.seed_id) {
+    paperGraphHistory.push(currentPaperGraph.seed_id);
+  }
+  const token = ++paperGraphRequestToken;
+  paperGraphStage.innerHTML = '<div class="paper-graph-loading"><span></span>正在构建关系图谱…</div>';
+  paperGraphNodeDetail?.classList.add('hidden');
+  document.getElementById('btn-paper-graph-reload')?.classList.add('is-loading');
+  syncPaperGraphControls();
+  try {
+    const graph = await invoke('get_paper_graph', {
+      entryId: entryId || null,
+      paperId: paperId || null,
+    });
+    if (token !== paperGraphRequestToken) return;
+    currentPaperGraph = graph;
+    selectedPaperGraphNodeId = graph.seed_id;
+    paperGraphViewport = { x: 0, y: 0, scale: 1 };
+    renderPaperGraph();
+  } catch (error) {
+    if (token !== paperGraphRequestToken) return;
+    currentPaperGraph = null;
+    paperGraphStage.innerHTML = `
+      <div class="paper-graph-error">
+        <div>${escapeHtml(String(error))}</div>
+        <button class="btn btn-secondary btn-sm" type="button" data-paper-graph-retry>重试</button>
+      </div>
+    `;
+    paperGraphStage.querySelector('[data-paper-graph-retry]')?.addEventListener('click', () => {
+      loadPaperGraph({ entryId: currentEntry?.id || null, paperId });
+    });
+    updatePaperGraphCounts();
+  } finally {
+    if (token === paperGraphRequestToken) {
+      document.getElementById('btn-paper-graph-reload')?.classList.remove('is-loading');
+    }
+  }
+}
+
+function paperGraphRelation(node) {
+  if (node.paper_id === currentPaperGraph?.seed_id) return 'seed';
+  if (paperGraphFilter !== 'all' && node.relations?.includes(paperGraphFilter)) return paperGraphFilter;
+  if (node.relations?.includes('reference')) return 'reference';
+  if (node.relations?.includes('citation')) return 'citation';
+  return 'similar';
+}
+
+function visiblePaperGraphNodes() {
+  if (!currentPaperGraph) return [];
+  return currentPaperGraph.nodes.filter(node => (
+    node.paper_id === currentPaperGraph.seed_id
+    || paperGraphFilter === 'all'
+    || node.relations?.includes(paperGraphFilter)
+  ));
+}
+
+function hashPaperGraphId(value) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash << 5) - hash + value.charCodeAt(index)) | 0;
+  }
+  return Math.abs(hash);
+}
+
+function truncatePaperGraphTitle(value, length = 22) {
+  const text = String(value || '').trim();
+  return text.length > length ? `${text.slice(0, length - 1)}…` : text;
+}
+
+function layoutPaperGraphNodes(nodes) {
+  const knownYears = nodes.map(node => node.year).filter(Number.isFinite);
+  const currentYear = new Date().getFullYear();
+  let minYear = knownYears.length ? Math.min(...knownYears) : currentYear - 1;
+  let maxYear = knownYears.length ? Math.max(...knownYears) : currentYear;
+  if (minYear === maxYear) {
+    minYear -= 1;
+    maxYear += 1;
+  }
+  const positions = new Map();
+  nodes.forEach(node => {
+    const year = Number.isFinite(node.year) ? node.year : maxYear;
+    const x = 72 + ((year - minYear) / (maxYear - minYear)) * 756;
+    const relation = paperGraphRelation(node);
+    const hash = hashPaperGraphId(node.paper_id);
+    let y = 210;
+    if (relation === 'reference') y = 68 + (hash % 88);
+    if (relation === 'similar') y = hash % 2 ? 178 - (hash % 34) : 236 + (hash % 34);
+    if (relation === 'citation') y = 292 + (hash % 70);
+    positions.set(node.paper_id, { x, y });
+  });
+  return { positions, minYear, maxYear };
+}
+
+function paperGraphYearTicks(minYear, maxYear) {
+  const span = maxYear - minYear;
+  const step = Math.max(1, Math.ceil(span / 5));
+  const ticks = [];
+  for (let year = minYear; year <= maxYear; year += step) ticks.push(year);
+  if (ticks[ticks.length - 1] !== maxYear) ticks.push(maxYear);
+  return ticks;
+}
+
+function applyPaperGraphViewport() {
+  const group = paperGraphStage?.querySelector('[data-paper-graph-viewport]');
+  if (!group) return;
+  const { x, y, scale } = paperGraphViewport;
+  group.setAttribute('transform', `translate(${x} ${y}) scale(${scale})`);
+}
+
+function bindPaperGraphViewport(svg) {
+  let pointer = null;
+  svg.addEventListener('wheel', event => {
+    event.preventDefault();
+    const rect = svg.getBoundingClientRect();
+    const pointX = ((event.clientX - rect.left) / rect.width) * 900;
+    const pointY = ((event.clientY - rect.top) / rect.height) * 410;
+    const oldScale = paperGraphViewport.scale;
+    const nextScale = Math.min(2.4, Math.max(0.72, oldScale * (event.deltaY < 0 ? 1.12 : 0.9)));
+    paperGraphViewport.x = pointX - ((pointX - paperGraphViewport.x) * nextScale / oldScale);
+    paperGraphViewport.y = pointY - ((pointY - paperGraphViewport.y) * nextScale / oldScale);
+    paperGraphViewport.scale = nextScale;
+    applyPaperGraphViewport();
+  }, { passive: false });
+  svg.addEventListener('pointerdown', event => {
+    if (event.button !== 0 || event.target.closest('[data-paper-node]')) return;
+    pointer = { id: event.pointerId, x: event.clientX, y: event.clientY, moved: false };
+    svg.setPointerCapture?.(event.pointerId);
+    svg.classList.add('is-panning');
+  });
+  svg.addEventListener('pointermove', event => {
+    if (!pointer || pointer.id !== event.pointerId) return;
+    const rect = svg.getBoundingClientRect();
+    const dx = (event.clientX - pointer.x) * 900 / rect.width;
+    const dy = (event.clientY - pointer.y) * 410 / rect.height;
+    if (Math.abs(dx) + Math.abs(dy) > 2) pointer.moved = true;
+    paperGraphViewport.x += dx;
+    paperGraphViewport.y += dy;
+    pointer.x = event.clientX;
+    pointer.y = event.clientY;
+    applyPaperGraphViewport();
+  });
+  const finish = event => {
+    if (!pointer || pointer.id !== event.pointerId) return;
+    if (pointer.moved) paperGraphSuppressClickUntil = Date.now() + 180;
+    pointer = null;
+    svg.classList.remove('is-panning');
+    svg.releasePointerCapture?.(event.pointerId);
+  };
+  svg.addEventListener('pointerup', finish);
+  svg.addEventListener('pointercancel', finish);
+}
+
+function renderPaperGraph() {
+  if (!currentPaperGraph || !paperGraphStage) return;
+  const nodes = visiblePaperGraphNodes();
+  const nodeIds = new Set(nodes.map(node => node.paper_id));
+  const edges = currentPaperGraph.edges.filter(edge => (
+    nodeIds.has(edge.source)
+    && nodeIds.has(edge.target)
+    && (paperGraphFilter === 'all' || edge.relation === paperGraphFilter)
+  ));
+  const { positions, minYear, maxYear } = layoutPaperGraphNodes(nodes);
+  const ticks = paperGraphYearTicks(minYear, maxYear);
+  const edgeMarkup = edges.map(edge => {
+    const source = positions.get(edge.source);
+    const target = positions.get(edge.target);
+    if (!source || !target) return '';
+    const marker = edge.relation === 'similar' ? '' : 'marker-end="url(#paper-graph-arrow)"';
+    return `<line class="paper-graph-edge ${edge.relation}" x1="${source.x}" y1="${source.y}" x2="${target.x}" y2="${target.y}" ${marker} />`;
+  }).join('');
+  const nodeMarkup = nodes.map(node => {
+    const point = positions.get(node.paper_id);
+    const relation = paperGraphRelation(node);
+    const radius = relation === 'seed' ? 15 : Math.min(13, 6 + Math.log10(Math.max(1, node.citation_count + 1)) * 2.4);
+    const selected = node.paper_id === selectedPaperGraphNodeId ? ' selected' : '';
+    return `
+      <g class="paper-graph-node ${relation}${selected}" data-paper-node data-paper-id="${escapeHtml(node.paper_id)}" transform="translate(${point.x} ${point.y})" tabindex="0" role="button" aria-label="${escapeHtml(node.title)}">
+        <circle r="${radius}"><title>${escapeHtml(node.title)} · ${node.year || '年份未知'} · 被引 ${node.citation_count || 0}</title></circle>
+        <text y="${radius + 15}" text-anchor="middle">${escapeHtml(truncatePaperGraphTitle(node.title))}</text>
+      </g>
+    `;
+  }).join('');
+  const tickMarkup = ticks.map(year => {
+    const x = 72 + ((year - minYear) / (maxYear - minYear)) * 756;
+    return `<g class="paper-graph-year" transform="translate(${x} 0)"><line y1="28" y2="382"/><text y="400" text-anchor="middle">${year}</text></g>`;
+  }).join('');
+
+  paperGraphStage.innerHTML = `
+    <svg class="paper-graph-svg" viewBox="0 0 900 410" role="img" aria-label="文献引用关系图">
+      <defs><marker id="paper-graph-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" /></marker></defs>
+      <g data-paper-graph-viewport>
+        ${tickMarkup}
+        ${edgeMarkup}
+        ${nodeMarkup}
+      </g>
+    </svg>
+  `;
+  const svg = paperGraphStage.querySelector('svg');
+  applyPaperGraphViewport();
+  bindPaperGraphViewport(svg);
+  paperGraphStage.querySelectorAll('[data-paper-node]').forEach(group => {
+    const select = () => {
+      if (Date.now() < paperGraphSuppressClickUntil) return;
+      selectPaperGraphNode(group.dataset.paperId);
+    };
+    group.addEventListener('click', select);
+    group.addEventListener('keydown', event => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        select();
+      }
+    });
+  });
+  updatePaperGraphCounts();
+  renderPaperGraphNodeDetail();
+  syncPaperGraphControls();
+}
+
+function updatePaperGraphCounts() {
+  if (!paperGraphCounts) return;
+  if (!currentPaperGraph) {
+    paperGraphCounts.textContent = '';
+    return;
+  }
+  const count = relation => currentPaperGraph.nodes.filter(node => node.relations?.includes(relation)).length;
+  paperGraphCounts.textContent = `更早 ${count('reference')} · 后续 ${count('citation')} · 相似 ${count('similar')}`;
+}
+
+function selectPaperGraphNode(paperId) {
+  if (!currentPaperGraph?.nodes.some(node => node.paper_id === paperId)) return;
+  selectedPaperGraphNodeId = paperId;
+  paperGraphStage?.querySelectorAll('[data-paper-node]').forEach(node => {
+    node.classList.toggle('selected', node.dataset.paperId === paperId);
+  });
+  renderPaperGraphNodeDetail();
+}
+
+function paperGraphNodeUrl(node) {
+  if (node?.url) return node.url;
+  if (node?.doi) return `https://doi.org/${encodeURIComponent(node.doi)}`;
+  if (node?.pmid) return `https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(node.pmid)}/`;
+  return '';
+}
+
+function paperGraphRelationLabel(node) {
+  const labels = [];
+  if (node?.paper_id === currentPaperGraph?.seed_id) labels.push('当前中心');
+  if (node?.relations?.includes('reference')) labels.push('更早工作');
+  if (node?.relations?.includes('citation')) labels.push('后续工作');
+  if (node?.relations?.includes('similar')) labels.push('相似文献');
+  return labels.join(' · ');
+}
+
+function renderPaperGraphNodeDetail() {
+  if (!paperGraphNodeDetail || !currentPaperGraph) return;
+  const node = currentPaperGraph.nodes.find(item => item.paper_id === selectedPaperGraphNodeId);
+  if (!node) {
+    paperGraphNodeDetail.classList.add('hidden');
+    return;
+  }
+  const authors = (node.authors || []).slice(0, 4).join(', ');
+  const url = paperGraphNodeUrl(node);
+  const isSeed = node.paper_id === currentPaperGraph.seed_id;
+  paperGraphNodeDetail.innerHTML = `
+    <div class="paper-graph-node-copy">
+      <div class="paper-graph-node-kind">${escapeHtml(paperGraphRelationLabel(node))}</div>
+      <div class="paper-graph-node-title">${escapeHtml(node.title)}</div>
+      <div class="paper-graph-node-meta">${escapeHtml([node.year, authors, `被引 ${node.citation_count || 0}`].filter(Boolean).join(' · '))}</div>
+      ${node.abstract_text ? `<div class="paper-graph-node-abstract">${escapeHtml(truncatePaperGraphTitle(node.abstract_text, 240))}</div>` : ''}
+    </div>
+    <div class="paper-graph-node-actions">
+      <button class="btn btn-secondary btn-sm" type="button" data-paper-graph-open ${url ? '' : 'disabled'}>打开</button>
+      <button class="btn btn-primary btn-sm" type="button" data-paper-graph-center ${isSeed ? 'disabled' : ''}>以此为中心</button>
+    </div>
+  `;
+  paperGraphNodeDetail.classList.remove('hidden');
+  paperGraphNodeDetail.querySelector('[data-paper-graph-open]')?.addEventListener('click', () => openUrl(url));
+  paperGraphNodeDetail.querySelector('[data-paper-graph-center]')?.addEventListener('click', () => {
+    loadPaperGraph({ paperId: node.paper_id, pushHistory: true });
+  });
+}
+
+function setPaperGraphFilter(filter) {
+  if (!['all', 'reference', 'citation', 'similar'].includes(filter)) return;
+  paperGraphFilter = filter;
+  paperGraphViewport = { x: 0, y: 0, scale: 1 };
+  if (currentPaperGraph) {
+    const selected = currentPaperGraph.nodes.find(node => node.paper_id === selectedPaperGraphNodeId);
+    if (selected && selected.paper_id !== currentPaperGraph.seed_id && !selected.relations?.includes(filter) && filter !== 'all') {
+      selectedPaperGraphNodeId = currentPaperGraph.seed_id;
+    }
+    renderPaperGraph();
+  } else {
+    syncPaperGraphControls();
+  }
+}
+
+function reloadPaperGraph() {
+  if (!currentEntry) return;
+  if (currentPaperGraph?.seed_id && paperGraphHistory.length) {
+    loadPaperGraph({ paperId: currentPaperGraph.seed_id });
+  } else {
+    loadPaperGraph({ entryId: currentEntry.id });
+  }
+}
+
+function backPaperGraph() {
+  const previous = paperGraphHistory.pop();
+  if (!previous) return;
+  loadPaperGraph({ paperId: previous });
 }
 
 function syncAbstractToggle() {
@@ -3446,20 +6696,35 @@ function renderSummary(entry, state = 'ready') {
     detailSummaryContent.innerHTML = '<div class="detail-summary-translating">正在翻译摘要…</div>';
     return;
   }
+  if (entry._transError && abstractLang === 'zh' && !entry.summary_translated) {
+    const clean = stripSummaryIdentifierFooter(stripHtml(entry.summary || ''));
+    detailSummaryContent.innerHTML = `
+      <p class="detail-summary-error">摘要翻译失败：${escapeHtml(entry._transError)}</p>
+      ${clean ? `<p class="detail-summary-original">${escapeHtml(clean)}</p>` : ''}
+    `;
+    return;
+  }
   // 2) Translated text available, zh tab → show it
   if (entry.summary_translated && abstractLang === 'zh') {
-    detailSummaryContent.innerHTML = `<p>${escapeHtml(entry.summary_translated)}</p>`;
+    const clean = stripSummaryIdentifierFooter(entry.summary_translated);
+    detailSummaryContent.innerHTML = `<p>${escapeHtml(clean)}</p>`;
     return;
   }
   // 3) Original summary available (any of: en tab; or zh tab without translation yet)
   if (entry.summary && (abstractLang === 'en' || !entry.summary_translated)) {
-    const clean = stripHtml(entry.summary);
+    const clean = stripSummaryIdentifierFooter(stripHtml(entry.summary));
     detailSummaryContent.innerHTML = `<p class="detail-summary-original">${escapeHtml(clean)}</p>`;
     return;
   }
   // 4) No summary yet — either still fetching (or we never will)
   if (state === 'loading') detailSummaryContent.innerHTML = '<p class="detail-summary-empty">正在获取 Abstract…</p>';
   else detailSummaryContent.innerHTML = '<p class="detail-summary-empty">未能自动获取 Abstract。可以打开原文查看。</p>';
+}
+
+function stripSummaryIdentifierFooter(text) {
+  return String(text ?? '')
+    .replace(/(?:\s*(?:[|｜]\s*)?(?:PMID|DOI)\s*[:：]\s*[^\s|｜]+){1,2}\s*$/iu, '')
+    .trim();
 }
 
 function refreshDetailTitleSpinner(entry) {
@@ -3470,7 +6735,7 @@ function refreshDetailTitleSpinner(entry) {
       spin = document.createElement('span');
       spin.id = 'detail-title-spinner';
       spin.className = 'detail-title-spinner';
-      detailTitle.appendChild(spin);
+      (detailTitle.querySelector('.detail-title-primary') || detailTitle).appendChild(spin);
     }
   } else if (spin) {
     spin.remove();
@@ -3663,7 +6928,10 @@ async function ensureEntryIdentifiersLoaded(entry) {
       x.pmcid = ids?.pmcid || '';
       x.doi = ids?.doi || '';
     });
-    if (currentEntry && currentEntry.id === entry.id) renderDetailIdentifiers(currentEntry);
+    if (currentEntry && currentEntry.id === entry.id) {
+      renderDetailIdentifiers(currentEntry);
+      syncDetailExternalActions(currentEntry);
+    }
   } catch (e) {
     console.warn('fetch_entry_identifiers 失败:', e);
   } finally {
@@ -3692,13 +6960,18 @@ async function loadAbstract(entry) {
 async function retrySummaryTranslation() {
   if (!currentEntry) return;
   const entryId = currentEntry.id;
+  if (btnRetrySummary) {
+    btnRetrySummary.disabled = true;
+    btnRetrySummary.setAttribute('aria-busy', 'true');
+  }
+  setGlobalStatus('正在翻译摘要…', 'progress');
   // Mirror translation-progress events: clear the error pill across all
   // entry collections so the middle-column badge disappears immediately.
   applyEntryUpdate(entryId, x => {
     x._summaryTranslating = true;
     x._transError = null;
   });
-  renderEntryList(allEntries);
+  updateRenderedTranslationEntry(entryId);
   if (currentEntry && currentEntry.id === entryId) renderSummary(currentEntry);
   try {
     const translated = await invoke('translate_summary', { entryId });
@@ -3708,14 +6981,20 @@ async function retrySummaryTranslation() {
       x._transError = null;
     });
     addTranslationCost(translated.length);
+    setGlobalStatus('摘要翻译完成', 'success');
   } catch (e) {
     const msg = (typeof e === 'string') ? e : (e && e.message) || '翻译失败';
     applyEntryUpdate(entryId, x => {
       x._summaryTranslating = false;
       x._transError = msg;
     });
+    setGlobalStatus(`摘要翻译失败：${msg}`, 'error');
   } finally {
-    renderEntryList(allEntries);
+    if (btnRetrySummary) {
+      btnRetrySummary.disabled = false;
+      btnRetrySummary.removeAttribute('aria-busy');
+    }
+    updateRenderedTranslationEntry(entryId);
     updateOverviewCounts();
     if (currentEntry && currentEntry.id === entryId) renderSummary(currentEntry);
   }
@@ -3749,6 +7028,73 @@ function applyEntryUpdate(entryId, mutate) {
   if (currentEntry && currentEntry.id === entryId && currentEntry !== inAll) mutate(currentEntry);
 }
 
+function findRenderedEntryItem(entryId) {
+  const targetId = String(entryId);
+  return Array.from(entryItemsEl?.querySelectorAll('[data-entry-id]') || [])
+    .find(element => element.dataset.entryId === targetId) || null;
+}
+
+function syncRenderedTranslationTitle(item, entry) {
+  const titleEl = item.querySelector('.pubmed-entry-title, .entry-title');
+  if (!titleEl) return;
+
+  const titles = displayTitles(entry);
+  titleEl.replaceChildren(document.createTextNode(titles.primary));
+  if (entry._titleTranslating || entry._summaryTranslating) {
+    titleEl.append(' ');
+    const spinner = document.createElement('span');
+    spinner.className = 'entry-spinner';
+    titleEl.appendChild(spinner);
+  }
+
+  const isPubmed = item.classList.contains('pubmed-entry-item');
+  const originalSelector = isPubmed ? '.pubmed-entry-original' : '.entry-title-original';
+  let originalEl = item.querySelector(originalSelector);
+  if (!titles.secondary) {
+    originalEl?.remove();
+    return;
+  }
+
+  if (!originalEl) {
+    originalEl = document.createElement('div');
+    originalEl.className = originalSelector.slice(1);
+    if (isPubmed) {
+      const titleRow = item.querySelector('.pubmed-entry-title-row');
+      titleRow?.insertAdjacentElement('afterend', originalEl);
+    } else {
+      titleEl.parentElement?.appendChild(originalEl);
+    }
+  }
+  originalEl.textContent = titles.secondary;
+}
+
+function syncRenderedTranslationBadge(item, entry) {
+  if (!entry.summary_translated) return;
+  let badgesEl = item.querySelector('.entry-badges');
+  if (!badgesEl) {
+    const content = item.querySelector('.pubmed-entry-content, .entry-body');
+    if (!content) return;
+    badgesEl = document.createElement('div');
+    badgesEl.className = item.classList.contains('pubmed-entry-item')
+      ? 'entry-badges pubmed-entry-tags'
+      : 'entry-badges';
+    content.appendChild(badgesEl);
+  }
+  if (badgesEl.querySelector('.pill-accent')) return;
+  const badge = document.createElement('span');
+  badge.className = 'pill pill-accent';
+  badge.textContent = '已翻译';
+  badgesEl.prepend(badge);
+}
+
+function updateRenderedTranslationEntry(entryId) {
+  const entry = allEntries.find(item => item.id === entryId);
+  const item = findRenderedEntryItem(entryId);
+  if (!entry || !item) return;
+  syncRenderedTranslationTitle(item, entry);
+  syncRenderedTranslationBadge(item, entry);
+}
+
 function loadPaperChatPanelWidth() {
   try {
     const raw = parseInt(localStorage.getItem(PAPER_CHAT_WIDTH_STORAGE_KEY) || '', 10);
@@ -3756,6 +7102,83 @@ function loadPaperChatPanelWidth() {
   } catch {
     return PAPER_CHAT_DEFAULT_WIDTH;
   }
+}
+
+function loadSidebarWidth() {
+  try {
+    const raw = parseInt(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY) || '', 10);
+    return Number.isFinite(raw) ? raw : SIDEBAR_DEFAULT_WIDTH;
+  } catch {
+    return SIDEBAR_DEFAULT_WIDTH;
+  }
+}
+
+function saveSidebarWidth(width) {
+  try {
+    localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(Math.round(width)));
+  } catch {}
+}
+
+function clampSidebarWidth(width) {
+  const requested = Number.isFinite(width) ? width : SIDEBAR_DEFAULT_WIDTH;
+  const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 0;
+  const maxByViewport = viewportWidth > 0
+    ? Math.max(SIDEBAR_MIN_WIDTH, viewportWidth - 640)
+    : SIDEBAR_MAX_WIDTH;
+  const maxWidth = Math.min(SIDEBAR_MAX_WIDTH, maxByViewport);
+  return Math.round(Math.min(maxWidth, Math.max(SIDEBAR_MIN_WIDTH, requested)));
+}
+
+function applySidebarWidth(width, { persist = false } = {}) {
+  const next = clampSidebarWidth(width);
+  document.documentElement.style.setProperty('--sidebar-width', `${next}px`);
+  if (persist) saveSidebarWidth(next);
+  requestAnimationFrame(() => {
+    applyPaperChatPanelWidth(loadPaperChatPanelWidth());
+    syncPaperChatResizerVisibility();
+  });
+}
+
+function loadListPanelWidth() {
+  try {
+    const raw = parseInt(localStorage.getItem(LIST_WIDTH_STORAGE_KEY) || '', 10);
+    return Number.isFinite(raw) ? raw : LIST_DEFAULT_WIDTH;
+  } catch {
+    return LIST_DEFAULT_WIDTH;
+  }
+}
+
+function saveListPanelWidth(width) {
+  try {
+    localStorage.setItem(LIST_WIDTH_STORAGE_KEY, String(Math.round(width)));
+  } catch {}
+}
+
+function clampListPanelWidth(width) {
+  const requested = Number.isFinite(width) ? width : LIST_DEFAULT_WIDTH;
+  const containerWidth = contentArea?.clientWidth || 0;
+  const detailMinWidth = mode === 'briefing' ? BRIEFING_DETAIL_MIN_WIDTH : DETAIL_PANEL_MIN_WIDTH;
+  const reserveForPaperChat = isLiteratureMode() && !shouldHidePaperChatPanel()
+    ? PAPER_CHAT_MIN_WIDTH + PANEL_RESIZER_WIDTH
+    : 0;
+  const maxByLayout = containerWidth > 0
+    ? Math.max(
+        LIST_MIN_WIDTH,
+        containerWidth - detailMinWidth - reserveForPaperChat - PANEL_RESIZER_WIDTH,
+      )
+    : LIST_MAX_WIDTH;
+  const maxWidth = Math.min(LIST_MAX_WIDTH, maxByLayout);
+  return Math.round(Math.min(maxWidth, Math.max(LIST_MIN_WIDTH, requested)));
+}
+
+function applyListPanelWidth(width, { persist = false } = {}) {
+  const next = clampListPanelWidth(width);
+  document.documentElement.style.setProperty('--list-width', `${next}px`);
+  if (persist) saveListPanelWidth(next);
+  requestAnimationFrame(() => {
+    applyPaperChatPanelWidth(loadPaperChatPanelWidth());
+    syncPaperChatResizerVisibility();
+  });
 }
 
 function savePaperChatPanelWidth(width) {
@@ -3793,7 +7216,7 @@ function clampPaperChatPanelWidth(width) {
 }
 
 function shouldAutoHidePaperChatPanel() {
-  if (mode !== 'feed') return true;
+  if (!isLiteratureMode()) return true;
   const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 0;
   if (viewportWidth > 0 && viewportWidth < PAPER_CHAT_MIN_APP_WIDTH) return true;
   const containerWidth = contentArea?.clientWidth || 0;
@@ -3805,6 +7228,10 @@ function shouldAutoHidePaperChatPanel() {
 
 function shouldHidePaperChatPanel() {
   return shouldAutoHidePaperChatPanel() || paperChatCollapsed;
+}
+
+function isLiteratureMode() {
+  return mode === 'feed' || mode === 'pubmed' || mode === 'kept' || mode === 'search';
 }
 
 function applyPaperChatPanelWidth(width, { persist = false } = {}) {
@@ -3826,9 +7253,9 @@ function syncPaperChatResizerVisibility() {
   const shouldHide = shouldHidePaperChatPanel();
   const autoHidden = shouldAutoHidePaperChatPanel();
   paperChatPanelEl?.classList.toggle('hidden', shouldHide);
-  btnShowPaperChat?.classList.toggle('hidden', mode !== 'feed' || !paperChatCollapsed || autoHidden);
-  btnTogglePaperChatToolbar?.classList.toggle('hidden', mode !== 'feed');
-  btnTogglePaperChatToolbar?.classList.toggle('active', mode === 'feed' && !shouldHide);
+  btnShowPaperChat?.classList.toggle('hidden', !isLiteratureMode() || !paperChatCollapsed || autoHidden);
+  btnTogglePaperChatToolbar?.classList.toggle('hidden', !isLiteratureMode());
+  btnTogglePaperChatToolbar?.classList.toggle('active', isLiteratureMode() && !shouldHide);
   if (btnTogglePaperChatToolbar) {
     btnTogglePaperChatToolbar.disabled = autoHidden;
     btnTogglePaperChatToolbar.title = autoHidden
@@ -3930,17 +7357,17 @@ function setupTranslationEvents() {
       });
     }
 
-    renderEntryList(allEntries);
+    updateRenderedTranslationEntry(id);
     updateOverviewCounts();
     if (currentEntry && currentEntry.id === id) {
       // Re-render only the parts that changed instead of resetting the panel
-      detailTitle.textContent = currentEntry.title_translated || currentEntry.title;
+      renderDetailTitle(currentEntry);
       refreshDetailTitleSpinner(currentEntry);
       const aiFooter = document.getElementById('detail-ai-footer');
       if (currentEntry.title_translated || currentEntry.summary_translated) {
         aiFooter?.classList.remove('hidden');
       }
-      if (currentEntry.title_translated && currentEntry.summary_translated) {
+      if (currentEntry.summary_translated) {
         detailSourceBadge.textContent = '已翻译';
         detailBadgeRow.classList.remove('hidden');
       } else {
@@ -3958,12 +7385,12 @@ function setupTranslationEvents() {
     if (p.status === 'needs_key') {
       showTranslationBanner({
         kind: 'needs_key',
-        text: `检测到 ${p.pending || ''} 篇待翻译文章，但未配置 DeepSeek API Key。前往设置填写后会自动翻译。`,
+        text: `检测到 ${p.pending || ''} 篇待翻译文章，但未配置当前 AI 服务的 API Key。前往设置填写后会自动翻译。`,
       });
     } else if (p.status === 'auth_failed') {
       showTranslationBanner({
         kind: 'auth_failed',
-        text: `DeepSeek API Key 无效或已过期，请打开设置重新填写并测试连接。${p.message ? `（${p.message}）` : ''}`,
+        text: `当前 AI 服务的 API Key 无效或已过期，请打开设置重新填写并测试连接。${p.message ? `（${p.message}）` : ''}`,
       });
     } else if (p.status === 'ok') {
       hideTranslationBanner();
@@ -4000,6 +7427,11 @@ function wireTranslationBannerButtons() {
   });
   dismiss?.addEventListener('click', hideTranslationBanner);
 }
+
+let latestUpdateInfo = null;
+let downloadedUpdatePath = null;
+let downloadedUpdateVersion = null;
+let updateDownloadInFlight = false;
 
 // ── Update channel (settings → 其他设置) ───────
 // Loads the bundled version into the "关于 Cento" card and wires the
@@ -4054,6 +7486,60 @@ async function initUpdateChannel() {
     }
   });
 
+  btnDownload?.addEventListener('click', async () => {
+    if (!latestUpdateInfo) return;
+
+    if (downloadedUpdatePath && downloadedUpdateVersion === latestUpdateInfo.latest_version) {
+      try {
+        await invoke('open_downloaded_update', { path: downloadedUpdatePath });
+      } catch (e) {
+        downloadedUpdatePath = null;
+        downloadedUpdateVersion = null;
+        renderUpdateResult(latestUpdateInfo, { statusEl, actionsEl, btnDownload, btnRelease });
+        const msg = (typeof e === 'string') ? e : (e && e.message) || String(e);
+        statusEl.textContent = `打开安装包失败：${msg}`;
+      }
+      return;
+    }
+
+    if (!latestUpdateInfo.asset_url) {
+      try {
+        await invoke('open_url', { url: latestUpdateInfo.release_url });
+      } catch (e) {
+        const msg = (typeof e === 'string') ? e : (e && e.message) || String(e);
+        statusEl.textContent = `无法打开发布页：${msg}`;
+      }
+      return;
+    }
+
+    updateDownloadInFlight = true;
+    renderUpdateResult(latestUpdateInfo, { statusEl, actionsEl, btnDownload, btnRelease });
+    statusEl.classList.remove('has-update');
+    statusEl.textContent = '正在下载更新包…';
+    try {
+      const result = await invoke('download_update_installer');
+      downloadedUpdatePath = result.local_path;
+      downloadedUpdateVersion = latestUpdateInfo.latest_version;
+      updateDownloadInFlight = false;
+      renderUpdateResult(latestUpdateInfo, { statusEl, actionsEl, btnDownload, btnRelease });
+      statusEl.textContent = `安装包已下载完成：${result.file_name}`;
+
+      const shouldOpen = window.confirm(
+        `更新包已下载完成：${result.file_name}\n\n现在打开安装包吗？`
+      );
+      if (shouldOpen) {
+        await invoke('open_downloaded_update', { path: result.local_path });
+      } else {
+        await invoke('reveal_downloaded_update', { path: result.local_path });
+      }
+    } catch (e) {
+      updateDownloadInFlight = false;
+      renderUpdateResult(latestUpdateInfo, { statusEl, actionsEl, btnDownload, btnRelease });
+      const msg = (typeof e === 'string') ? e : (e && e.message) || String(e);
+      statusEl.textContent = `下载失败：${msg}`;
+    }
+  });
+
   toggleAuto?.addEventListener('click', async () => {
     // Optimistic toggle so the click feels instant; the backend round-trip
     // rolls it back only if saving fails.
@@ -4069,6 +7555,21 @@ async function initUpdateChannel() {
 
   // Reflect background-checker results live without the user clicking.
   const evt = window.__TAURI__?.event;
+  evt?.listen?.('update-download-progress', (e) => {
+    if (!updateDownloadInFlight) return;
+    const p = e.payload || {};
+    const percent = Number.isFinite(p.percent) ? Math.max(0, Math.min(100, p.percent)) : null;
+    if (btnDownload) {
+      btnDownload.textContent = percent != null
+        ? `下载中 ${Math.round(percent)}%`
+        : '下载中…';
+    }
+    if (statusEl) {
+      statusEl.textContent = percent != null
+        ? `正在下载更新包… ${Math.round(percent)}%`
+        : `正在下载更新包… ${formatBytes(p.downloaded_bytes || 0)}`;
+    }
+  });
   evt?.listen?.('update-checked', (e) => {
     const info = e.payload || {};
     renderUpdateResult(info, { statusEl, actionsEl, btnDownload, btnRelease });
@@ -4078,20 +7579,35 @@ async function initUpdateChannel() {
 
 function renderUpdateResult(info, { statusEl, actionsEl, btnDownload, btnRelease }) {
   if (!info || !statusEl) return;
-  if (info.has_update) {
+  latestUpdateInfo = info;
+  if (downloadedUpdateVersion && downloadedUpdateVersion !== info.latest_version) {
+    downloadedUpdatePath = null;
+    downloadedUpdateVersion = null;
+  }
+  if (info.source_available === false) {
+    statusEl.classList.remove('has-update');
+    statusEl.textContent = '更新源暂不可用，请稍后重试或检查发布仓库';
+    actionsEl?.classList.add('hidden');
+  } else if (info.has_update) {
     statusEl.classList.add('has-update');
     statusEl.textContent = `🎉 新版本 v${info.latest_version} 已发布（当前 v${info.current_version}）`;
     if (actionsEl) {
       actionsEl.classList.remove('hidden');
-      // Prefer the direct .dmg asset; fall back to the release page if the
-      // tag doesn't have an attached installer yet.
       if (btnDownload) {
-        btnDownload.href = info.asset_url || info.release_url;
-        btnDownload.textContent = info.asset_url ? '下载安装包' : '前往下载页';
+        if (downloadedUpdatePath && downloadedUpdateVersion === info.latest_version) {
+          btnDownload.textContent = '打开安装包';
+        } else if (updateDownloadInFlight && info.asset_url) {
+          btnDownload.textContent = '下载中…';
+        } else {
+          btnDownload.textContent = info.asset_url ? '下载安装包' : '前往下载页';
+        }
+        btnDownload.disabled = updateDownloadInFlight;
       }
       if (btnRelease) btnRelease.href = info.release_url;
     }
   } else {
+    downloadedUpdatePath = null;
+    downloadedUpdateVersion = null;
     statusEl.classList.remove('has-update');
     statusEl.textContent = `已是最新版（v${info.current_version}）`;
     actionsEl?.classList.add('hidden');
@@ -4106,6 +7622,14 @@ function formatLocalTime(iso) {
   } catch {
     return iso;
   }
+}
+
+function formatBytes(bytes) {
+  const num = Number(bytes) || 0;
+  if (num < 1024) return `${num} B`;
+  if (num < 1024 * 1024) return `${(num / 1024).toFixed(1)} KB`;
+  if (num < 1024 * 1024 * 1024) return `${(num / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(num / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
 // macOS native notification via tauri-plugin-notification. Permission is
@@ -4191,7 +7715,9 @@ async function refreshAll() {
     // so the frontend doesn't dispatch them here anymore.
 
     await loadFeeds();
-    await loadEntries(selectedFeedId);
+    const query = literatureSearchInput?.value.trim() || '';
+    if (mode === 'search' && query) await runLiteratureSearch(query);
+    else await loadEntries(selectedFeedId);
   } catch (e) {
     setGlobalStatus('刷新失败: ' + e, 'error');
   } finally {
@@ -4208,7 +7734,9 @@ function startSchedulerListener() {
   if (!listen) return;
   listen('scheduler-refreshed', async () => {
     await loadFeeds();
-    await loadEntries(selectedFeedId);
+    const query = literatureSearchInput?.value.trim() || '';
+    if (mode === 'search' && query) await runLiteratureSearch(query);
+    else await loadEntries(selectedFeedId);
   });
 }
 
@@ -4275,21 +7803,28 @@ async function loadBriefings() {
   updateOverviewCounts();
 }
 
-function enterBriefingMode() {
+function enterBriefingMode(options = {}) {
+  const preserveSearch = !!options.preserveSearch;
+  if (!preserveSearch) cancelLiteratureSearchForNavigation();
   mode = 'briefing';
+  currentPubmedSearch = null;
+  document.body.classList.remove('pubmed-mode');
+  pubmedBatchHeader?.classList.add('hidden');
   entryListEl.classList.add('hidden');
   detailPanelEl.classList.add('hidden');
   syncPaperChatResizerVisibility();
   briefingListEl.classList.remove('hidden');
   briefingDetailEl.classList.remove('hidden');
+  applyListPanelWidth(loadListPanelWidth());
   document.querySelectorAll('.feed-item').forEach(el => el.classList.remove('selected'));
   syncEntryFilterControls();
   setToolbarSubtitle('briefing');
   renderBriefingList();
-  if (BRIEFINGS.length > 0) {
-    const target = selectedBriefingId && BRIEFINGS.find(b => b.id === selectedBriefingId)
+  const visibleBriefings = filteredBriefingsForCurrentQuery();
+  if (visibleBriefings.length > 0) {
+    const target = selectedBriefingId && visibleBriefings.find(b => b.id === selectedBriefingId)
       ? selectedBriefingId
-      : BRIEFINGS[0].id;
+      : visibleBriefings[0].id;
     selectBriefing(target);
   } else {
     showBriefingEmpty();
@@ -4298,20 +7833,54 @@ function enterBriefingMode() {
 
 function enterFeedMode() {
   mode = 'feed';
+  currentPubmedSearch = null;
+  document.body.classList.remove('pubmed-mode');
+  pubmedBatchHeader?.classList.add('hidden');
   briefingListEl.classList.add('hidden');
   briefingDetailEl.classList.add('hidden');
   entryListEl.classList.remove('hidden');
   detailPanelEl.classList.remove('hidden');
+  applyListPanelWidth(loadListPanelWidth());
   applyPaperChatPanelWidth(loadPaperChatPanelWidth());
   syncPaperChatResizerVisibility();
   syncEntryFilterControls();
+  renderPubmedSearchList();
+}
+
+function briefingMatchesLiteratureSearchQuery(briefing, query) {
+  const terms = String(query || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return true;
+  const haystack = [
+    briefing.title,
+    briefing.lead_in,
+    briefing.leadIn,
+    briefing.period,
+    briefing.date,
+    briefing.content,
+  ].filter(Boolean).join('\n').toLowerCase();
+  return terms.every(term => haystack.includes(term));
+}
+
+function filteredBriefingsForCurrentQuery() {
+  const query = literatureSearchInput?.value.trim() || '';
+  return query ? BRIEFINGS.filter(briefing => briefingMatchesLiteratureSearchQuery(briefing, query)) : BRIEFINGS;
 }
 
 function renderBriefingList() {
   if (!briefingItemsEl) return;
   briefingItemsEl.innerHTML = '';
 
-  if (BRIEFINGS.length === 0) {
+  const visibleBriefings = filteredBriefingsForCurrentQuery();
+  const query = literatureSearchInput?.value.trim() || '';
+
+  if (visibleBriefings.length === 0) {
+    if (query && BRIEFINGS.length > 0) {
+      briefingItemsEl.innerHTML = `
+        <li class="entry-empty">
+          未找到与“${escapeHtml(query)}”匹配的简报
+        </li>`;
+      return;
+    }
     briefingItemsEl.innerHTML = `
       <li class="entry-empty">
         <div style="margin-bottom: 12px;">还没有生成简报</div>
@@ -4320,7 +7889,7 @@ function renderBriefingList() {
     return;
   }
 
-  BRIEFINGS.forEach(b => {
+  visibleBriefings.forEach(b => {
     const li = document.createElement('li');
     const isRead = readBriefings.has(b.id);
     li.className = `briefing-item ${isRead ? 'read' : 'unread'}`;
@@ -4418,8 +7987,10 @@ function selectBriefing(id) {
     sectionsEl.dataset.linkDelegateBound = '1';
   }
 
+  const providerMeta = AI_PROVIDER_META[activeProviderId()] || AI_PROVIDER_META.deepseek;
+  const modelName = (modelInput?.value || providerMeta.model).trim() || providerMeta.label;
   document.getElementById('briefing-detail-footer-text').innerHTML =
-    `<span class="ai-footer-strong">由 deepseek-v4-pro 生成</span>，覆盖 ${(b.counts?.feeds || 0)} 个订阅源、${(b.counts?.articles || 0)} 篇文献。可在「AI 简报」设置调整频率与 Prompt。`;
+    `<span class="ai-footer-strong">由 ${escapeHtml(providerMeta.label)} · ${escapeHtml(modelName)} 生成</span>，覆盖 ${(b.counts?.feeds || 0)} 个订阅源、${(b.counts?.articles || 0)} 篇文献。可在「AI 简报」设置调整频率与 Prompt。`;
 }
 
 function showBriefingEmpty() {
@@ -4494,6 +8065,7 @@ async function generateBriefingNow() {
   const expectedFrequency = localStorage.getItem('briefing-frequency') || 'weekly';
   try {
     const b = await invoke('generate_briefing', { customPrompt, expectedFrequency });
+    loadCostSummary();
     setGlobalStatus('简报已生成', 'success');
     await loadBriefings();
     if (b) selectBriefing(b.id);
@@ -4596,7 +8168,7 @@ function briefingSchedulerTick() {
   const expected = computeMostRecentExpectedFiring(freq, hour, day);
   if (!expected) return;
 
-  // Failure backoff: don't hammer DeepSeek if recent attempts failed.
+  // Failure backoff: don't hammer the active provider after recent failures.
   const lastAttempt = parseInt(localStorage.getItem('briefing-last-attempt') || '0', 10);
   if (Date.now() - lastAttempt < 60 * 60 * 1000) return;
 
@@ -4914,6 +8486,7 @@ function initPubmedGenerator() {
     btnNl.innerHTML = `<span class="spinner"></span> AI 生成中…`;
     try {
       const query = await invoke('natural_to_pubmed_query', { text });
+      loadCostSummary();
       queryEl.value = query;
       updatePreview();
       state = 'idle';
@@ -5190,7 +8763,7 @@ async function renderReadingStats() {
   applyStatsPeriod();
   renderFeedPrefsFromCounts(stats.feed_read_counts || []);
 
-  // Easter-egg copy refresh runs detached so a slow DeepSeek round trip never
+  // Easter-egg copy refresh runs detached so a slow provider round trip never
   // blocks the stats render — local pool always paints first.
   maybeRefreshFlavorPool();
 }
@@ -5418,7 +8991,7 @@ function renderHeatmapStrip(dayCounts, days) {
 
 // ── Stats easter-egg flavor copy ──────────────────────────────────
 // A small local template pool is the load-bearing source — renders instantly,
-// works offline. DeepSeek tops the pool up in the background on a weekly cadence
+// works offline. The active AI provider tops it up in the background weekly
 // for novelty; if it fails or hasn't run yet, the local pool alone is enough.
 
 const FLAVOR_LOCAL_POOL = [
@@ -5526,9 +9099,9 @@ function renderStatsFlavor(ps) {
   requestAnimationFrame(() => el.classList.add('is-visible'));
 }
 
-// Fire-and-forget weekly refresh of the DeepSeek-generated pool. All errors
+// Fire-and-forget weekly refresh of the AI-generated pool. All errors
 // are swallowed — the local pool guarantees the UI never goes blank. The
-// actual DeepSeek call lives in Rust (entry_service::generate_flavor_pool)
+// actual provider call lives in Rust (entry_service::generate_flavor_pool)
 // so it shares the timeout/error handling pattern used by briefing and
 // translation, and avoids CORS issues with the vendor API.
 async function maybeRefreshFlavorPool() {
@@ -5546,6 +9119,7 @@ async function maybeRefreshFlavorPool() {
       activeDays: ps.activeDays,
       peakHour: ps.peakHour,
     });
+    loadCostSummary();
     if (Array.isArray(fresh) && fresh.length > 0) {
       saveFlavorState({
         ...state,
@@ -5554,12 +9128,12 @@ async function maybeRefreshFlavorPool() {
       });
     } else {
       // Mark the attempt anyway so we don't hammer the API on every render
-      // when DeepSeek returns nothing useful.
+      // when the provider returns nothing useful.
       saveFlavorState({ ...state, generatedAt: Date.now() });
     }
   } catch (e) {
     // Swallow silently — local pool is the source of truth, this is enrichment.
-    console.warn('[flavor] DeepSeek refresh skipped:', e?.message || e);
+    console.warn('[flavor] AI refresh skipped:', e?.message || e);
   }
 }
 
@@ -5656,6 +9230,7 @@ window.addEventListener('DOMContentLoaded', () => {
   mainView     = document.getElementById('main-view');
   contentArea  = document.getElementById('content-area');
   toolbarSubtitle = document.getElementById('toolbar-subtitle');
+  toolbarApiTokenSelect = document.getElementById('toolbar-api-token');
 
   // Toolbar
   btnSettings = document.getElementById('btn-settings');
@@ -5665,14 +9240,20 @@ window.addEventListener('DOMContentLoaded', () => {
   refreshIcon = document.getElementById('refresh-icon');
 
   // Settings inputs
+  providerSelect    = document.getElementById('ai-provider');
   apiKeyInput       = document.getElementById('api-key');
   baseUrlInput      = document.getElementById('base-url');
   modelInput        = document.getElementById('model');
   systemPromptInput = document.getElementById('system-prompt');
   retentionSelect   = document.getElementById('read-retention');
+  titleDisplaySelect = document.getElementById('title-display-mode');
   btnToggleApiKey   = document.getElementById('btn-toggle-api-key');
   btnTest           = document.getElementById('btn-test');
   btnSaveSettings   = document.getElementById('btn-save-settings');
+  apiTokenProfileSelect = document.getElementById('api-token-profile');
+  apiTokenProfileNameInput = document.getElementById('api-token-profile-name');
+  btnNewApiToken = document.getElementById('btn-new-api-token');
+  btnDeleteApiToken = document.getElementById('btn-delete-api-token');
   btnSaveGeneral    = document.getElementById('btn-save-general');
   settingsStatus    = document.getElementById('settings-status');
   generalStatus     = document.getElementById('general-status');
@@ -5685,8 +9266,12 @@ window.addEventListener('DOMContentLoaded', () => {
   btnAddFeed    = document.getElementById('btn-add-feed');
   addFeedRow    = document.getElementById('add-feed-row');
   addFeedIcon   = document.getElementById('add-feed-icon');
+  literatureSearchInput = document.getElementById('literature-search');
+  btnClearLiteratureSearch = document.getElementById('btn-clear-literature-search');
+  literatureSearchRow = document.getElementById('literature-search-row');
   feedListEl    = document.getElementById('feed-list');
   globalStatusEl = document.getElementById('global-status');
+  pubmedSearchListEl = document.getElementById('pubmed-search-list');
 
   // Entry list
   entryListEl     = document.getElementById('entry-list');
@@ -5700,6 +9285,8 @@ window.addEventListener('DOMContentLoaded', () => {
   btnEntryBulkSelectNoted = document.getElementById('btn-entry-bulk-select-noted');
   btnEntryBulkInvert = document.getElementById('btn-entry-bulk-invert');
   btnEntryBulkDeselect = document.getElementById('btn-entry-bulk-deselect');
+  entryBulkExportFormat = document.getElementById('entry-bulk-export-format');
+  btnEntryBulkExport = document.getElementById('btn-entry-bulk-export');
   entryBulkExistingMode = document.getElementById('entry-bulk-existing-mode');
   btnEntryBulkGenerate = document.getElementById('btn-entry-bulk-generate');
   btnEntryBulkClear = document.getElementById('btn-entry-bulk-clear');
@@ -5708,6 +9295,29 @@ window.addEventListener('DOMContentLoaded', () => {
   entryMetricBFilter = document.getElementById('entry-metric-b-filter');
   entryMetricTopFilter = document.getElementById('entry-metric-top-filter');
   entryTagFilter = document.getElementById('entry-tag-filter');
+  entryMetricFilterSummaryCount = document.getElementById('entry-metric-filter-summary-count');
+  pubmedBatchHeader = document.getElementById('pubmed-batch-header');
+  pubmedBatchMeta = document.getElementById('pubmed-batch-meta');
+  pubmedStatusFilter = document.getElementById('pubmed-status-filter');
+  pubmedSort = document.getElementById('pubmed-sort');
+  pubmedStarFilter = document.getElementById('pubmed-star-filter');
+  pubmedDateFilters = document.getElementById('pubmed-date-filters');
+  pubmedPublishedFrom = document.getElementById('pubmed-published-from');
+  pubmedPublishedTo = document.getElementById('pubmed-published-to');
+  pubmedAddedFrom = document.getElementById('pubmed-added-from');
+  pubmedAddedTo = document.getElementById('pubmed-added-to');
+  pubmedProgressEl = document.getElementById('pubmed-search-progress');
+  pubmedProgressFill = document.getElementById('pubmed-progress-fill');
+  pubmedProgressLabel = document.getElementById('pubmed-progress-label');
+  btnRunPubmedSearch = document.getElementById('btn-run-pubmed-search');
+  btnCancelPubmedRun = document.getElementById('btn-cancel-pubmed-run');
+  pubmedExportFormat = document.getElementById('pubmed-export-format');
+  btnExportPubmed = document.getElementById('btn-export-pubmed');
+  pubmedSnapshotSelect = document.getElementById('pubmed-snapshot-select');
+  btnSavePubmedSnapshot = document.getElementById('btn-save-pubmed-snapshot');
+  btnDeletePubmedSnapshot = document.getElementById('btn-delete-pubmed-snapshot');
+  pubmedBulkStatus = document.getElementById('pubmed-bulk-status');
+  btnPubmedAiScreen = document.getElementById('btn-pubmed-ai-screen');
   restoreEntryFilter();
   syncEntryFilterControls();
   restoreEntryMetricFilters();
@@ -5719,6 +9329,8 @@ window.addEventListener('DOMContentLoaded', () => {
 
   // Detail
   detailPanelEl        = document.getElementById('detail-panel');
+  sidebarResizerEl     = document.getElementById('sidebar-resizer');
+  listResizerEl        = document.getElementById('list-resizer');
   paperChatResizerEl   = document.getElementById('paper-chat-resizer');
   paperChatPanelEl     = document.getElementById('paper-chat-panel');
   briefingDetailEl     = document.getElementById('briefing-detail');
@@ -5738,15 +9350,24 @@ window.addEventListener('DOMContentLoaded', () => {
   detailPaperChatMessages = document.getElementById('detail-paper-chat-messages');
   detailPaperChatScopes = document.getElementById('detail-paper-chat-scopes');
   paperChatInput       = document.getElementById('paper-chat-input');
+  paperChatComposer    = document.querySelector('.detail-paper-chat-composer');
   paperChatScopeCaption = document.getElementById('paper-chat-scope-caption');
   paperChatPickedList = document.getElementById('paper-chat-picked-list');
   paperChatPickedLabel = document.getElementById('paper-chat-picked-label');
   paperChatProfileSelect = document.getElementById('paper-chat-profile-select');
+  paperChatAttachmentsEl = document.getElementById('paper-chat-attachments');
+  paperChatAttachmentList = document.getElementById('paper-chat-attachment-list');
+  btnPaperChatAddFiles = document.getElementById('btn-paper-chat-add-files');
+  btnPaperChatAddFolder = document.getElementById('btn-paper-chat-add-folder');
+  btnClearPaperChatAttachments = document.getElementById('btn-clear-paper-chat-attachments');
   readingProfileSortSelect = document.getElementById('reading-profiles-sort');
   btnReadingProfilesSort = document.getElementById('reading-profiles-apply-sort');
   detailBadgeRow       = document.getElementById('detail-badge-row');
   detailSourceBadge    = document.getElementById('detail-source-badge');
   btnOpenUrl           = document.getElementById('btn-open-url');
+  btnPaperGraph        = document.getElementById('btn-paper-graph');
+  btnDetailPdf         = document.getElementById('btn-detail-pdf');
+  btnDetailSciHub      = document.getElementById('btn-detail-scihub');
   btnRetrySummary      = document.getElementById('btn-retry-summary');
   btnSendPaperChat     = document.getElementById('btn-send-paper-chat');
   btnClearPaperChat    = document.getElementById('btn-clear-paper-chat');
@@ -5757,10 +9378,18 @@ window.addEventListener('DOMContentLoaded', () => {
   detailTagList        = document.getElementById('detail-tag-list');
   detailTagInput       = document.getElementById('detail-tag-input');
   btnDetailAddTag      = document.getElementById('btn-detail-add-tag');
+  detailPaperGraphSection = document.getElementById('detail-paper-graph-section');
+  paperGraphStage      = document.getElementById('paper-graph-stage');
+  paperGraphNodeDetail = document.getElementById('paper-graph-node-detail');
+  paperGraphCounts     = document.getElementById('paper-graph-counts');
   briefingDetailEmpty  = document.getElementById('briefing-detail-empty');
   briefingDetailContent = document.getElementById('briefing-detail-content');
 
+  setupSidebarResizer();
+  setupSidebarSectionToggles();
+  setupListResizer();
   setupPaperChatResizer();
+  setupPaperChatAttachmentDrop();
 
   // Wire events
   btnSettings.addEventListener('click', () => {
@@ -5773,16 +9402,51 @@ window.addEventListener('DOMContentLoaded', () => {
     else showMain();
   });
   btnTogglePaperChatToolbar?.addEventListener('click', () => {
-    if (mode !== 'feed' || shouldAutoHidePaperChatPanel()) return;
+    if (!isLiteratureMode() || shouldAutoHidePaperChatPanel()) return;
     setPaperChatCollapsed(!paperChatCollapsed);
   });
 
   btnRefresh.addEventListener('click', refreshAll);
+  providerSelect?.addEventListener('change', () => {
+    syncProviderUi();
+    loadProviderSettings(activeProviderId());
+  });
+  apiTokenProfileSelect?.addEventListener('change', () => {
+    activateApiTokenProfile(apiTokenProfileSelect.value);
+  });
+  toolbarApiTokenSelect?.addEventListener('change', () => {
+    activateApiTokenProfile(toolbarApiTokenSelect.value);
+  });
+  btnNewApiToken?.addEventListener('click', beginNewApiTokenProfile);
+  btnDeleteApiToken?.addEventListener('click', deleteCurrentApiTokenProfile);
+  modelInput?.addEventListener('input', syncProviderUi);
   btnToggleApiKey.addEventListener('click', toggleApiKeyVisibility);
   btnTest.addEventListener('click', testConnection);
   btnSaveSettings.addEventListener('click', saveTranslationSettings);
   btnSaveGeneral?.addEventListener('click', saveGeneralSettings);
+  if (titleDisplaySelect) {
+    titleDisplaySelect.value = titleDisplayMode();
+    titleDisplaySelect.addEventListener('change', () => {
+      const next = TITLE_DISPLAY_MODES.has(titleDisplaySelect.value)
+        ? titleDisplaySelect.value
+        : 'both';
+      localStorage.setItem(TITLE_DISPLAY_STORAGE_KEY, next);
+      renderEntryList(allEntries);
+      if (currentEntry) {
+        renderDetailTitle(currentEntry);
+        refreshDetailTitleSpinner(currentEntry);
+      }
+    });
+  }
   btnRetrySummary?.addEventListener('click', retrySummaryTranslation);
+  btnPaperGraph?.addEventListener('click', togglePaperGraph);
+  document.getElementById('btn-paper-graph-close')?.addEventListener('click', togglePaperGraph);
+  document.getElementById('btn-paper-graph-reload')?.addEventListener('click', reloadPaperGraph);
+  document.getElementById('btn-paper-graph-back')?.addEventListener('click', backPaperGraph);
+  document.getElementById('paper-graph-filters')?.addEventListener('click', event => {
+    const button = event.target.closest('[data-graph-filter]');
+    if (button) setPaperGraphFilter(button.dataset.graphFilter);
+  });
   document.getElementById('btn-refresh-balance')?.addEventListener('click', () => refreshDeepSeekBalance());
   document.getElementById('btn-reading-profile-new')?.addEventListener('click', () => {
     fillReadingProfileEditor(null);
@@ -5792,12 +9456,26 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-reading-profile-import-skill')?.addEventListener('click', importReadingSkillProfile);
   document.getElementById('btn-reading-profile-save')?.addEventListener('click', saveReadingProfile);
   document.getElementById('btn-reading-profile-delete')?.addEventListener('click', () => deleteReadingProfile());
-  btnSendPaperChat?.addEventListener('click', sendPaperChatQuestion);
+  btnSendPaperChat?.addEventListener('click', handlePaperChatPrimaryAction);
   btnClearPaperChat?.addEventListener('click', clearPaperChatMessages);
   btnTogglePaperChat?.addEventListener('click', () => setPaperChatCollapsed(true));
   btnShowPaperChat?.addEventListener('click', () => setPaperChatCollapsed(false));
   btnPaperChatAddCurrent?.addEventListener('click', () => addCurrentEntryToPaperChat());
   btnPaperChatClearPicked?.addEventListener('click', () => clearPaperChatPinnedEntries());
+  btnPaperChatAddFiles?.addEventListener('click', () => choosePaperChatAttachments());
+  btnPaperChatAddFolder?.addEventListener('click', () => choosePaperChatAttachments({ directory: true }));
+  btnClearPaperChatAttachments?.addEventListener('click', () => {
+    paperChatAttachments = [];
+    renderPaperChatAttachments();
+  });
+  paperChatAttachmentList?.addEventListener('click', e => {
+    const button = e.target.closest('[data-paper-chat-attachment-remove]');
+    if (!button) return;
+    const index = Number(button.dataset.paperChatAttachmentRemove);
+    if (!Number.isInteger(index) || !paperChatAttachments[index]) return;
+    paperChatAttachments.splice(index, 1);
+    renderPaperChatAttachments();
+  });
   paperChatProfileSelect?.addEventListener('change', async () => {
     currentPaperChatProfileId = normalizePaperChatProfileId(paperChatProfileSelect.value);
     refreshPaperChatComposerState();
@@ -5809,12 +9487,13 @@ window.addEventListener('DOMContentLoaded', () => {
   });
   paperChatInput?.addEventListener('input', refreshPaperChatComposerState);
   paperChatInput?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !activePaperChatRequest) {
       e.preventDefault();
       sendPaperChatQuestion();
     }
   });
   refreshPaperChatComposerState();
+  renderPaperChatAttachments();
   detailPaperChatScopes?.addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-paper-chat-scope]');
     if (!btn) return;
@@ -5865,7 +9544,15 @@ window.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('.sidebar-row').forEach(row => {
     row.addEventListener('click', () => {
       const view = row.dataset.view;
-      if (view === 'briefing') { enterBriefingMode(); return; }
+      const query = literatureSearchInput?.value.trim() || '';
+      if (view === 'briefing') {
+        enterBriefingMode({ preserveSearch: !!query });
+        return;
+      }
+      if (view === 'kept') {
+        enterKeptMode({ preserveSearch: !!query });
+        return;
+      }
       enterFeedMode();
       document.querySelectorAll('.feed-item').forEach(el => el.classList.remove('selected'));
       selectedFeedId = null;
@@ -5873,6 +9560,11 @@ window.addEventListener('DOMContentLoaded', () => {
       persistEntryFilter();
       syncEntryFilterControls();
       setToolbarSubtitle('main');
+      if (query) {
+        runLiteratureSearch(query);
+        return;
+      }
+      cancelLiteratureSearchForNavigation();
       loadEntries(null);
     });
   });
@@ -6050,6 +9742,11 @@ window.addEventListener('DOMContentLoaded', () => {
 
   document.addEventListener('keydown', (e) => {
     const key = typeof e.key === 'string' ? e.key.toLowerCase() : '';
+    if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && canHandleEntryArrowShortcut(e)) {
+      e.preventDefault();
+      navigateEntryList(e.key === 'ArrowDown' ? 1 : -1);
+      return;
+    }
     if ((e.metaKey || e.ctrlKey) && !e.altKey && key === 'a' && canHandleEntrySelectAllShortcut(e.target)) {
       e.preventDefault();
       if (!entrySelectionMode) {
@@ -6090,6 +9787,106 @@ window.addEventListener('DOMContentLoaded', () => {
   feedUrlInput.addEventListener('keydown', e => { if (e.key === 'Enter') addFeed(); });
   btnAddFeed.addEventListener('click', addFeed);
 
+  literatureSearchInput?.addEventListener('input', scheduleLiteratureSearch);
+  literatureSearchInput?.addEventListener('keydown', event => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      clearLiteratureSearch();
+    }
+  });
+  btnClearLiteratureSearch?.addEventListener('click', () => {
+    clearLiteratureSearch();
+    literatureSearchInput?.focus();
+  });
+
+  document.getElementById('btn-new-pubmed-search')?.addEventListener('click', () => openPubmedSearchModal());
+  document.getElementById('btn-new-feed')?.addEventListener('click', openFeedAddModal);
+  document.querySelectorAll('[data-feed-add-modal-close]').forEach(element => {
+    element.addEventListener('click', closeFeedAddModal);
+  });
+  document.querySelectorAll('[data-feed-add-mode]').forEach(button => {
+    button.addEventListener('click', () => setFeedAddMode(button.dataset.feedAddMode));
+  });
+  document.getElementById('feed-add-url')?.addEventListener('input', syncFeedAddModalState);
+  document.getElementById('feed-add-url')?.addEventListener('keydown', event => {
+    if (event.key !== 'Enter' || document.getElementById('btn-create-feed')?.disabled) return;
+    event.preventDefault();
+    createFeedFromModal();
+  });
+  document.getElementById('feed-author-name')?.addEventListener('input', syncFeedAddModalState);
+  document.getElementById('btn-create-feed')?.addEventListener('click', createFeedFromModal);
+  document.querySelectorAll('[data-pubmed-modal-close]').forEach(element => {
+    element.addEventListener('click', closePubmedSearchModal);
+  });
+  document.getElementById('btn-generate-pubmed-query')?.addEventListener('click', generatePubmedQuery);
+  document.getElementById('btn-build-pubmed-author-query')?.addEventListener('click', buildPubmedAuthorQuery);
+  document.querySelectorAll('[data-pubmed-search-mode]').forEach(button => {
+    button.addEventListener('click', () => setPubmedSearchBuilderMode(button.dataset.pubmedSearchMode));
+  });
+  document.getElementById('btn-preview-pubmed-search')?.addEventListener('click', previewPubmedSearch);
+  document.getElementById('btn-create-pubmed-search')?.addEventListener('click', createAndRunPubmedSearch);
+  document.querySelectorAll('input[name="pubmed-retrieval-scope"]').forEach(input => {
+    input.addEventListener('change', updatePubmedRetrievalUi);
+  });
+  document.getElementById('pubmed-retrieval-limit')?.addEventListener('input', updatePubmedRetrievalUi);
+  ['pubmed-retrieval-date-from', 'pubmed-retrieval-date-to', 'pubmed-retrieval-sort'].forEach(id => {
+    document.getElementById(id)?.addEventListener('change', updatePubmedRetrievalUi);
+  });
+  document.getElementById('pubmed-batch-query-input')?.addEventListener('input', () => {
+    invalidatePubmedPreview();
+  });
+  btnRunPubmedSearch?.addEventListener('click', runCurrentPubmedSearch);
+  btnExportPubmed?.addEventListener('click', () => exportCurrentPubmedEntries());
+  btnEntryBulkExport?.addEventListener('click', () => {
+    exportCurrentPubmedEntries(entryBulkExportFormat?.value, btnEntryBulkExport);
+  });
+  pubmedSnapshotSelect?.addEventListener('change', () => activatePubmedSnapshot(pubmedSnapshotSelect.value));
+  btnSavePubmedSnapshot?.addEventListener('click', saveCurrentPubmedSnapshot);
+  btnDeletePubmedSnapshot?.addEventListener('click', deleteCurrentPubmedSnapshot);
+  if (pubmedDateFilters) pubmedDateFilters.open = false;
+  setupPubmedMonthPicker(pubmedPublishedFrom);
+  setupPubmedMonthPicker(pubmedPublishedTo);
+  [pubmedAddedFrom, pubmedAddedTo].forEach(element => {
+    element?.addEventListener('click', () => {
+      try {
+        element.showPicker?.();
+      } catch (_) {
+        // The native input remains usable when this WebView does not expose showPicker().
+      }
+    });
+  });
+  btnCancelPubmedRun?.addEventListener('click', async () => {
+    if (!activePubmedRunId) return;
+    try {
+      await invoke('cancel_pubmed_search_run', { runId: activePubmedRunId });
+      pubmedProgressLabel.textContent = '正在取消…';
+    } catch (e) {
+      setGlobalStatus('取消失败: ' + e, 'error');
+    }
+  });
+  [
+    [pubmedStatusFilter, 'status'],
+    [pubmedSort, 'sort'],
+    [pubmedStarFilter, 'star'],
+    [pubmedPublishedFrom, 'publishedFrom'],
+    [pubmedPublishedTo, 'publishedTo'],
+    [pubmedAddedFrom, 'addedFrom'],
+    [pubmedAddedTo, 'addedTo'],
+  ].forEach(([element, key]) => {
+    element?.addEventListener('change', () => {
+      pubmedFilters[key] = element.value || (key === 'status' || key === 'star' ? 'all' : (key === 'sort' ? 'publication-desc' : ''));
+      pubmedRenderLimit = 200;
+      clearEntrySelection({ render: false, syncPaperChat: false });
+      renderEntryList(allEntries);
+    });
+  });
+  pubmedBulkStatus?.addEventListener('change', async () => {
+    const status = pubmedBulkStatus.value;
+    pubmedBulkStatus.value = '';
+    await applyBulkPubmedStatus(status);
+  });
+  btnPubmedAiScreen?.addEventListener('click', startPubmedAiScreening);
+
   // Generate briefing
   document.getElementById('btn-generate-briefing')?.addEventListener('click', generateBriefingNow);
 
@@ -6114,6 +9911,7 @@ window.addEventListener('DOMContentLoaded', () => {
   loadCostSummary();
   syncEntryBulkActions();
   setupTranslationEvents();
+  setupPubmedSearchEvents();
   wireTranslationBannerButtons();
   initUpdateChannel();
   ensureNotificationPermission();

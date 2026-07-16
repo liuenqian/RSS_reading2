@@ -1,6 +1,6 @@
 [package]
 name = "cento"
-version = "1.0.0"
+version = "1.1.0"
 description = "RSS Reading — a lightweight RSS reader forked from Cento with Chinese translation via DeepSeek"
 authors = ["liuenqian", "itsdrchen <44201097+itsdrchen@users.noreply.github.com>"]
 edition = "2021"
@@ -30,8 +30,10 @@ reqwest = { version = "0.12", features = ["json", "cookies"] }
 feed-rs = "2"
 tokio = { version = "1", features = ["full"] }
 roxmltree = "0.20"
+pdf-extract = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+rust_xlsxwriter = "0.96.0"
 
 # Size-optimized release profile.
 #   opt-level = "z"     — optimize for smallest binary (over speed)

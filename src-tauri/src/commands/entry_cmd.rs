@@ -1,6 +1,6 @@
 use crate::db::DbState;
 use crate::models::{Entry, EntryIdentifiers, ReadingStats};
-use crate::services::{article_service, entry_service};
+use crate::services::{article_service, entry_service, fulltext_service};
 use tauri::State;
 use tracing::{info, warn};
 
@@ -11,9 +11,29 @@ pub fn list_entries(state: State<DbState>, feed_id: Option<i64>) -> Result<Vec<E
 }
 
 #[tauri::command]
+pub fn search_entries(
+    state: State<DbState>,
+    query: String,
+    feed_id: Option<i64>,
+) -> Result<Vec<Entry>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    entry_service::search_entries(&conn, &query, feed_id)
+}
+
+#[tauri::command]
 pub fn set_entry_read(state: State<DbState>, entry_id: i64, is_read: bool) -> Result<(), String> {
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
     entry_service::set_entry_read(&conn, entry_id, is_read)
+}
+
+#[tauri::command]
+pub fn set_entry_screening_status(
+    state: State<DbState>,
+    entry_id: i64,
+    status: String,
+) -> Result<(), String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    entry_service::set_screening_status(&conn, entry_id, &status)
 }
 
 #[tauri::command]
@@ -56,7 +76,17 @@ pub async fn generate_stats_flavor_pool(
         let conn = state.conn.lock().map_err(|e| e.to_string())?;
         crate::services::settings_service::get_settings(&conn)
     };
-    entry_service::generate_flavor_pool(&settings, fetched, read, active_days, peak_hour).await
+    let (items, usage) =
+        entry_service::generate_flavor_pool(&settings, fetched, read, active_days, peak_hour)
+            .await?;
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    let _ = crate::services::cost_service::record_usage(
+        &conn,
+        &settings.provider,
+        &settings.model,
+        &usage,
+    );
+    Ok(items)
 }
 
 #[tauri::command]
@@ -268,6 +298,54 @@ pub async fn fetch_entry_identifiers(
     .map_err(|e| format!("保存文章标识失败: {}", e))?;
 
     Ok(identifiers)
+}
+
+#[tauri::command]
+pub async fn resolve_entry_pdf_url(
+    state: State<'_, DbState>,
+    entry_id: i64,
+) -> Result<Option<String>, String> {
+    let (title, doi, pmid, pmcid, publication_date, published_at): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT title, doi, pmid, pmcid, publication_date, published_at
+             FROM entries WHERE id = ?1",
+            [entry_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .map_err(|e| format!("文章不存在: {}", e))?
+    };
+
+    let publication_year = publication_date
+        .as_deref()
+        .or(published_at.as_deref())
+        .and_then(|value| value.get(..4))
+        .and_then(|value| value.parse::<i32>().ok());
+
+    fulltext_service::resolve_pdf_url(
+        &title,
+        doi.as_deref(),
+        pmid.as_deref(),
+        pmcid.as_deref(),
+        publication_year,
+    )
+    .await
 }
 
 #[tauri::command]

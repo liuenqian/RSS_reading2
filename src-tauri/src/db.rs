@@ -1,8 +1,10 @@
+use crate::db_migrations;
 use rusqlite::{Connection, OpenFlags};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const DB_FILE_NAME: &str = "cento.db";
 const LEGACY_DB_FILE_NAME: &str = "rss reading.db";
@@ -16,6 +18,7 @@ pub struct DbState {
     /// DeepSeek API) — which used to silently produce 5-10 duplicate rows
     /// covering the same period.
     pub briefing_in_flight: AtomicBool,
+    pub pubmed_run_cancellations: Mutex<HashMap<i64, Arc<AtomicBool>>>,
 }
 
 fn schema_sql() -> &'static str {
@@ -30,7 +33,7 @@ fn schema_sql() -> &'static str {
 
     CREATE TABLE IF NOT EXISTS entries (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        feed_id      INTEGER NOT NULL,
+        feed_id      INTEGER,
         guid         TEXT NOT NULL,
         title        TEXT NOT NULL,
         link         TEXT NOT NULL,
@@ -41,11 +44,15 @@ fn schema_sql() -> &'static str {
         pmid         TEXT,
         pmcid        TEXT,
         doi          TEXT,
+        pmid_normalized TEXT,
+        doi_normalized TEXT,
+        publication_date_raw TEXT,
+        publication_date_precision TEXT,
+        publication_sort_key INTEGER,
         fetched_at   TEXT NOT NULL DEFAULT (datetime('now')),
         is_read      INTEGER NOT NULL DEFAULT 0,
         read_at      TEXT,
-        UNIQUE(feed_id, guid),
-        FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE
+        FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS translations (
@@ -197,6 +204,13 @@ pub fn initialize(app_data_dir: PathBuf) -> Result<DbState, String> {
     conn.execute_batch(schema_sql())
         .map_err(|e| format!("无法创建表: {}", e))?;
 
+    let needs_pubmed_migration = db_migrations::needs_migration(&conn)?;
+    if needs_pubmed_migration && current_db_has_user_data(&db_path)? {
+        conn.execute_batch("PRAGMA wal_checkpoint(FULL);")
+            .map_err(|e| format!("迁移前同步数据库失败: {}", e))?;
+        backup_pubmed_migration_db(&app_data_dir, &db_path)?;
+    }
+
     ensure_column(&conn, "entries", "publication_date", "TEXT")?;
     ensure_column(&conn, "entries", "source", "TEXT")?;
     ensure_column(&conn, "entries", "pmid", "TEXT")?;
@@ -207,6 +221,11 @@ pub fn initialize(app_data_dir: PathBuf) -> Result<DbState, String> {
     ensure_column(&conn, "entries", "read_at", "TEXT")?;
     ensure_column(&conn, "entries", "affiliation", "TEXT")?;
     ensure_column(&conn, "entries", "has_free_fulltext", "INTEGER")?;
+    ensure_column(&conn, "entries", "pmid_normalized", "TEXT")?;
+    ensure_column(&conn, "entries", "doi_normalized", "TEXT")?;
+    ensure_column(&conn, "entries", "publication_date_raw", "TEXT")?;
+    ensure_column(&conn, "entries", "publication_date_precision", "TEXT")?;
+    ensure_column(&conn, "entries", "publication_sort_key", "INTEGER")?;
     ensure_column(
         &conn,
         "feeds",
@@ -227,11 +246,14 @@ pub fn initialize(app_data_dir: PathBuf) -> Result<DbState, String> {
     conn.execute("DELETE FROM settings WHERE key = 'elsevier_api_key'", [])
         .map_err(|e| format!("清理旧设置失败: {}", e))?;
 
+    db_migrations::migrate(&conn)?;
+
     backfill_reading_events(&conn)?;
 
     Ok(DbState {
         conn: Mutex::new(conn),
         briefing_in_flight: AtomicBool::new(false),
+        pubmed_run_cancellations: Mutex::new(HashMap::new()),
     })
 }
 
@@ -315,6 +337,11 @@ fn backup_current_db_family(app_data_dir: &Path, current_db_path: &Path) -> Resu
     let backup_db_path = app_data_dir.join("cento.pre-legacy-restore.db");
     copy_sidecar_if_exists(current_db_path, &backup_db_path)?;
     Ok(())
+}
+
+fn backup_pubmed_migration_db(app_data_dir: &Path, current_db_path: &Path) -> Result<(), String> {
+    let backup_db_path = app_data_dir.join("cento.pre-pubmed-migration.db");
+    copy_sidecar_if_exists(current_db_path, &backup_db_path)
 }
 
 fn remove_db_family(db_path: &Path) -> Result<(), String> {

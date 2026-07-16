@@ -1,7 +1,6 @@
-use crate::models::{DeepSeekSettings, Entry, ReadingStats};
-use crate::services::article_service;
-use rusqlite::{params, Connection};
-use serde_json::Value;
+use crate::models::{DeepSeekSettings, Entry, ReadingStats, TokenUsage};
+use crate::services::{article_service, pubmed_search_service, translate_service};
+use rusqlite::{params, types::Value, Connection};
 
 pub fn list_entries(conn: &Connection, feed_id: Option<i64>) -> Result<Vec<Entry>, String> {
     let retention_days: i64 = conn
@@ -28,6 +27,7 @@ pub fn list_entries(conn: &Connection, feed_id: Option<i64>) -> Result<Vec<Entry
             t_title.translated_text,
             t_summary.translated_text,
             e.affiliation,
+            COALESCE(ess.screening_status, 'unreviewed'),
             EXISTS(SELECT 1 FROM reading_notes rn WHERE rn.entry_id = e.id),
             (SELECT GROUP_CONCAT(tag, char(31))
                FROM (SELECT tag
@@ -37,11 +37,15 @@ pub fn list_entries(conn: &Connection, feed_id: Option<i64>) -> Result<Vec<Entry
             e.has_free_fulltext
      FROM entries e
      LEFT JOIN translations t_title ON t_title.entry_id = e.id AND t_title.field = 'title' AND length(trim(t_title.translated_text)) > 0
-     LEFT JOIN translations t_summary ON t_summary.entry_id = e.id AND t_summary.field = 'summary' AND length(trim(t_summary.translated_text)) > 0";
+     LEFT JOIN translations t_summary ON t_summary.entry_id = e.id AND t_summary.field = 'summary' AND length(trim(t_summary.translated_text)) > 0
+     LEFT JOIN entry_screening_status ess ON ess.entry_id = e.id";
 
     let sql = if feed_id.is_some() {
         format!(
-            "{} WHERE e.feed_id = ?1 {} ORDER BY e.published_at DESC, e.fetched_at DESC",
+            "{} WHERE EXISTS (
+                    SELECT 1 FROM entry_feed_memberships efm
+                    WHERE efm.entry_id = e.id AND efm.feed_id = ?1
+                 ) {} ORDER BY e.published_at DESC, e.fetched_at DESC",
             select, retention_clause
         )
     } else {
@@ -68,13 +72,113 @@ pub fn list_entries(conn: &Connection, feed_id: Option<i64>) -> Result<Vec<Entry
     Ok(entries)
 }
 
+pub fn search_entries(
+    conn: &Connection,
+    query: &str,
+    feed_id: Option<i64>,
+) -> Result<Vec<Entry>, String> {
+    let terms = normalize_search_terms(query);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let searchable_fields = [
+        "e.title",
+        "e.summary",
+        "e.author",
+        "e.source",
+        "e.pmid",
+        "e.pmcid",
+        "e.doi",
+        "e.affiliation",
+        "t_title.translated_text",
+        "t_summary.translated_text",
+    ];
+    let term_condition = format!(
+        "({} OR EXISTS (
+            SELECT 1 FROM entry_tags search_tag
+            WHERE search_tag.entry_id = e.id
+              AND lower(search_tag.tag) LIKE ? ESCAPE '\\'
+        ))",
+        searchable_fields
+            .iter()
+            .map(|field| format!("lower(COALESCE({}, '')) LIKE ? ESCAPE '\\'", field))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    );
+    let mut conditions = std::iter::repeat_n(term_condition, terms.len())
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    if feed_id.is_some() {
+        conditions = format!("e.feed_id = ? AND ({})", conditions);
+    }
+
+    let select = "SELECT e.id, e.feed_id, e.guid, e.title, e.link, e.summary, e.summary_source, e.author,
+            e.published_at, e.publication_date, e.source, e.pmid, e.pmcid, e.doi, e.fetched_at, e.is_read, e.read_at,
+            t_title.translated_text,
+            t_summary.translated_text,
+            e.affiliation,
+            COALESCE(ess.screening_status, 'unreviewed'),
+            EXISTS(SELECT 1 FROM reading_notes rn WHERE rn.entry_id = e.id),
+            (SELECT GROUP_CONCAT(tag, char(31))
+               FROM (SELECT tag
+                       FROM entry_tags et
+                      WHERE et.entry_id = e.id
+                      ORDER BY lower(tag), tag)),
+            e.has_free_fulltext
+     FROM entries e
+     LEFT JOIN translations t_title ON t_title.entry_id = e.id AND t_title.field = 'title' AND length(trim(t_title.translated_text)) > 0
+     LEFT JOIN translations t_summary ON t_summary.entry_id = e.id AND t_summary.field = 'summary' AND length(trim(t_summary.translated_text)) > 0
+     LEFT JOIN entry_screening_status ess ON ess.entry_id = e.id";
+    let sql = format!(
+        "{} WHERE {} ORDER BY e.published_at DESC, e.fetched_at DESC LIMIT 200",
+        select, conditions
+    );
+
+    let mut params = Vec::with_capacity(terms.len() * (searchable_fields.len() + 1) + 1);
+    if let Some(fid) = feed_id {
+        params.push(Value::Integer(fid));
+    }
+    for term in terms {
+        let pattern = format!("%{}%", escape_like_pattern(&term));
+        params.extend(std::iter::repeat_n(
+            Value::Text(pattern),
+            searchable_fields.len() + 1,
+        ));
+    }
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("检索失败: {}", e))?;
+    let entries = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), map_entry)
+        .map_err(|e| format!("检索失败: {}", e))?
+        .filter_map(|row| row.ok())
+        .collect();
+    Ok(entries)
+}
+
+fn normalize_search_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| !term.is_empty())
+        .take(8)
+        .collect()
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 fn map_entry(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
     let summary: Option<String> = row.get(5)?;
     let metadata = article_service::extract_rss_metadata(summary.as_deref());
     let publication_date: Option<String> = row.get(9)?;
     let source: Option<String> = row.get(10)?;
     let affiliation_raw: Option<String> = row.get(19)?;
-    let tags_raw: Option<String> = row.get(21)?;
+    let tags_raw: Option<String> = row.get(22)?;
     let affiliation = affiliation_raw.map(|s| article_service::dedupe_repeated(&s));
 
     Ok(Entry {
@@ -102,10 +206,32 @@ fn map_entry(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
         read_at: row.get(16)?,
         title_translated: row.get(17)?,
         summary_translated: row.get(18)?,
-        has_reading_note: row.get(20)?,
+        screening_status: row.get(20)?,
+        has_reading_note: row.get(21)?,
         tags: parse_entry_tags(tags_raw.as_deref()),
-        has_free_fulltext: row.get(22)?,
+        has_free_fulltext: row.get(23)?,
     })
+}
+
+pub fn set_screening_status(conn: &Connection, entry_id: i64, status: &str) -> Result<(), String> {
+    pubmed_search_service::validate_screening_status(status)?;
+    let changed = conn
+        .execute(
+            "INSERT INTO entry_screening_status (entry_id, screening_status, screened_at)
+             SELECT id, ?2,
+                    CASE WHEN ?2 = 'unreviewed' THEN NULL ELSE datetime('now') END
+             FROM entries
+             WHERE id = ?1
+             ON CONFLICT(entry_id) DO UPDATE SET
+                screening_status = excluded.screening_status,
+                screened_at = excluded.screened_at",
+            params![entry_id, status],
+        )
+        .map_err(|e| format!("更新筛选状态失败: {}", e))?;
+    if changed == 0 {
+        return Err("文章不存在".to_string());
+    }
+    Ok(())
 }
 
 pub fn add_entry_tag(conn: &Connection, entry_id: i64, tag: &str) -> Result<Vec<String>, String> {
@@ -286,7 +412,7 @@ pub fn reading_stats(conn: &Connection) -> Result<ReadingStats, String> {
     })
 }
 
-/// Ask DeepSeek to produce a fresh batch of easter-egg "flavor" templates for
+/// Ask the active AI provider to produce a fresh batch of "flavor" templates for
 /// the reading-stats card. The frontend treats this as best-effort enrichment
 /// on top of its built-in local pool — failures are silent and the local pool
 /// keeps the UI alive. Templates may contain `{read}`, `{fetched}`,
@@ -297,9 +423,9 @@ pub async fn generate_flavor_pool(
     read: i64,
     active_days: i64,
     peak_hour: i64,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, TokenUsage), String> {
     if settings.api_key.trim().is_empty() {
-        return Err("未配置 DeepSeek API Key".to_string());
+        return Err("未配置 AI 服务 API Key".to_string());
     }
     let hour_label = match peak_hour {
         h if h < 0 => "未知".to_string(),
@@ -323,51 +449,16 @@ pub async fn generate_flavor_pool(
         hour_label = hour_label,
     );
 
-    let url = format!(
-        "{}/chat/completions",
-        settings.base_url.trim_end_matches('/')
-    );
-    let body = serde_json::json!({
-        "model": settings.model,
-        "messages": [
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 1.1,
-        "max_tokens": 600,
-    });
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
-
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", settings.api_key))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("DeepSeek 请求失败: {}", e))?;
-
-    let status = resp.status();
-    let value: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("解析 DeepSeek 响应失败: {}", e))?;
-
-    if !status.is_success() {
-        let msg = value["error"]["message"].as_str().unwrap_or("未知错误");
-        return Err(format!("DeepSeek {} — {}", status.as_u16(), msg));
-    }
-
-    let content = value["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let output = translate_service::complete_with_messages(
+        settings,
+        vec![("user".to_string(), user_prompt)],
+        1.1,
+        600,
+    )
+    .await?;
     // Strip code fences if the model added them despite our instructions.
-    let cleaned = content
+    let cleaned = output
+        .content
         .trim_start_matches("```json")
         .trim_start_matches("```")
         .trim_end_matches("```")
@@ -379,12 +470,16 @@ pub async fn generate_flavor_pool(
         .filter(|s| !s.is_empty() && s.chars().count() <= 40)
         .take(20)
         .collect();
-    Ok(lines)
+    Ok((lines, output.usage))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_entry_tag, parse_entry_tags};
+    use super::{
+        escape_like_pattern, normalize_entry_tag, normalize_search_terms, parse_entry_tags,
+        search_entries,
+    };
+    use rusqlite::Connection;
 
     #[test]
     fn normalize_entry_tag_trims_and_collapses_spaces() {
@@ -395,6 +490,82 @@ mod tests {
     fn parse_entry_tags_splits_internal_separator() {
         let tags = parse_entry_tags(Some("综述\u{1f}方法学\u{1f}转化医学"));
         assert_eq!(tags, vec!["综述", "方法学", "转化医学"]);
+    }
+
+    #[test]
+    fn search_terms_support_chinese_and_case_insensitive_english() {
+        assert_eq!(
+            normalize_search_terms("  Sepsis 免疫  "),
+            vec!["sepsis", "免疫"]
+        );
+    }
+
+    #[test]
+    fn search_escapes_like_wildcards() {
+        assert_eq!(escape_like_pattern(r"PD-1_100%\path"), r"PD-1\_100\%\\path");
+    }
+
+    #[test]
+    fn search_entries_matches_english_source_and_chinese_translation() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE entries (
+                id INTEGER PRIMARY KEY,
+                feed_id INTEGER,
+                guid TEXT NOT NULL,
+                title TEXT NOT NULL,
+                link TEXT NOT NULL,
+                summary TEXT,
+                summary_source TEXT,
+                author TEXT,
+                published_at TEXT,
+                publication_date TEXT,
+                source TEXT,
+                pmid TEXT,
+                pmcid TEXT,
+                doi TEXT,
+                fetched_at TEXT NOT NULL,
+                is_read INTEGER NOT NULL DEFAULT 0,
+                read_at TEXT,
+                affiliation TEXT,
+                has_free_fulltext INTEGER
+            );
+            CREATE TABLE translations (entry_id INTEGER, field TEXT, translated_text TEXT);
+            CREATE TABLE reading_notes (entry_id INTEGER);
+            CREATE TABLE entry_tags (entry_id INTEGER, tag TEXT);
+            CREATE TABLE entry_screening_status (entry_id INTEGER, screening_status TEXT);
+            INSERT INTO entries (
+                id, feed_id, guid, title, link, summary, author, published_at,
+                source, fetched_at, is_read
+            ) VALUES
+                (1, 1, 'one', 'Sepsis immune response', 'https://example.com/1',
+                 'English abstract', 'A. Author', '2026-01-02', 'Nature', '2026-01-02', 0),
+                (2, 1, 'two', 'Tumor microenvironment', 'https://example.com/2',
+                 'English abstract', 'B. Author', '2026-01-01', 'Cell', '2026-01-01', 0),
+                (3, 2, 'three', 'Sepsis cohort validation', 'https://example.com/3',
+                 'English abstract', 'C. Author', '2026-01-03', 'JAMA', '2026-01-03', 0);
+            INSERT INTO translations (entry_id, field, translated_text)
+                VALUES (2, 'title', '肿瘤免疫微环境');",
+        )
+        .unwrap();
+
+        let english = search_entries(&conn, "SEPSIS", None).unwrap();
+        assert_eq!(
+            english.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![3, 1]
+        );
+
+        let chinese = search_entries(&conn, "肿瘤免疫", None).unwrap();
+        assert_eq!(
+            chinese.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        let feed_scoped = search_entries(&conn, "SEPSIS", Some(1)).unwrap();
+        assert_eq!(
+            feed_scoped.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 }
 

@@ -25,8 +25,8 @@ pub fn delete_briefing(state: State<'_, DbState>, id: i64) -> Result<(), String>
     briefing_service::delete_briefing(&conn, id)
 }
 
-/// Compose a fresh briefing from the last 7 days of articles via DeepSeek
-/// and persist it. Async because it makes an HTTP call out to DeepSeek; the
+/// Compose a fresh briefing from the last 7 days of articles via the active AI
+/// provider and persist it. Async because it makes an external HTTP call; the
 /// frontend renders a spinner while it's in flight. Requires the user to
 /// have configured an API key (the service surfaces a clear error otherwise).
 ///

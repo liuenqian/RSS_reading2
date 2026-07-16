@@ -12,10 +12,10 @@
 //      `X-CSRFToken`, and the session cookies → receive JSON
 //      `{"rss_feed_url": "https://pubmed.ncbi.nlm.nih.gov/rss/search/<token>/?…"}`.
 
-use crate::models::DeepSeekSettings;
+use crate::models::{DeepSeekSettings, TokenUsage};
+use crate::services::translate_service;
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::Value;
 
 const PUBMED_BASE: &str = "https://pubmed.ncbi.nlm.nih.gov";
 const USER_AGENT: &str =
@@ -156,15 +156,102 @@ fn enforce_limit_param(url: &str, limit: u32) -> Result<String, String> {
 
 // ── Natural language → PubMed query ────────────
 
-// Default fallback for NL → query conversion when the settings model is empty.
-const DEFAULT_NL_QUERY_MODEL: &str = "deepseek-v4-pro";
-
 // Generous ceiling. PubMed queries are short, but the model may emit a few
 // tokens of internal reasoning before the final string, and complex requests
 // (5+ journals OR'd together, multiple MeSH groups, date filters) can easily
 // push the actual query past 500 tokens. 1500 leaves a safety margin without
 // being wasteful.
 const NL_QUERY_MAX_TOKENS: u32 = 1500;
+
+pub fn build_author_query(
+    author_name: &str,
+    affiliation: Option<&str>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+) -> Result<String, String> {
+    let author_name = normalize_author_query_value(author_name, "作者姓名")?;
+    let mut clauses = vec![format!("{}[Author]", escape_pubmed_phrase(&author_name))];
+
+    if let Some(affiliation) = normalize_optional_query_value(affiliation, "机构")? {
+        clauses.push(format!(
+            "\"{}\"[Affiliation:~50]",
+            escape_pubmed_phrase(&affiliation)
+        ));
+    }
+
+    let start_date = normalize_optional_date(start_date, "起始日期")?;
+    let end_date = normalize_optional_date(end_date, "结束日期")?;
+    if start_date.is_some() || end_date.is_some() {
+        let start = start_date.as_deref().unwrap_or("1000/01/01");
+        let end = end_date.as_deref().unwrap_or("3000/12/31");
+        if start > end {
+            return Err("起始日期不能晚于结束日期".to_string());
+        }
+        clauses.push(format!("{}:{}[Date - Publication]", start, end));
+    }
+
+    Ok(clauses.join(" AND "))
+}
+
+fn normalize_author_query_value(value: &str, label: &str) -> Result<String, String> {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.is_empty() {
+        return Err(format!("{}不能为空", label));
+    }
+    if value.chars().count() > 200 {
+        return Err(format!("{}过长", label));
+    }
+    Ok(value)
+}
+
+fn normalize_optional_query_value(
+    value: Option<&str>,
+    label: &str,
+) -> Result<Option<String>, String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| normalize_author_query_value(value, label))
+        .transpose()
+}
+
+fn normalize_optional_date(value: Option<&str>, label: &str) -> Result<Option<String>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let parts = value.split('-').collect::<Vec<_>>();
+    let year = parts.first().and_then(|part| part.parse::<u32>().ok());
+    let month = parts.get(1).and_then(|part| part.parse::<u32>().ok());
+    let day = parts.get(2).and_then(|part| part.parse::<u32>().ok());
+    let valid = parts.len() == 3
+        && parts[0].len() == 4
+        && parts[1].len() == 2
+        && parts[2].len() == 2
+        && parts
+            .iter()
+            .all(|part| part.chars().all(|c| c.is_ascii_digit()))
+        && month.is_some_and(|month| (1..=12).contains(&month))
+        && day.is_some_and(|day| {
+            let month = month.unwrap_or_default();
+            let year = year.unwrap_or_default();
+            let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            let days_in_month = match month {
+                2 if leap_year => 29,
+                2 => 28,
+                4 | 6 | 9 | 11 => 30,
+                _ => 31,
+            };
+            (1..=days_in_month).contains(&day)
+        });
+    if !valid {
+        return Err(format!("{}格式无效", label));
+    }
+    Ok(Some(parts.join("/")))
+}
+
+fn escape_pubmed_phrase(value: &str) -> String {
+    value.replace('"', "")
+}
 
 const NL_TO_PUBMED_PROMPT: &str = "\
 You are a PubMed search expert. Convert a researcher's natural-language request \
@@ -197,101 +284,85 @@ Output format:
 pub async fn natural_language_to_query(
     settings: &DeepSeekSettings,
     text: &str,
-) -> Result<String, String> {
-    let model = if settings.model.trim().is_empty() {
-        DEFAULT_NL_QUERY_MODEL
-    } else {
-        settings.model.trim()
-    };
-    let url = format!(
-        "{}/chat/completions",
-        settings.base_url.trim_end_matches('/')
-    );
+) -> Result<(String, TokenUsage), String> {
+    let output = translate_service::complete_with_prompts(
+        settings,
+        NL_TO_PUBMED_PROMPT,
+        text,
+        0.1,
+        i64::from(NL_QUERY_MAX_TOKENS),
+    )
+    .await?;
+    Ok((output.content, output.usage))
+}
 
-    let body = serde_json::json!({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": NL_TO_PUBMED_PROMPT},
-            {"role": "user", "content": text}
-        ],
-        "temperature": 0.1,
-        "max_tokens": NL_QUERY_MAX_TOKENS
-    });
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
-
-    let response = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", settings.api_key))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("AI 请求发送失败（网络或超时）: {}", e))?;
-
-    let status = response.status();
-    let response_body: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("解析 AI 响应失败（非 JSON）: {}", e))?;
-
-    if !status.is_success() {
-        let error_type = response_body["error"]["type"].as_str().unwrap_or("");
-        let error_msg = response_body["error"]["message"]
-            .as_str()
-            .unwrap_or("未知错误");
-        let detail = if error_type.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", error_type)
-        };
-        return Err(format!(
-            "API 返回 {} {}{}",
-            status.as_u16(),
-            error_msg,
-            detail
-        ));
+pub fn validate_query_syntax(query: &str) -> Result<String, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("PubMed 检索式不能为空".to_string());
+    }
+    if query.chars().count() > 8_000 {
+        return Err("PubMed 检索式过长".to_string());
     }
 
-    let content = response_body["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or_else(|| {
-            let snippet =
-                serde_json::to_string(&response_body).unwrap_or_else(|_| "无法序列化".to_string());
-            let truncated: String = snippet.chars().take(300).collect();
-            format!("AI 响应格式异常（模型 {}），响应: {}", model, truncated)
-        })?
-        .trim()
-        .to_string();
+    let mut in_quote = false;
+    let mut escaped = false;
+    let mut parentheses = 0_i32;
+    let mut brackets = 0_i32;
 
-    let finish_reason = response_body["choices"][0]["finish_reason"]
-        .as_str()
-        .unwrap_or("");
-
-    if content.is_empty() {
-        return Err(format!(
-            "AI 返回空结果（模型 {}, finish_reason: {}）。请尝试简化检索描述，或在「设置 → 翻译」中确认 base_url/API Key 支持该模型。",
-            model,
-            if finish_reason.is_empty() { "未知" } else { finish_reason }
-        ));
+    for ch in query.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_quote = !in_quote;
+            continue;
+        }
+        if in_quote {
+            continue;
+        }
+        match ch {
+            '(' => parentheses += 1,
+            ')' => {
+                parentheses -= 1;
+                if parentheses < 0 {
+                    return Err("PubMed 检索式存在未配对的右括号".to_string());
+                }
+            }
+            '[' => brackets += 1,
+            ']' => {
+                brackets -= 1;
+                if brackets < 0 {
+                    return Err("PubMed 检索式存在未配对的右方括号".to_string());
+                }
+            }
+            _ => {}
+        }
     }
 
-    // `length` means the model was still generating when it hit max_tokens.
-    // The partial string is usually still a valid PubMed expression (the
-    // tail just gets clipped), so surface it instead of failing outright.
-    // PubMed itself will tell the user if the syntax is broken.
-    if finish_reason == "length" {
-        tracing::warn!(
-            model = model,
-            max_tokens = NL_QUERY_MAX_TOKENS,
-            "NL→PubMed: response truncated at max_tokens, returning partial query"
-        );
+    if in_quote {
+        return Err("PubMed 检索式存在未闭合的引号".to_string());
+    }
+    if parentheses != 0 {
+        return Err("PubMed 检索式存在未闭合的圆括号".to_string());
+    }
+    if brackets != 0 {
+        return Err("PubMed 检索式存在未闭合的字段标签，例如 [MeSH Terms]".to_string());
+    }
+    if query
+        .split_whitespace()
+        .last()
+        .is_some_and(|word| matches!(word.to_ascii_uppercase().as_str(), "AND" | "OR" | "NOT"))
+    {
+        return Err("PubMed 检索式不能以 AND、OR 或 NOT 结尾".to_string());
     }
 
-    Ok(content)
+    Ok(query.to_string())
 }
 
 /// Extract the `csrfmiddlewaretoken` hidden input value from PubMed's HTML.
@@ -338,5 +409,68 @@ mod urlencoding {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_author_query, validate_query_syntax};
+
+    #[test]
+    fn builds_author_query_without_optional_filters() {
+        assert_eq!(
+            build_author_query("  Jia   Guo ", None, None, None).unwrap(),
+            "Jia Guo[Author]"
+        );
+    }
+
+    #[test]
+    fn builds_author_query_with_affiliation_and_open_end_date() {
+        assert_eq!(
+            build_author_query(
+                "Guo Jia",
+                Some("Peking University First Hospital"),
+                Some("2020-01-01"),
+                None,
+            )
+            .unwrap(),
+            "Guo Jia[Author] AND \"Peking University First Hospital\"[Affiliation:~50] AND 2020/01/01:3000/12/31[Date - Publication]"
+        );
+    }
+
+    #[test]
+    fn builds_author_query_with_closed_date_range() {
+        assert_eq!(
+            build_author_query("Smith JA", Some("  "), None, Some("2025-12-31")).unwrap(),
+            "Smith JA[Author] AND 1000/01/01:2025/12/31[Date - Publication]"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_author_and_dates() {
+        assert!(build_author_query(" ", None, None, None).is_err());
+        assert!(build_author_query("Smith JA", None, Some("2025-02-29"), None).is_err());
+        assert!(
+            build_author_query("Smith JA", None, Some("2025-01-02"), Some("2025-01-01"),).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_pubmed_queries() {
+        let valid =
+            r#"("ischemic cardiomyopathy"[Title/Abstract]) AND "Single-Cell Analysis"[MeSH Terms]"#;
+        assert_eq!(validate_query_syntax(valid).unwrap(), valid);
+
+        for invalid in [
+            r#""Single-Cell Analysis"[Me"#,
+            r#"("ischemic cardiomyopathy"[Title/Abstract]"#,
+            r#""ischemic cardiomyopathy[Title/Abstract]"#,
+            "ischemic cardiomyopathy AND",
+        ] {
+            assert!(
+                validate_query_syntax(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 }

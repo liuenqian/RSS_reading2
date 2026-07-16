@@ -1,11 +1,13 @@
 mod commands;
 mod db;
+mod db_migrations;
 mod models;
 mod services;
 
 use commands::{
-    briefing_cmd, entry_cmd, feed_cmd, fetch_cmd, opml_cmd, paper_chat_cmd, pubmed_cmd,
-    reading_cmd, settings_cmd, translate_cmd, tray_cmd, update_cmd,
+    briefing_cmd, entry_cmd, feed_cmd, fetch_cmd, nature_download_cmd, opml_cmd, paper_chat_cmd,
+    paper_graph_cmd, pubmed_cmd, pubmed_conversion_cmd, pubmed_search_cmd, reading_cmd,
+    settings_cmd, translate_cmd, tray_cmd, update_cmd,
 };
 use services::scheduler;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
@@ -33,6 +35,7 @@ pub fn run() {
                 db::initialize(app_data_dir).map_err(|e| Box::new(std::io::Error::other(e)))?;
 
             app.manage(db_state);
+            app.manage(paper_chat_cmd::PaperChatRequestState::default());
 
             // ── macOS menu-bar tray icon ──
             let show_item = MenuItemBuilder::with_id("tray-show", "打开 RSS Reading").build(app)?;
@@ -104,12 +107,15 @@ pub fn run() {
             entry_cmd::fetch_abstract,
             entry_cmd::fetch_affiliation,
             entry_cmd::fetch_entry_identifiers,
+            entry_cmd::resolve_entry_pdf_url,
             entry_cmd::ensure_free_fulltext_status,
             entry_cmd::get_reading_stats,
             entry_cmd::generate_stats_flavor_pool,
             entry_cmd::list_entries,
             entry_cmd::remove_entry_tag,
+            entry_cmd::search_entries,
             entry_cmd::set_entry_read,
+            entry_cmd::set_entry_screening_status,
             feed_cmd::add_feed,
             feed_cmd::list_feeds,
             feed_cmd::delete_feed,
@@ -120,13 +126,39 @@ pub fn run() {
             fetch_cmd::fetch_all_feeds,
             fetch_cmd::fetch_feed,
             fetch_cmd::start_translation_pipeline,
+            nature_download_cmd::download_papers_with_nature,
             opml_cmd::export_opml,
             opml_cmd::import_opml,
             paper_chat_cmd::list_paper_chat_messages,
             paper_chat_cmd::clear_paper_chat,
+            paper_chat_cmd::import_paper_chat_attachments,
+            paper_chat_cmd::cancel_paper_chat,
             paper_chat_cmd::ask_paper_chat,
+            paper_chat_cmd::suggest_pubmed_screening,
+            paper_graph_cmd::get_paper_graph,
             pubmed_cmd::build_pubmed_rss_url,
+            pubmed_cmd::build_pubmed_author_query,
             pubmed_cmd::natural_to_pubmed_query,
+            pubmed_conversion_cmd::convert_pubmed_feed_to_search,
+            pubmed_conversion_cmd::convert_pubmed_search_to_feed,
+            pubmed_search_cmd::preview_pubmed_search,
+            pubmed_search_cmd::assess_pubmed_search_preview,
+            pubmed_search_cmd::create_pubmed_search,
+            pubmed_search_cmd::list_pubmed_searches,
+            pubmed_search_cmd::get_pubmed_search,
+            pubmed_search_cmd::clone_pubmed_search,
+            pubmed_search_cmd::rename_pubmed_search,
+            pubmed_search_cmd::update_pubmed_search,
+            pubmed_search_cmd::delete_pubmed_search,
+            pubmed_search_cmd::run_pubmed_search,
+            pubmed_search_cmd::resume_pubmed_search_run,
+            pubmed_search_cmd::cancel_pubmed_search_run,
+            pubmed_search_cmd::list_pubmed_search_entries,
+            pubmed_search_cmd::set_pubmed_screening_status,
+            pubmed_search_cmd::bulk_set_pubmed_screening_status,
+            pubmed_search_cmd::list_kept_pubmed_entries,
+            pubmed_search_cmd::export_pubmed_entries,
+            pubmed_search_cmd::apply_pubmed_screening_suggestions,
             reading_cmd::get_reading_profiles,
             reading_cmd::import_reading_skill,
             reading_cmd::save_reading_profiles,
@@ -136,10 +168,17 @@ pub fn run() {
             reading_cmd::append_paper_chat_to_note,
             reading_cmd::generate_reading_note,
             settings_cmd::get_settings,
+            settings_cmd::get_provider_settings,
+            settings_cmd::list_api_token_profiles,
+            settings_cmd::upsert_api_token_profile,
+            settings_cmd::activate_api_token_profile,
+            settings_cmd::delete_api_token_profile,
             settings_cmd::save_settings,
             settings_cmd::test_connection,
             settings_cmd::fetch_deepseek_balance,
             translate_cmd::translate_summary,
+            translate_cmd::translate_entry_title,
+            translate_cmd::translate_entry_summary,
             translate_cmd::translate_entry_missing,
             translate_cmd::open_url,
             translate_cmd::get_cost_summary,
@@ -147,8 +186,11 @@ pub fn run() {
             tray_cmd::set_tray_visible,
             tray_cmd::send_test_notification,
             update_cmd::check_for_update,
+            update_cmd::download_update_installer,
             update_cmd::get_app_version,
             update_cmd::get_update_prefs,
+            update_cmd::open_downloaded_update,
+            update_cmd::reveal_downloaded_update,
             update_cmd::set_update_auto_check,
         ])
         .build(tauri::generate_context!())

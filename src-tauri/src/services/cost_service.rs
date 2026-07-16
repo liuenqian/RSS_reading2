@@ -1,9 +1,7 @@
 // Token-accurate cost meter.
 //
-// Replaces the old localStorage character-count approximation. Every successful
-// translation reports a `TokenUsage` block from DeepSeek; we persist running
-// per-(month, model) totals in the `cost_log` table and price them with the
-// official rate card.
+// Provider responses are normalized to `TokenUsage`; monthly totals are kept
+// per provider and model. Only providers with a maintained rate card are priced.
 //
 // Why per-model: deepseek-chat and deepseek-reasoner have different rates, and
 // future models will too. Storing model alongside the counts lets us evolve
@@ -28,9 +26,12 @@ struct Rates {
     completion_per_m: f64,
 }
 
-fn rates_for(model: &str) -> Rates {
+fn rates_for(provider: &str, model: &str) -> Option<Rates> {
+    if provider != "deepseek" {
+        return None;
+    }
     let m = model.to_ascii_lowercase();
-    if m.contains("reasoner") || m.contains("r1") {
+    Some(if m.contains("reasoner") || m.contains("r1") {
         Rates {
             cache_hit_per_m: 1.0,
             cache_miss_per_m: 4.0,
@@ -43,7 +44,7 @@ fn rates_for(model: &str) -> Rates {
             cache_miss_per_m: 2.0,
             completion_per_m: 8.0,
         }
-    }
+    })
 }
 
 fn price(tokens: i64, per_m: f64) -> f64 {
@@ -80,10 +81,17 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
 /// Add one API call's usage to the current month's running total. Upserts on
 /// `(month, model)` so re-translating an article just bumps the counts rather
 /// than creating a new row per call.
-pub fn record_usage(conn: &Connection, model: &str, usage: &TokenUsage) -> Result<(), String> {
+pub fn record_usage(
+    conn: &Connection,
+    provider: &str,
+    model: &str,
+    usage: &TokenUsage,
+) -> Result<(), String> {
     let month = current_month();
+    let usage_key = format!("{}::{}", provider.trim(), model.trim());
     info!(
         month = %month,
+        provider = %provider,
         model = %model,
         hit = usage.prompt_cache_hit_tokens,
         miss = usage.prompt_cache_miss_tokens,
@@ -101,7 +109,7 @@ pub fn record_usage(conn: &Connection, model: &str, usage: &TokenUsage) -> Resul
            completion_tokens        = completion_tokens        + excluded.completion_tokens",
         rusqlite::params![
             month,
-            model,
+            usage_key,
             usage.prompt_cache_hit_tokens,
             usage.prompt_cache_miss_tokens,
             usage.completion_tokens,
@@ -109,6 +117,13 @@ pub fn record_usage(conn: &Connection, model: &str, usage: &TokenUsage) -> Resul
     )
     .map_err(|e| format!("记录用量失败: {}", e))?;
     Ok(())
+}
+
+fn split_usage_key(value: &str) -> (String, String) {
+    value
+        .split_once("::")
+        .map(|(provider, model)| (provider.to_string(), model.to_string()))
+        .unwrap_or_else(|| ("deepseek".to_string(), value.to_string()))
 }
 
 pub fn current_month_summary(conn: &Connection) -> Result<CostSummary, String> {
@@ -134,14 +149,22 @@ pub fn current_month_summary(conn: &Connection) -> Result<CostSummary, String> {
 
     let mut breakdown = Vec::new();
     let mut total = 0.0_f64;
+    let mut all_priced = true;
     for r in rows.flatten() {
-        let (model, hit, miss, comp) = r;
-        let rates = rates_for(&model);
-        let cny = price(hit, rates.cache_hit_per_m)
-            + price(miss, rates.cache_miss_per_m)
-            + price(comp, rates.completion_per_m);
-        total += cny;
+        let (usage_key, hit, miss, comp) = r;
+        let (provider, model) = split_usage_key(&usage_key);
+        let cny = rates_for(&provider, &model).map(|rates| {
+            price(hit, rates.cache_hit_per_m)
+                + price(miss, rates.cache_miss_per_m)
+                + price(comp, rates.completion_per_m)
+        });
+        if let Some(value) = cny {
+            total += value;
+        } else {
+            all_priced = false;
+        }
         breakdown.push(CostBreakdownRow {
+            provider,
             model,
             prompt_cache_hit_tokens: hit,
             prompt_cache_miss_tokens: miss,
@@ -151,7 +174,24 @@ pub fn current_month_summary(conn: &Connection) -> Result<CostSummary, String> {
     }
     Ok(CostSummary {
         month,
-        total_cny: total,
+        total_cny: all_priced.then_some(total),
         breakdown,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_usage_keys_are_deepseek() {
+        assert_eq!(
+            split_usage_key("deepseek-chat"),
+            ("deepseek".to_string(), "deepseek-chat".to_string())
+        );
+        assert_eq!(
+            split_usage_key("anthropic::claude-sonnet-5"),
+            ("anthropic".to_string(), "claude-sonnet-5".to_string())
+        );
+    }
 }

@@ -27,7 +27,7 @@ pub struct Feed {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     pub id: i64,
-    pub feed_id: i64,
+    pub feed_id: Option<i64>,
     pub guid: String,
     pub title: String,
     pub link: String,
@@ -46,9 +46,15 @@ pub struct Entry {
     pub read_at: Option<String>,
     pub title_translated: Option<String>,
     pub summary_translated: Option<String>,
+    #[serde(default = "default_screening_status")]
+    pub screening_status: String,
     pub has_reading_note: bool,
     pub tags: Vec<String>,
     pub has_free_fulltext: Option<bool>,
+}
+
+fn default_screening_status() -> String {
+    "unreviewed".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -58,13 +64,284 @@ pub struct EntryIdentifiers {
     pub doi: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaperGraphNode {
+    pub paper_id: String,
+    pub title: String,
+    pub authors: Vec<String>,
+    pub year: Option<i64>,
+    pub citation_count: i64,
+    pub url: Option<String>,
+    pub doi: Option<String>,
+    pub pmid: Option<String>,
+    pub abstract_text: Option<String>,
+    pub relations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaperGraphEdge {
+    pub source: String,
+    pub target: String,
+    pub relation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaperGraph {
+    pub seed_id: String,
+    pub nodes: Vec<PaperGraphNode>,
+    pub edges: Vec<PaperGraphEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PubmedArticleRecord {
+    pub pmid: String,
+    pub pmcid: Option<String>,
+    pub doi: Option<String>,
+    pub title: String,
+    pub abstract_text: Option<String>,
+    pub authors: Option<String>,
+    pub journal: Option<String>,
+    pub affiliation: Option<String>,
+    pub publication_date: Option<String>,
+    pub publication_date_raw: Option<String>,
+    pub publication_date_precision: Option<String>,
+    pub publication_sort_key: Option<i64>,
+    pub has_free_fulltext: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PubmedSearchPreview {
+    pub query: String,
+    pub total_count: usize,
+    pub pmids: Vec<String>,
+    pub entries: Vec<PubmedArticleRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PubmedPreviewEntryAssessment {
+    pub pmid: String,
+    pub status: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PubmedPreviewAssessment {
+    pub verdict: String,
+    pub summary: String,
+    pub sample_size: usize,
+    pub abstract_count: usize,
+    pub relevant_count: usize,
+    pub maybe_count: usize,
+    pub irrelevant_count: usize,
+    pub precision_percent: f64,
+    pub precision_low_percent: f64,
+    pub precision_high_percent: f64,
+    pub recall_risk: String,
+    pub recall_assessment: String,
+    pub coverage_gaps: Vec<String>,
+    pub suggested_query: Option<String>,
+    pub entries: Vec<PubmedPreviewEntryAssessment>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PubmedSearchPage {
+    pub total_count: usize,
+    pub pmids: Vec<String>,
+    pub web_env: Option<String>,
+    pub query_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PubmedSearch {
+    pub id: i64,
+    pub name: String,
+    pub question: Option<String>,
+    pub query: String,
+    pub retrieval_scope: String,
+    pub retrieval_limit: Option<i64>,
+    pub retrieval_date_from: Option<String>,
+    pub retrieval_date_to: Option<String>,
+    pub retrieval_sort: String,
+    pub created_at: String,
+    pub last_attempt_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_result_count: i64,
+    pub last_added_count: i64,
+    pub total_entries: i64,
+    pub unreviewed_count: i64,
+    pub keep_count: i64,
+    pub maybe_count: i64,
+    pub exclude_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PubmedRetrievalOptions {
+    #[serde(default = "default_pubmed_retrieval_scope")]
+    pub scope: String,
+    pub limit: Option<usize>,
+    pub date_from: Option<String>,
+    pub date_to: Option<String>,
+    #[serde(default = "default_pubmed_retrieval_sort")]
+    pub sort: String,
+}
+
+impl Default for PubmedRetrievalOptions {
+    fn default() -> Self {
+        Self {
+            scope: default_pubmed_retrieval_scope(),
+            limit: None,
+            date_from: None,
+            date_to: None,
+            sort: default_pubmed_retrieval_sort(),
+        }
+    }
+}
+
+fn default_pubmed_retrieval_scope() -> String {
+    "all".to_string()
+}
+
+fn default_pubmed_retrieval_sort() -> String {
+    "most_recent".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PubmedSearchRunResult {
+    pub run_id: i64,
+    pub search_id: i64,
+    pub status: String,
+    pub matched_count: usize,
+    pub added_count: usize,
+    pub reused_count: usize,
+    pub failed_count: usize,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PubmedSearchEntry {
+    pub entry_id: i64,
+    pub search_id: i64,
+    pub screening_status: String,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub is_current_match: bool,
+    pub pubmed_rank: Option<i64>,
+    pub title: String,
+    pub title_translated: Option<String>,
+    pub summary: Option<String>,
+    pub summary_translated: Option<String>,
+    pub authors: Option<String>,
+    pub journal: Option<String>,
+    pub publication_date: Option<String>,
+    pub publication_date_raw: Option<String>,
+    pub publication_date_precision: Option<String>,
+    pub publication_sort_key: Option<i64>,
+    pub pmid: Option<String>,
+    pub pmcid: Option<String>,
+    pub doi: Option<String>,
+    pub affiliation: Option<String>,
+    pub has_free_fulltext: bool,
+    pub is_read: bool,
+    pub read_at: Option<String>,
+    pub has_reading_note: bool,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PubmedSearchMembershipLabel {
+    pub search_id: i64,
+    pub search_name: String,
+    pub screening_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PubmedScreeningSuggestion {
+    pub entry_id: i64,
+    pub pmid: Option<String>,
+    pub status: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PubmedScreeningSuggestionResult {
+    pub raw_answer: String,
+    pub suggestions: Vec<PubmedScreeningSuggestion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeptPubmedEntry {
+    #[serde(flatten)]
+    pub entry: PubmedSearchEntry,
+    pub searches: Vec<PubmedSearchMembershipLabel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PubmedExportMetric {
+    pub entry_id: i64,
+    pub impact_factor: Option<String>,
+    pub jcr_quartile: Option<String>,
+    pub cas_partition: Option<String>,
+    pub is_top: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NatureDownloadItem {
+    pub title: String,
+    pub doi: Option<String>,
+    pub pmid: Option<String>,
+    pub pmcid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NatureDownloadReport {
+    pub total: usize,
+    pub downloaded: usize,
+    pub needs_user_action: usize,
+    pub output_dir: String,
+    pub results: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PubmedSearchProgress {
+    pub run_id: i64,
+    pub search_id: i64,
+    pub processed: usize,
+    pub total: usize,
+    pub added: usize,
+    pub reused: usize,
+    pub failed: usize,
+    pub current_pmid: Option<String>,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeepSeekSettings {
+    #[serde(default = "default_ai_provider")]
+    pub provider: String,
     pub api_key: String,
     pub base_url: String,
     pub model: String,
     pub system_prompt: String,
     pub read_retention_days: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiTokenProfileSummary {
+    pub id: String,
+    pub name: String,
+    pub masked_key: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiTokenProfileList {
+    pub provider: String,
+    pub active_id: Option<String>,
+    pub profiles: Vec<ApiTokenProfileSummary>,
+}
+
+fn default_ai_provider() -> String {
+    "deepseek".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +380,21 @@ pub struct PaperChatMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaperChatAttachment {
+    pub path: String,
+    pub name: String,
+    pub content: String,
+    pub char_count: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaperChatAttachmentImport {
+    pub attachments: Vec<PaperChatAttachment>,
+    pub skipped: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeepSeekBalanceInfo {
     pub currency: String,
     pub total_balance: String,
@@ -116,10 +408,7 @@ pub struct DeepSeekBalance {
     pub balance_infos: Vec<DeepSeekBalanceInfo>,
 }
 
-/// Token usage returned by DeepSeek's `/chat/completions` (the `usage` block).
-/// Cache-hit input is billed at a quarter of cache-miss input, so we keep the
-/// two separated — averaging them out would significantly inflate the
-/// reported cost for short, repetitive prompts (like Cento's system prompt).
+/// Provider-normalized token usage for one successful AI request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub prompt_cache_hit_tokens: i64,
@@ -130,17 +419,18 @@ pub struct TokenUsage {
 /// One row of the per-model cost breakdown returned by `get_cost_summary`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostBreakdownRow {
+    pub provider: String,
     pub model: String,
     pub prompt_cache_hit_tokens: i64,
     pub prompt_cache_miss_tokens: i64,
     pub completion_tokens: i64,
-    pub cny: f64,
+    pub cny: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostSummary {
     pub month: String,
-    pub total_cny: f64,
+    pub total_cny: Option<f64>,
     pub breakdown: Vec<CostBreakdownRow>,
 }
 
@@ -193,11 +483,31 @@ pub struct UpdateInfo {
     pub current_version: String,
     pub latest_version: String,
     pub has_update: bool,
+    #[serde(default = "default_update_source_available")]
+    pub source_available: bool,
     pub release_url: String,
     pub release_notes: Option<String>,
+    pub asset_name: Option<String>,
     /// First `.dmg` asset attached to the release, if any. Frontend uses it
     /// for the "下载安装包" direct link; missing → fall back to `release_url`.
     pub asset_url: Option<String>,
+}
+
+fn default_update_source_available() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateDownloadResult {
+    pub local_path: String,
+    pub file_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateDownloadProgress {
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub percent: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

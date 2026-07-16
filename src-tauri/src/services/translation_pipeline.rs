@@ -35,6 +35,7 @@ struct PendingTask {
     is_read: bool,
     has_title_translation: bool,
     has_summary_translation: bool,
+    translate_summary: bool,
 }
 
 /// Fire-and-forget. Safe to call after every fetch + at app startup.
@@ -114,7 +115,9 @@ fn collect_pending(state: &DbState) -> Result<(Vec<PendingTask>, DeepSeekSetting
         .prepare(
             "SELECT e.id, e.title, e.summary, e.is_read,
                     EXISTS(SELECT 1 FROM translations t WHERE t.entry_id = e.id AND t.field = 'title'   AND length(trim(t.translated_text)) > 0),
-                    EXISTS(SELECT 1 FROM translations t WHERE t.entry_id = e.id AND t.field = 'summary' AND length(trim(t.translated_text)) > 0)
+                    EXISTS(SELECT 1 FROM translations t WHERE t.entry_id = e.id AND t.field = 'summary' AND length(trim(t.translated_text)) > 0),
+                    EXISTS(SELECT 1 FROM entry_feed_memberships efm WHERE efm.entry_id = e.id),
+                    EXISTS(SELECT 1 FROM pubmed_search_entries pse WHERE pse.entry_id = e.id AND pse.screening_status = 'keep')
              FROM entries e
              ORDER BY e.published_at DESC, e.fetched_at DESC
              LIMIT ?1",
@@ -130,12 +133,16 @@ fn collect_pending(state: &DbState) -> Result<(Vec<PendingTask>, DeepSeekSetting
                 is_read: row.get::<_, i64>(3)? != 0,
                 has_title_translation: row.get::<_, i64>(4)? != 0,
                 has_summary_translation: row.get::<_, i64>(5)? != 0,
+                translate_summary: summary_translation_allowed(
+                    row.get::<_, i64>(6)? != 0,
+                    row.get::<_, i64>(7)? != 0,
+                ),
             })
         })
         .map_err(|e| format!("查询失败: {}", e))?;
 
     let mut tasks = vec![];
-    for r in rows.flatten() {
+    for mut r in rows.flatten() {
         // Title always gets translated if missing. A title that's already
         // predominantly Chinese is a strong signal the source language matches
         // the translation target, so we skip silently.
@@ -150,15 +157,21 @@ fn collect_pending(state: &DbState) -> Result<(Vec<PendingTask>, DeepSeekSetting
         // allow missing titles to catch up, but avoid spending extra tokens or
         // PubMed bandwidth on summaries for articles the user already moved past.
         let needs_summary_translation = !r.has_summary_translation
+            && r.translate_summary
             && !r.is_read
             && !summary_already_chinese
             && (summary_text_is_real || !r.is_read);
-        if needs_title || needs_summary_translation {
+        r.translate_summary = needs_summary_translation;
+        if needs_title || r.translate_summary {
             tasks.push(r);
         }
     }
 
     Ok((tasks, settings))
+}
+
+fn summary_translation_allowed(has_rss_membership: bool, has_kept_search: bool) -> bool {
+    has_rss_membership || has_kept_search
 }
 
 /// Source-language guard for the translation pipeline. We translate to Chinese,
@@ -224,7 +237,12 @@ async fn process_task(app: AppHandle, task: PendingTask, settings: &DeepSeekSett
                     );
                     if res.is_ok() {
                         if let Ok(conn) = state.conn.lock() {
-                            let _ = cost_service::record_usage(&conn, &settings.model, &out.usage);
+                            let _ = cost_service::record_usage(
+                                &conn,
+                                &settings.provider,
+                                &settings.model,
+                                &out.usage,
+                            );
                         }
                     }
                     res
@@ -245,7 +263,7 @@ async fn process_task(app: AppHandle, task: PendingTask, settings: &DeepSeekSett
     }
 
     // ── Summary ──
-    if task.has_summary_translation {
+    if task.has_summary_translation || !task.translate_summary {
         return;
     }
 
@@ -303,7 +321,12 @@ async fn process_task(app: AppHandle, task: PendingTask, settings: &DeepSeekSett
                 );
                 if res.is_ok() {
                     if let Ok(conn) = state.conn.lock() {
-                        let _ = cost_service::record_usage(&conn, &settings.model, &out.usage);
+                        let _ = cost_service::record_usage(
+                            &conn,
+                            &settings.provider,
+                            &settings.model,
+                            &out.usage,
+                        );
                     }
                 }
                 res
@@ -395,4 +418,16 @@ fn emit_summary_fetched(app: &AppHandle, entry_id: i64, summary: &str, source: &
             "source": source,
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summary_translation_allowed;
+
+    #[test]
+    fn pubmed_only_summary_requires_keep_status() {
+        assert!(!summary_translation_allowed(false, false));
+        assert!(summary_translation_allowed(false, true));
+        assert!(summary_translation_allowed(true, false));
+    }
 }

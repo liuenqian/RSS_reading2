@@ -47,12 +47,33 @@
                 </div>
             </div>
 
+            <div class="pubmed-batch-heading" data-tauri-drag-region="deep">
+                <div id="pubmed-batch-meta" class="pubmed-batch-meta" data-tauri-drag-region="deep"></div>
+                <div class="pubmed-batch-actions">
+                    <select id="pubmed-export-format" class="settings-select compact" aria-label="导出格式">
+                        <option value="xlsx">Excel (.xlsx)</option>
+                        <option value="txt">PubMed TXT</option>
+                    </select>
+                    <button id="btn-export-pubmed" class="btn btn-secondary btn-sm" type="button" title="导出当前结果">
+                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2.5v7M5.2 6.8 8 9.6l2.8-2.8M3 12.5h10" /></svg>
+                        <span>导出</span>
+                    </button>
+                    <button id="btn-run-pubmed-search" class="btn btn-secondary btn-sm" type="button">检查更新</button>
+                </div>
+            </div>
+
             <!-- App name shown by native macOS titlebar; only show contextual subtitle here -->
             <div class="toolbar-title-group" data-tauri-drag-region="deep">
                 <div id="toolbar-subtitle" class="toolbar-subtitle" data-tauri-drag-region="deep"></div>
             </div>
 
             <div class="toolbar-trailing">
+                <select
+                    id="toolbar-api-token"
+                    class="toolbar-token-select hidden"
+                    aria-label="切换 API Token"
+                    title="切换 API Token"
+                ></select>
                 <div class="capsule-group">
                     <button
                         id="btn-toggle-paper-chat-toolbar"
@@ -305,6 +326,44 @@
                             <p class="section-subtitle">
                                 批量编辑订阅源、设置图标、调整刷新行为。
                             </p>
+                        </div>
+
+                        <div class="settings-card">
+                            <div class="settings-card-header">添加 RSS 订阅</div>
+                            <div class="settings-card-body">
+                                <div class="add-feed-row settings-add-feed-row" id="add-feed-row">
+                                    <span class="add-feed-icon" id="add-feed-icon">
+                                        <svg
+                                            width="13"
+                                            height="13"
+                                            viewBox="0 0 16 16"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            stroke-width="1.5"
+                                            stroke-linecap="round"
+                                            stroke-linejoin="round"
+                                            aria-hidden="true"
+                                        >
+                                            <line x1="8" y1="3.5" x2="8" y2="12.5" />
+                                            <line x1="3.5" y1="8" x2="12.5" y2="8" />
+                                        </svg>
+                                    </span>
+                                    <input
+                                        type="url"
+                                        id="feed-url"
+                                        placeholder="粘贴 RSS URL"
+                                        autocomplete="off"
+                                        aria-label="RSS URL"
+                                    />
+                                    <button
+                                        id="btn-add-feed"
+                                        class="btn-add-submit hidden"
+                                        type="button"
+                                    >
+                                        添加
+                                    </button>
+                                </div>
+                            </div>
                         </div>
 
                         <div class="settings-card">
@@ -742,7 +801,7 @@
                                                 background: var(--accent);
                                             "
                                         ></span>
-                                        <span>deepseek-v4-pro</span>
+                                        <span id="briefing-settings-model">当前 AI 模型</span>
                                         <span
                                             style="
                                                 margin-left: auto;
@@ -854,26 +913,11 @@
                                 <div class="onboarding-text">
                                     RSS Reading 不配置也能直接阅读英文
                                     RSS。如果想让标题和摘要自动翻译成中文，在下方填入
-                                    DeepSeek API Key 并保存即可。
+                                    AI 服务 API Key 并保存即可。
                                 </div>
                                 <div class="onboarding-hint">
-                                    没有 API Key？前往
-                                    <a
-                                        href="https://platform.deepseek.com/api_keys"
-                                        target="_blank"
-                                        rel="noreferrer"
-                                        class="onboarding-link"
-                                        >DeepSeek 控制台</a
-                                    >
-                                    免费注册并生成，或前往
-                                    <a
-                                        href="https://www.sensenova.cn/"
-                                        target="_blank"
-                                        rel="noreferrer"
-                                        class="onboarding-link"
-                                        >免费 API 申请</a
-                                    >
-                                    （充值少量即可使用，翻译每篇文章约 0.001 元）
+                                    可选择 DeepSeek、OpenAI、Anthropic、Gemini
+                                    或自定义兼容接口。
                                 </div>
                             </div>
                         </div>
@@ -896,7 +940,7 @@
                                 </svg>
                                 翻译服务
                             </div>
-                            <h1 class="section-title">DeepSeek 配置</h1>
+                            <h1 class="section-title">AI 服务配置</h1>
                             <p class="section-subtitle">
                                 配置翻译服务后即可使用 RSS Reading 自动翻译 PubMed
                                 文献的标题和摘要。API Key
@@ -908,9 +952,60 @@
                             <div class="settings-card-header">API 凭据</div>
                             <div class="settings-card-body">
                                 <div class="settings-row">
+                                    <label class="srow-label" for="ai-provider"
+                                        >服务商</label
+                                    >
+                                    <select
+                                        id="ai-provider"
+                                        class="settings-input"
+                                    >
+                                        <option value="deepseek">DeepSeek</option>
+                                        <option value="openai">OpenAI</option>
+                                        <option value="anthropic">Anthropic Claude</option>
+                                        <option value="gemini">Google Gemini</option>
+                                        <option value="openai_compatible">自定义 OpenAI-compatible</option>
+                                    </select>
+                                </div>
+                                <div class="settings-row">
                                     <label class="srow-label" for="api-key"
                                         >API Key</label
                                     >
+                                    <div class="api-token-profile-controls">
+                                        <select
+                                            id="api-token-profile"
+                                            class="settings-select"
+                                            aria-label="Token 档案"
+                                        ></select>
+                                        <button
+                                            type="button"
+                                            id="btn-new-api-token"
+                                            class="icon-btn"
+                                            title="新增 Token"
+                                            aria-label="新增 Token"
+                                        >
+                                            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+                                                <path d="M8 3v10M3 8h10" />
+                                            </svg>
+                                        </button>
+                                        <button
+                                            type="button"
+                                            id="btn-delete-api-token"
+                                            class="icon-btn danger"
+                                            title="删除当前 Token"
+                                            aria-label="删除当前 Token"
+                                        >
+                                            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                                <path d="M3.5 4.5h9M6 4.5V3h4v1.5M5 6.5l.5 6h5l.5-6" />
+                                            </svg>
+                                        </button>
+                                    </div>
+                                    <input
+                                        type="text"
+                                        id="api-token-profile-name"
+                                        placeholder="例如：主账号、备用账号"
+                                        autocomplete="off"
+                                        class="settings-input"
+                                    />
                                     <div class="password-field">
                                         <input
                                             type="password"
@@ -943,34 +1038,7 @@
                                         </button>
                                     </div>
                                     <div class="srow-hint">
-                                        前往
-                                        <a
-                                            href="https://platform.deepseek.com/api_keys"
-                                            target="_blank"
-                                            rel="noreferrer"
-                                            style="
-                                                color: var(--accent-deep);
-                                                text-decoration: none;
-                                                font-weight: 500;
-                                                border-bottom: 0.5px solid
-                                                    var(--accent-tint);
-                                            "
-                                            >DeepSeek 控制台</a
-                                        >
-                                        获取，以 sk- 开头；或前往
-                                        <a
-                                            href="https://www.sensenova.cn/"
-                                            target="_blank"
-                                            rel="noreferrer"
-                                            style="
-                                                color: var(--accent-deep);
-                                                text-decoration: none;
-                                                font-weight: 500;
-                                                border-bottom: 0.5px solid
-                                                    var(--accent-tint);
-                                            "
-                                            >免费 API 申请</a
-                                        >
+                                        当前服务商的凭据，仅保存在本地数据库；保存后可在顶部快速切换。
                                     </div>
                                 </div>
                                 <div class="settings-row">
@@ -998,7 +1066,7 @@
                             </div>
                         </div>
 
-                        <div class="settings-card">
+                        <div class="settings-card" id="deepseek-balance-card">
                             <div class="settings-card-header">
                                 账户余额
                                 <div class="settings-card-subtitle">
@@ -1444,6 +1512,23 @@
                                         </button>
                                     </div>
                                 </div>
+                                <div class="settings-row settings-row-inline">
+                                    <div class="srow-label-group">
+                                        <div class="srow-label">标题显示</div>
+                                        <div class="srow-hint">
+                                            已翻译文献在列表和详情中的标题语言
+                                        </div>
+                                    </div>
+                                    <select
+                                        id="title-display-mode"
+                                        class="settings-select"
+                                        style="width: 200px"
+                                    >
+                                        <option value="both">中英文</option>
+                                        <option value="zh">仅中文</option>
+                                        <option value="en">仅英文</option>
+                                    </select>
+                                </div>
                             </div>
                         </div>
 
@@ -1670,11 +1755,11 @@
                                     <div class="about-label">项目</div>
                                     <div class="about-value">
                                         <a
-                                            href="https://github.com/liuenqian/RSS_reading"
+                                            href="https://github.com/liuenqian/RSS_reading2"
                                             target="_blank"
                                             rel="noreferrer"
                                             class="about-link"
-                                            >liuenqian / RSS_reading</
+                                            >liuenqian / RSS_reading2</
                                         >
                                     </div>
                                     <div class="about-label">致谢</div>
@@ -1724,15 +1809,13 @@
                                     class="update-actions hidden"
                                     id="update-actions"
                                 >
-                                    <a
-                                        href="#"
-                                        target="_blank"
-                                        rel="noreferrer"
+                                    <button
+                                        type="button"
                                         class="btn btn-primary"
                                         id="btn-download-update"
                                     >
                                         下载安装包
-                                    </a>
+                                    </button>
                                     <a
                                         href="#"
                                         target="_blank"
@@ -1839,9 +1922,9 @@
                      same upper strip below them. -->
                 <aside id="sidebar" class="sidebar" data-tauri-drag-region>
                     <div class="sidebar-brand" aria-hidden="true">RSS Reading</div>
-                    <div class="add-feed-wrap">
-                        <div class="add-feed-row" id="add-feed-row">
-                            <span class="add-feed-icon" id="add-feed-icon">
+                    <div class="literature-search-wrap">
+                        <div class="literature-search-row" id="literature-search-row">
+                            <span class="literature-search-icon">
                                 <svg
                                     width="13"
                                     height="13"
@@ -1853,21 +1936,25 @@
                                     stroke-linejoin="round"
                                     aria-hidden="true"
                                 >
-                                    <line x1="8" y1="3.5" x2="8" y2="12.5" />
-                                    <line x1="3.5" y1="8" x2="12.5" y2="8" />
+                                    <circle cx="7" cy="7" r="4.5" />
+                                    <path d="m10.5 10.5 3 3" />
                                 </svg>
                             </span>
                             <input
                                 type="text"
-                                id="feed-url"
-                                placeholder="添加订阅源 · 粘贴 RSS URL"
+                                id="literature-search"
+                                placeholder="检索文献"
                                 autocomplete="off"
+                                aria-label="检索软件内文献"
                             />
                             <button
-                                id="btn-add-feed"
-                                class="btn-add-submit hidden"
+                                id="btn-clear-literature-search"
+                                class="btn-clear-search hidden"
+                                type="button"
+                                title="清空检索"
+                                aria-label="清空检索"
                             >
-                                添加
+                                ×
                             </button>
                         </div>
                     </div>
@@ -2013,17 +2100,61 @@
                                 id="count-briefing"
                             ></span>
                         </div>
+                        <div
+                            class="sidebar-row sidebar-row-kept"
+                            data-view="kept"
+                            id="sidebar-row-kept"
+                        >
+                            <span class="sidebar-row-icon">
+                                <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                    <path d="M4 2.8h8v10.4L8 10.8l-4 2.4Z" />
+                                </svg>
+                            </span>
+                            <span class="sidebar-row-label">保留文献</span>
+                            <span class="sidebar-row-count" id="count-kept"></span>
+                        </div>
                     </div>
 
-                    <div class="feed-section-label">
-                        <span>订阅源</span>
+                    <div class="feed-section-label pubmed-section-label">
+                        <button
+                            class="sidebar-section-toggle"
+                            type="button"
+                            data-sidebar-section-toggle="pubmed"
+                            aria-expanded="true"
+                            aria-controls="pubmed-search-list"
+                            title="折叠 PubMed 检索"
+                        >
+                            <svg class="sidebar-section-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
+                            <span>PubMed 检索</span>
+                        </button>
+                        <button id="btn-new-pubmed-search" class="sidebar-section-action" type="button" title="新建 PubMed 检索" aria-label="新建 PubMed 检索">
+                            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                        </button>
                     </div>
-                    <ul id="feed-list" class="feed-list"></ul>
+                    <ul id="pubmed-search-list" class="pubmed-search-list sidebar-section-list"></ul>
+
+                    <div class="feed-section-label">
+                        <button
+                            class="sidebar-section-toggle"
+                            type="button"
+                            data-sidebar-section-toggle="feeds"
+                            aria-expanded="true"
+                            aria-controls="feed-list"
+                            title="折叠订阅源"
+                        >
+                            <svg class="sidebar-section-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
+                            <span>订阅源</span>
+                        </button>
+                        <button id="btn-new-feed" class="sidebar-section-action" type="button" title="添加 RSS 订阅" aria-label="添加 RSS 订阅">
+                            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                        </button>
+                    </div>
+                    <ul id="feed-list" class="feed-list sidebar-section-list"></ul>
 
                     <!-- Cost meter -->
                     <div class="cost-meter" id="cost-meter">
                         <div class="cost-meter-top">
-                            <span>本月翻译</span>
+                            <span>本月 AI 用量</span>
                             <span class="cost-meter-value" id="cost-value"
                                 >¥ 0.00</span
                             >
@@ -2032,7 +2163,7 @@
                             <div class="cost-meter-fill" id="cost-fill"></div>
                         </div>
                         <div class="cost-meter-bot">
-                            <span id="cost-chars">0 字符</span>
+                            <span id="cost-chars">0 tokens</span>
                             <span class="cost-meter-model" id="cost-model"
                                 >deepseek-v4</span
                             >
@@ -2042,13 +2173,30 @@
                     <div id="global-status" class="global-status"></div>
                 </aside>
 
+                <div
+                    id="sidebar-resizer"
+                    class="sidebar-resizer"
+                    role="separator"
+                    aria-orientation="vertical"
+                    aria-label="调整订阅侧栏宽度"
+                ></div>
+
                 <!-- Content area -->
                 <div id="content-area" class="content-area">
                     <!-- Entry list (feed mode) -->
                     <section id="entry-list" class="entry-list" tabindex="0">
                         <div class="entry-list-header chrome">
+                            <div id="pubmed-batch-header" class="pubmed-batch-header hidden">
+                                <div id="pubmed-search-progress" class="pubmed-search-progress hidden">
+                                    <div class="pubmed-progress-track"><span id="pubmed-progress-fill"></span></div>
+                                    <span id="pubmed-progress-label"></span>
+                                    <button id="btn-cancel-pubmed-run" class="pubmed-progress-cancel" type="button">取消</button>
+                                </div>
+                            </div>
                             <div class="entry-header-left">
-                                <div class="segmented-control" id="entry-filter">
+                                <div class="entry-reading-filter-section">
+                                    <span class="entry-filter-section-label">阅读状态</span>
+                                    <div class="segmented-control" id="entry-filter">
                                     <button
                                         class="seg-btn active"
                                         data-filter="all"
@@ -2083,8 +2231,74 @@
                                             id="top-count-reading-notes"
                                         ></span>
                                     </button>
+                                    </div>
                                 </div>
-                                <div class="entry-metric-filters">
+                                <details id="entry-metric-filter-section" class="entry-metric-filter-section">
+                                    <summary class="compact-filter-summary">
+                                        <span class="compact-filter-summary-label">
+                                            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 3.5h11M4.5 8h7M6.5 12.5h3" /></svg>
+                                            <span>更多筛选</span>
+                                        </span>
+                                        <span class="compact-filter-summary-meta">
+                                            <span id="entry-metric-filter-summary-count" class="compact-filter-summary-count"></span>
+                                            <svg class="compact-filter-chevron" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5.5 6.5 2.5 3 2.5-3" /></svg>
+                                        </span>
+                                    </summary>
+                                    <div class="entry-advanced-filter-content">
+                                    <div class="pubmed-filter-content pubmed-only-filter-group">
+                                        <div class="pubmed-list-controls">
+                                            <label class="filter-field" for="pubmed-status-filter">
+                                                <span class="filter-field-label">筛选状态</span>
+                                                <select id="pubmed-status-filter" class="settings-select compact">
+                                                    <option value="all">全部状态</option>
+                                                    <option value="unreviewed">未筛选</option>
+                                                    <option value="keep">保留</option>
+                                                    <option value="maybe">待定</option>
+                                                    <option value="exclude">排除</option>
+                                                </select>
+                                            </label>
+                                            <label class="filter-field" for="pubmed-sort">
+                                                <span class="filter-field-label">排序方式</span>
+                                                <select id="pubmed-sort" class="settings-select compact">
+                                                    <option value="publication-desc">发表时间：最新</option>
+                                                    <option value="publication-asc">发表时间：最早</option>
+                                                    <option value="added-desc">加入时间：最新</option>
+                                                    <option value="added-asc">加入时间：最早</option>
+                                                    <option value="if-desc">影响因子：从高到低</option>
+                                                    <option value="if-asc">影响因子：从低到高</option>
+                                                    <option value="rank">PubMed 顺序</option>
+                                                </select>
+                                            </label>
+                                        </div>
+                                        <details id="pubmed-date-filters" class="pubmed-date-filters">
+                                            <summary>
+                                                <span class="pubmed-date-summary-label">
+                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="3.5" width="11" height="10" rx="1.5" /><path d="M5 2.5v2M11 2.5v2M2.5 6.5h11" /></svg>
+                                                    <span>日期范围</span>
+                                                </span>
+                                                <svg class="pubmed-date-chevron" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5.5 6.5 2.5 3 2.5-3" /></svg>
+                                            </summary>
+                                            <div class="pubmed-date-controls">
+                                                <div class="pubmed-date-group">
+                                                    <span class="filter-field-label">发表月份</span>
+                                                    <div class="pubmed-date-range">
+                                                        <input id="pubmed-published-from" class="pubmed-date-filter pubmed-month-filter" type="text" placeholder="开始 YYYY-MM" title="发表月份起始" aria-label="发表月份起始" readonly />
+                                                        <span class="pubmed-date-range-separator">至</span>
+                                                        <input id="pubmed-published-to" class="pubmed-date-filter pubmed-month-filter" type="text" placeholder="结束 YYYY-MM" title="发表月份截止" aria-label="发表月份截止" readonly />
+                                                    </div>
+                                                </div>
+                                                <div class="pubmed-date-group">
+                                                    <span class="filter-field-label">加入日期</span>
+                                                    <div class="pubmed-date-range">
+                                                        <input id="pubmed-added-from" class="pubmed-date-filter" type="date" title="加入批次起始" aria-label="加入批次起始" />
+                                                        <span class="pubmed-date-range-separator">至</span>
+                                                        <input id="pubmed-added-to" class="pubmed-date-filter" type="date" title="加入批次截止" aria-label="加入批次截止" />
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </details>
+                                    </div>
+                                    <div class="entry-metric-filters">
                                     <select
                                         id="entry-metric-if-filter"
                                         class="settings-select compact"
@@ -2127,12 +2341,34 @@
                                         <option value="na">无 Top 数据</option>
                                     </select>
                                     <select
-                                        id="entry-tag-filter"
-                                        class="settings-select compact"
+                                        id="pubmed-star-filter"
+                                        class="settings-select compact pubmed-only-filter"
                                     >
-                                        <option value="all">全部标签</option>
+                                        <option value="all">全部星标</option>
+                                        <option value="starred">已标星</option>
+                                        <option value="unstarred">未标星</option>
                                     </select>
-                                </div>
+                                        <select
+                                            id="entry-tag-filter"
+                                            class="settings-select compact"
+                                        >
+                                            <option value="all">全部标签</option>
+                                        </select>
+                                    </div>
+                                    <div class="pubmed-snapshot-section">
+                                    <span class="entry-filter-section-label">筛选结果快照</span>
+                                    <div class="pubmed-snapshot-controls">
+                                        <select id="pubmed-snapshot-select" class="settings-select compact" aria-label="筛选结果快照">
+                                            <option value="">实时筛选</option>
+                                        </select>
+                                        <button id="btn-save-pubmed-snapshot" class="btn btn-secondary btn-sm" type="button">保存当前结果</button>
+                                        <button id="btn-delete-pubmed-snapshot" class="btn-icon hidden" type="button" title="删除当前快照" aria-label="删除当前快照">
+                                            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 4.5h9M6 2.8h4M5 4.5l.5 8h5l.5-8" /></svg>
+                                        </button>
+                                    </div>
+                                    </div>
+                                    </div>
+                                </details>
                             </div>
                             <div
                                 id="entry-bulk-actions"
@@ -2185,6 +2421,23 @@
                                     全不选
                                 </button>
                                 <select
+                                    id="entry-bulk-export-format"
+                                    class="settings-select compact hidden"
+                                    aria-label="批量导出格式"
+                                >
+                                    <option value="xlsx">Excel (.xlsx)</option>
+                                    <option value="txt">PubMed TXT</option>
+                                </select>
+                                <button
+                                    id="btn-entry-bulk-export"
+                                    class="btn btn-secondary btn-sm hidden"
+                                    type="button"
+                                    title="导出当前勾选的文献"
+                                >
+                                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2.5v7M5.2 6.8 8 9.6l2.8-2.8M3 12.5h10" /></svg>
+                                    <span>导出所选</span>
+                                </button>
+                                <select
                                     id="entry-bulk-existing-mode"
                                     class="settings-select compact hidden"
                                 >
@@ -2205,6 +2458,14 @@
                                 >
                                     批量笔记
                                 </button>
+                                <select id="pubmed-bulk-status" class="settings-select compact hidden">
+                                    <option value="">设置筛选状态</option>
+                                    <option value="unreviewed">未筛选</option>
+                                    <option value="keep">保留</option>
+                                    <option value="maybe">待定</option>
+                                    <option value="exclude">排除</option>
+                                </select>
+                                <button id="btn-pubmed-ai-screen" class="btn btn-secondary btn-sm hidden" type="button">AI 辅助筛选</button>
                             </div>
                         </div>
                         <ul id="entry-items" class="entry-items">
@@ -2281,6 +2542,14 @@
                         <ul id="briefing-items" class="briefing-items"></ul>
                     </section>
 
+                    <div
+                        id="list-resizer"
+                        class="panel-resizer"
+                        role="separator"
+                        aria-orientation="vertical"
+                        aria-label="调整文章列表宽度"
+                    ></div>
+
                     <!-- Detail panel (feed mode) -->
                     <section id="detail-panel" class="detail-panel">
                         <div id="detail-empty" class="detail-empty">
@@ -2335,6 +2604,78 @@
                                                 d="m8 2.5 1.7 3.5 3.8.55-2.75 2.7.65 3.8L8 11.25 4.6 13.05l.65-3.8L2.5 6.55l3.8-.55Z"
                                             />
                                         </svg>
+                                    </button>
+                                    <button
+                                        id="btn-paper-graph"
+                                        class="ghost-btn"
+                                        type="button"
+                                        title="文献图谱"
+                                        aria-label="文献图谱"
+                                    >
+                                        <svg
+                                            width="14"
+                                            height="14"
+                                            viewBox="0 0 16 16"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            stroke-width="1.5"
+                                            stroke-linecap="round"
+                                            stroke-linejoin="round"
+                                            aria-hidden="true"
+                                        >
+                                            <circle cx="3" cy="8" r="1.5" />
+                                            <circle cx="8" cy="3" r="1.5" />
+                                            <circle cx="13" cy="7" r="1.5" />
+                                            <circle cx="9" cy="13" r="1.5" />
+                                            <path d="m4.1 6.9 2.8-2.8M9.4 4.1l2.3 1.8M11.9 8.2l-1.8 3.5M7.5 11.7 4.3 9" />
+                                        </svg>
+                                    </button>
+                                    <button
+                                        id="btn-detail-pdf"
+                                        class="ghost-btn detail-external-action"
+                                        type="button"
+                                        title="智能下载 PDF"
+                                        aria-label="智能下载 PDF"
+                                    >
+                                        <svg
+                                            width="13"
+                                            height="13"
+                                            viewBox="0 0 16 16"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            stroke-width="1.5"
+                                            stroke-linecap="round"
+                                            stroke-linejoin="round"
+                                            aria-hidden="true"
+                                        >
+                                            <path d="M4 2.5h5l3 3v8H4Z" />
+                                            <path d="M9 2.5v3h3" />
+                                        </svg>
+                                        <span>PDF</span>
+                                    </button>
+                                    <button
+                                        id="btn-detail-scihub"
+                                        class="ghost-btn detail-external-action"
+                                        type="button"
+                                        title="通过 Sci-Hub 查找全文"
+                                        aria-label="通过 Sci-Hub 查找全文"
+                                    >
+                                        <svg
+                                            width="13"
+                                            height="13"
+                                            viewBox="0 0 16 16"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            stroke-width="1.5"
+                                            stroke-linecap="round"
+                                            stroke-linejoin="round"
+                                            aria-hidden="true"
+                                        >
+                                            <path d="M6.2 9.8 9.8 6.2" />
+                                            <path d="M5.2 11.8H4.5a2.5 2.5 0 0 1 0-5H7" />
+                                            <path d="M10.8 4.2h.7a2.5 2.5 0 0 1 0 5H9" />
+                                        </svg>
+                                        <span>Sci-Hub</span>
                                     </button>
                                     <button
                                         id="btn-open-url"
@@ -2444,6 +2785,38 @@
                                         ></div>
                                     </div>
 
+                                    <section
+                                        id="detail-paper-graph-section"
+                                        class="detail-paper-graph-section hidden"
+                                        aria-label="文献关系图谱"
+                                    >
+                                        <div class="paper-graph-header">
+                                            <div>
+                                                <div class="paper-graph-title">文献图谱</div>
+                                                <div id="paper-graph-counts" class="paper-graph-counts"></div>
+                                            </div>
+                                            <div class="paper-graph-header-actions">
+                                                <button id="btn-paper-graph-back" class="btn-icon hidden" type="button" title="返回上一个中心" aria-label="返回上一个中心">
+                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m10.5 3.5-4.5 4.5 4.5 4.5" /></svg>
+                                                </button>
+                                                <button id="btn-paper-graph-reload" class="btn-icon" type="button" title="重新加载图谱" aria-label="重新加载图谱">
+                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.7"/><path d="M13.5 2.6V5.2H10.9"/></svg>
+                                                </button>
+                                                <button id="btn-paper-graph-close" class="btn-icon" type="button" title="收起图谱" aria-label="收起图谱">
+                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
+                                                </button>
+                                            </div>
+                                        </div>
+                                        <div id="paper-graph-filters" class="paper-graph-filters" role="tablist" aria-label="图谱关系筛选">
+                                            <button class="paper-graph-filter active" type="button" data-graph-filter="all">全部</button>
+                                            <button class="paper-graph-filter" type="button" data-graph-filter="reference">更早工作</button>
+                                            <button class="paper-graph-filter" type="button" data-graph-filter="citation">后续工作</button>
+                                            <button class="paper-graph-filter" type="button" data-graph-filter="similar">相似文献</button>
+                                        </div>
+                                        <div id="paper-graph-stage" class="paper-graph-stage"></div>
+                                        <div id="paper-graph-node-detail" class="paper-graph-node-detail hidden"></div>
+                                    </section>
+
                                     <div
                                         id="detail-summary-section"
                                         class="detail-summary-section"
@@ -2457,6 +2830,7 @@
                                                 class="detail-summary-retry hidden"
                                             >
                                                 <button
+                                                    type="button"
                                                     class="btn btn-secondary btn-sm"
                                                     id="btn-retry-summary"
                                                 >
@@ -2657,12 +3031,48 @@
                                     rows="3"
                                     placeholder="例如：这篇文献的核心发现是什么？有哪些局限？"
                                 ></textarea>
-                                <div class="detail-paper-chat-toolbar">
+                                <div
+                                    id="paper-chat-attachments"
+                                    class="paper-chat-attachments hidden"
+                                >
                                     <div
-                                        id="paper-chat-scope-caption"
-                                        class="detail-paper-chat-caption"
+                                        id="paper-chat-attachment-list"
+                                        class="paper-chat-attachment-list"
+                                    ></div>
+                                    <button
+                                        id="btn-clear-paper-chat-attachments"
+                                        class="btn-ghost btn-sm"
+                                        type="button"
                                     >
-                                        当前范围：当前文献
+                                        清空附件
+                                    </button>
+                                </div>
+                                <div class="detail-paper-chat-toolbar">
+                                    <div class="detail-paper-chat-tools">
+                                        <button
+                                            id="btn-paper-chat-add-files"
+                                            class="btn-icon paper-chat-attach-btn"
+                                            type="button"
+                                            title="添加文件"
+                                            aria-label="添加文件"
+                                        >
+                                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
+                                        </button>
+                                        <button
+                                            id="btn-paper-chat-add-folder"
+                                            class="btn-icon paper-chat-attach-btn"
+                                            type="button"
+                                            title="添加文件夹"
+                                            aria-label="添加文件夹"
+                                        >
+                                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H9l2 2h7.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5Z" /><path d="M12 10v5M9.5 12.5h5" /></svg>
+                                        </button>
+                                        <div
+                                            id="paper-chat-scope-caption"
+                                            class="detail-paper-chat-caption"
+                                        >
+                                            当前范围：当前文献
+                                        </div>
                                     </div>
                                     <button
                                         class="btn btn-primary btn-sm"
@@ -2671,6 +3081,13 @@
                                     >
                                         发送
                                     </button>
+                                </div>
+                                <div
+                                    id="paper-chat-drop-overlay"
+                                    class="paper-chat-drop-overlay"
+                                    aria-hidden="true"
+                                >
+                                    <span>松开以添加文件或文件夹</span>
                                 </div>
                             </div>
                         </div>
@@ -2783,8 +3200,11 @@
                                         class="detail-date-sub"
                                     ></span>
                                 </div>
-                                <div class="briefing-detail-toolbar-model">
-                                    deepseek-v4-pro
+                                <div
+                                    class="briefing-detail-toolbar-model"
+                                    id="briefing-detail-model"
+                                >
+                                    当前 AI 模型
                                 </div>
                             </div>
                             <div class="detail-body">
@@ -2837,5 +3257,187 @@
             <!-- /#main-view -->
         </div>
         <!-- /#app -->
+
+        <div id="feed-add-modal" class="pubmed-modal hidden" role="dialog" aria-modal="true" aria-labelledby="feed-add-modal-title">
+            <div class="pubmed-modal-backdrop" data-feed-add-modal-close></div>
+            <section class="pubmed-modal-panel feed-add-modal-panel">
+                <header class="pubmed-modal-header">
+                    <div>
+                        <h2 id="feed-add-modal-title">添加 RSS 订阅</h2>
+                        <p>粘贴 RSS 地址后，Cento 将持续抓取并更新文献。</p>
+                    </div>
+                    <button class="pubmed-modal-close" type="button" data-feed-add-modal-close title="关闭" aria-label="关闭">×</button>
+                </header>
+                <div class="pubmed-modal-body">
+                    <div id="feed-add-mode" class="segmented-control pubmed-search-mode" role="group" aria-label="RSS 添加方式">
+                        <button class="seg-btn active" type="button" data-feed-add-mode="url">RSS 地址</button>
+                        <button class="seg-btn" type="button" data-feed-add-mode="author">作者检索</button>
+                    </div>
+                    <div id="feed-add-url-builder">
+                        <label class="pubmed-field">
+                            <span>RSS 地址</span>
+                            <input id="feed-add-url" type="url" placeholder="https://example.com/feed.xml" autocomplete="off" />
+                        </label>
+                    </div>
+                    <div id="feed-add-author-builder" class="pubmed-author-builder hidden">
+                        <label class="pubmed-field">
+                            <span>作者姓名</span>
+                            <input id="feed-author-name" type="text" maxlength="200" placeholder="例如：Jia Guo 或 Guo Jia" />
+                        </label>
+                        <label class="pubmed-field">
+                            <span>机构（可选）</span>
+                            <input id="feed-author-affiliation" type="text" maxlength="200" placeholder="建议填写英文机构关键词" />
+                        </label>
+                        <div class="pubmed-author-date-grid">
+                            <label class="pubmed-field">
+                                <span>起始日期（可选）</span>
+                                <input id="feed-author-start-date" type="date" />
+                            </label>
+                            <label class="pubmed-field">
+                                <span>结束日期（可选）</span>
+                                <input id="feed-author-end-date" type="date" />
+                            </label>
+                        </div>
+                        <div class="feed-add-options-grid">
+                            <label class="pubmed-field">
+                                <span>每次抓取</span>
+                                <select id="feed-author-limit" class="settings-select">
+                                    <option value="5">5 篇</option>
+                                    <option value="10">10 篇</option>
+                                    <option value="15" selected>15 篇</option>
+                                    <option value="20">20 篇</option>
+                                    <option value="50">50 篇</option>
+                                    <option value="100">100 篇</option>
+                                </select>
+                            </label>
+                            <label class="pubmed-field">
+                                <span>订阅源名称（可选）</span>
+                                <input id="feed-author-title" type="text" maxlength="80" placeholder="默认使用作者姓名" />
+                            </label>
+                        </div>
+                    </div>
+                    <div id="feed-add-status" class="pubmed-preview-status" role="status"></div>
+                </div>
+                <footer class="pubmed-modal-footer">
+                    <button class="btn btn-secondary" type="button" data-feed-add-modal-close>取消</button>
+                    <button id="btn-create-feed" class="btn btn-primary" type="button" disabled>添加订阅</button>
+                </footer>
+            </section>
+        </div>
+
+        <div id="pubmed-search-modal" class="pubmed-modal hidden" role="dialog" aria-modal="true" aria-labelledby="pubmed-modal-title">
+            <div class="pubmed-modal-backdrop" data-pubmed-modal-close></div>
+            <section class="pubmed-modal-panel">
+                <header class="pubmed-modal-header">
+                    <div>
+                        <h2 id="pubmed-modal-title">新建 PubMed 检索</h2>
+                        <p id="pubmed-modal-description">确认检索式后，Cento 将直接从 PubMed 抓取并持续更新。</p>
+                    </div>
+                    <button class="pubmed-modal-close" type="button" data-pubmed-modal-close title="关闭" aria-label="关闭">×</button>
+                </header>
+                <div class="pubmed-modal-body">
+                    <div id="pubmed-search-mode" class="segmented-control pubmed-search-mode" role="group" aria-label="检索模式">
+                        <button class="seg-btn active" type="button" data-pubmed-search-mode="topic">主题检索</button>
+                        <button class="seg-btn" type="button" data-pubmed-search-mode="author">作者检索</button>
+                    </div>
+                    <div id="pubmed-topic-builder">
+                        <label class="pubmed-field">
+                            <span>研究问题</span>
+                            <textarea id="pubmed-question" rows="3" placeholder="例如：脓毒症后免疫麻痹的单细胞研究"></textarea>
+                        </label>
+                        <div class="pubmed-field-action">
+                            <button id="btn-generate-pubmed-query" class="btn btn-secondary" type="button">AI 生成检索式</button>
+                        </div>
+                    </div>
+                    <div id="pubmed-author-builder" class="pubmed-author-builder hidden">
+                        <label class="pubmed-field">
+                            <span>作者姓名</span>
+                            <input id="pubmed-author-name" type="text" maxlength="200" placeholder="例如：Jia Guo 或 Guo Jia" />
+                        </label>
+                        <label class="pubmed-field">
+                            <span>机构（可选）</span>
+                            <input id="pubmed-author-affiliation" type="text" maxlength="200" placeholder="建议填写英文机构关键词" />
+                        </label>
+                        <div class="pubmed-author-date-grid">
+                            <label class="pubmed-field">
+                                <span>起始日期（可选）</span>
+                                <input id="pubmed-author-start-date" type="date" />
+                            </label>
+                            <label class="pubmed-field">
+                                <span>结束日期（可选）</span>
+                                <input id="pubmed-author-end-date" type="date" />
+                            </label>
+                        </div>
+                        <div class="pubmed-field-action">
+                            <button id="btn-build-pubmed-author-query" class="btn btn-secondary" type="button">构建作者检索式</button>
+                        </div>
+                    </div>
+                    <label class="pubmed-field">
+                        <span>PubMed 检索式</span>
+                        <textarea id="pubmed-batch-query-input" rows="5" placeholder="可直接输入或修改 PubMed 检索式"></textarea>
+                    </label>
+                    <label class="pubmed-field">
+                        <span>检索名称</span>
+                        <input id="pubmed-search-name" type="text" maxlength="80" placeholder="例如：脓毒症免疫重编程" />
+                    </label>
+                    <div class="pubmed-preview-actions">
+                        <button id="btn-preview-pubmed-search" class="btn btn-secondary" type="button">预览结果</button>
+                        <span id="pubmed-preview-status" class="pubmed-preview-status"></span>
+                    </div>
+                    <div id="pubmed-preview-results" class="pubmed-preview-results hidden"></div>
+                    <fieldset id="pubmed-retrieval-panel" class="pubmed-retrieval-panel" disabled>
+                        <legend>正式抓取范围</legend>
+                        <div class="pubmed-retrieval-options">
+                            <label class="pubmed-retrieval-option">
+                                <input type="radio" name="pubmed-retrieval-scope" value="all" />
+                                <span>全部结果 <strong id="pubmed-retrieval-all-count"></strong></span>
+                            </label>
+                            <label class="pubmed-retrieval-option">
+                                <input type="radio" name="pubmed-retrieval-scope" value="top" />
+                                <span>排序前 10,000 篇</span>
+                            </label>
+                            <label class="pubmed-retrieval-option">
+                                <input type="radio" name="pubmed-retrieval-scope" value="custom" />
+                                <span>自定义数量</span>
+                            </label>
+                            <label class="pubmed-retrieval-option">
+                                <input type="radio" name="pubmed-retrieval-scope" value="date_range" />
+                                <span>按日期范围</span>
+                            </label>
+                        </div>
+                        <div id="pubmed-retrieval-custom-row" class="pubmed-retrieval-detail hidden">
+                            <label class="pubmed-field">
+                                <span>抓取数量</span>
+                                <input id="pubmed-retrieval-limit" type="number" min="1" step="1" value="10000" inputmode="numeric" />
+                            </label>
+                        </div>
+                        <div id="pubmed-retrieval-date-row" class="pubmed-retrieval-detail pubmed-author-date-grid hidden">
+                            <label class="pubmed-field">
+                                <span id="pubmed-retrieval-date-from-label">开始日期</span>
+                                <input id="pubmed-retrieval-date-from" type="date" />
+                            </label>
+                            <label class="pubmed-field">
+                                <span id="pubmed-retrieval-date-to-label">结束日期</span>
+                                <input id="pubmed-retrieval-date-to" type="date" />
+                            </label>
+                        </div>
+                        <label class="pubmed-field pubmed-retrieval-sort-field">
+                            <span>排序依据</span>
+                            <select id="pubmed-retrieval-sort" class="settings-select">
+                                <option value="most_recent">最近收录</option>
+                                <option value="relevance">最佳匹配</option>
+                                <option value="publication_date">发表日期（新到旧）</option>
+                                <option value="first_author">第一作者（A–Z）</option>
+                                <option value="journal">期刊（A–Z）</option>
+                            </select>
+                        </label>
+                    </fieldset>
+                </div>
+                <footer class="pubmed-modal-footer">
+                    <button class="btn btn-secondary" type="button" data-pubmed-modal-close>取消</button>
+                    <button id="btn-create-pubmed-search" class="btn btn-primary" type="button" disabled>创建并抓取</button>
+                </footer>
+            </section>
+        </div>
     </body>
 </html>

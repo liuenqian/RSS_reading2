@@ -1,5 +1,5 @@
 use crate::db::DbState;
-use crate::models::UpdateInfo;
+use crate::models::{UpdateDownloadResult, UpdateInfo};
 use crate::services::update_service;
 use tauri::{AppHandle, State};
 
@@ -67,6 +67,21 @@ pub fn set_update_auto_check(state: State<'_, DbState>, enabled: bool) -> Result
     )
     .map_err(|e| format!("保存更新检查偏好失败: {}", e))?;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn download_update_installer(app: AppHandle) -> Result<UpdateDownloadResult, String> {
+    update_service::download_installer(&app).await
+}
+
+#[tauri::command]
+pub fn open_downloaded_update(app: AppHandle, path: String) -> Result<(), String> {
+    update_service::open_downloaded_installer(&app, &path)
+}
+
+#[tauri::command]
+pub fn reveal_downloaded_update(app: AppHandle, path: String) -> Result<(), String> {
+    update_service::reveal_downloaded_installer(&app, &path)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

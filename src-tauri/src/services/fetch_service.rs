@@ -1,6 +1,6 @@
-use crate::models::{Feed, FeedFetchResult, FetchResult};
-use crate::services::{article_service, feed_service, settings_service};
-use rusqlite::Connection;
+use crate::models::{EntryIdentifiers, Feed, FeedFetchResult, FetchResult};
+use crate::services::{article_service, entry_identity_service, feed_service, settings_service};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Mutex;
 use tracing::{info, warn};
 
@@ -59,7 +59,10 @@ pub async fn fetch_all_feeds(conn_mutex: &Mutex<Connection>) -> Result<FetchResu
     Ok(result)
 }
 
-pub async fn fetch_feed(conn_mutex: &Mutex<Connection>, feed_id: i64) -> Result<FetchResult, String> {
+pub async fn fetch_feed(
+    conn_mutex: &Mutex<Connection>,
+    feed_id: i64,
+) -> Result<FetchResult, String> {
     let feed = {
         let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
         feed_service::get_feed(&conn, feed_id)?
@@ -93,7 +96,11 @@ pub async fn fetch_feed(conn_mutex: &Mutex<Connection>, feed_id: i64) -> Result<
             });
             let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
             let _ = feed_service::mark_feed_fetched(&conn, feed.id);
-            info!(feed_id = feed.id, new_entries = entries, "单个订阅源刷新完成");
+            info!(
+                feed_id = feed.id,
+                new_entries = entries,
+                "单个订阅源刷新完成"
+            );
         }
         Err(e) => {
             warn!(feed_id = feed.id, error = %e, "单个订阅源刷新失败");
@@ -310,33 +317,22 @@ async fn process_feed(
         let published_at = entry.published.or(entry.updated).map(|d| d.to_rfc3339());
 
         let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+        let (entry_id, added_to_feed) = upsert_feed_entry(
+            &conn,
+            feed.id,
+            &guid,
+            &title,
+            &link,
+            summary.as_deref(),
+            author.as_deref(),
+            published_at.as_deref(),
+            metadata.publication_date.as_deref(),
+            metadata.source.as_deref(),
+            &identifiers,
+        )?;
 
-        let inserted = conn
-            .execute(
-                "INSERT OR IGNORE INTO entries
-                 (feed_id, guid, title, link, summary, summary_source, author, published_at, publication_date, source, pmid, pmcid, doi)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                rusqlite::params![
-                    feed.id,
-                    &guid,
-                    &title,
-                    link,
-                    summary.as_deref(),
-                    summary.as_ref().map(|_| "rss"),
-                    author,
-                    published_at,
-                    metadata.publication_date.as_deref(),
-                    metadata.source.as_deref(),
-                    identifiers.pmid.as_deref(),
-                    identifiers.pmcid.as_deref(),
-                    identifiers.doi.as_deref()
-                ],
-            )
-            .map_err(|e| format!("入库失败: {}", e))?;
-
-        if inserted > 0 {
+        if added_to_feed {
             new_entries += 1;
-            let entry_id = conn.last_insert_rowid();
             // Log an immutable "fetched" event so the stats survive feed deletion
             // or retention-based entry pruning. feed_title may be None on the very
             // first fetch of a brand-new feed (UPDATE above runs in a sibling lock
@@ -347,34 +343,262 @@ async fn process_feed(
                  VALUES ('fetched', ?1, ?2, ?3)",
                 rusqlite::params![feed.id, feed_title.as_deref(), entry_id],
             );
-        } else {
-            conn.execute(
-                "UPDATE entries
-                 SET summary = COALESCE(NULLIF(summary, ''), ?1),
-                     summary_source = CASE
-                         WHEN (summary IS NULL OR trim(summary) = '') AND ?1 IS NOT NULL THEN 'rss'
-                         ELSE summary_source
-                     END,
-                     publication_date = COALESCE(NULLIF(publication_date, ''), ?2),
-                     source = COALESCE(NULLIF(source, ''), ?3),
-                     pmid = COALESCE(NULLIF(pmid, ''), ?4),
-                     pmcid = COALESCE(NULLIF(pmcid, ''), ?5),
-                     doi = COALESCE(NULLIF(doi, ''), ?6)
-                 WHERE feed_id = ?7 AND guid = ?8",
-                rusqlite::params![
-                    summary.as_deref(),
-                    metadata.publication_date.as_deref(),
-                    metadata.source.as_deref(),
-                    identifiers.pmid.as_deref(),
-                    identifiers.pmcid.as_deref(),
-                    identifiers.doi.as_deref(),
-                    feed.id,
-                    &guid
-                ],
-            )
-            .map_err(|e| format!("更新文章摘要失败: {}", e))?;
         }
     }
 
     Ok(new_entries)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_feed_entry(
+    conn: &Connection,
+    feed_id: i64,
+    guid: &str,
+    title: &str,
+    link: &str,
+    summary: Option<&str>,
+    author: Option<&str>,
+    published_at: Option<&str>,
+    publication_date: Option<&str>,
+    source: Option<&str>,
+    identifiers: &EntryIdentifiers,
+) -> Result<(i64, bool), String> {
+    let membership_entry = conn
+        .query_row(
+            "SELECT entry_id FROM entry_feed_memberships WHERE feed_id = ?1 AND guid = ?2",
+            params![feed_id, guid],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| format!("查询 RSS 归属失败: {}", e))?;
+
+    let resolved_entry = match membership_entry {
+        Some(entry_id) => Some(entry_id),
+        None => entry_identity_service::resolve_entry_id(
+            conn,
+            identifiers.pmid.as_deref(),
+            identifiers.doi.as_deref(),
+        )?,
+    };
+
+    let entry_id = if let Some(entry_id) = resolved_entry {
+        conn.execute(
+            "UPDATE entries
+             SET feed_id = COALESCE(feed_id, ?1),
+                 title = CASE WHEN trim(title) = '' OR title = '(无标题)' THEN ?2 ELSE title END,
+                 link = CASE WHEN trim(link) = '' THEN ?3 ELSE link END,
+                 summary = COALESCE(NULLIF(summary, ''), ?4),
+                 summary_source = CASE
+                     WHEN (summary IS NULL OR trim(summary) = '') AND ?4 IS NOT NULL THEN 'rss'
+                     ELSE summary_source
+                 END,
+                 author = COALESCE(NULLIF(author, ''), ?5),
+                 published_at = COALESCE(NULLIF(published_at, ''), ?6),
+                 publication_date = COALESCE(NULLIF(publication_date, ''), ?7),
+                 source = COALESCE(NULLIF(source, ''), ?8),
+                 pmid = COALESCE(NULLIF(pmid, ''), ?9),
+                 pmcid = COALESCE(NULLIF(pmcid, ''), ?10),
+                 doi = COALESCE(NULLIF(doi, ''), ?11)
+             WHERE id = ?12",
+            params![
+                feed_id,
+                title,
+                link,
+                summary,
+                author,
+                published_at,
+                publication_date,
+                source,
+                identifiers.pmid.as_deref(),
+                identifiers.pmcid.as_deref(),
+                identifiers.doi.as_deref(),
+                entry_id,
+            ],
+        )
+        .map_err(|e| format!("更新规范文献失败: {}", e))?;
+        entry_id
+    } else {
+        conn.execute(
+            "INSERT INTO entries
+             (feed_id, guid, title, link, summary, summary_source, author, published_at,
+              publication_date, source, pmid, pmcid, doi)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                feed_id,
+                guid,
+                title,
+                link,
+                summary,
+                summary.map(|_| "rss"),
+                author,
+                published_at,
+                publication_date,
+                source,
+                identifiers.pmid.as_deref(),
+                identifiers.pmcid.as_deref(),
+                identifiers.doi.as_deref(),
+            ],
+        )
+        .map_err(|e| format!("文献入库失败: {}", e))?;
+        conn.last_insert_rowid()
+    };
+
+    entry_identity_service::register_entry_identities(
+        conn,
+        entry_id,
+        identifiers.pmid.as_deref(),
+        identifiers.doi.as_deref(),
+        "rss",
+    )?;
+
+    let had_membership = conn
+        .query_row(
+            "SELECT 1 FROM entry_feed_memberships WHERE entry_id = ?1 AND feed_id = ?2",
+            params![entry_id, feed_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| format!("查询 RSS 归属失败: {}", e))?
+        .is_some();
+
+    if had_membership {
+        conn.execute(
+            "UPDATE entry_feed_memberships
+             SET last_seen_at = datetime('now')
+             WHERE entry_id = ?1 AND feed_id = ?2",
+            params![entry_id, feed_id],
+        )
+        .map_err(|e| format!("更新 RSS 归属失败: {}", e))?;
+    } else {
+        conn.execute(
+            "INSERT INTO entry_feed_memberships (entry_id, feed_id, guid)
+             VALUES (?1, ?2, ?3)",
+            params![entry_id, feed_id, guid],
+        )
+        .map_err(|e| format!("保存 RSS 归属失败: {}", e))?;
+    }
+
+    Ok((entry_id, !had_membership))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn membership_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("open database");
+        conn.execute_batch(
+            "
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE feeds (id INTEGER PRIMARY KEY, url TEXT NOT NULL UNIQUE);
+            CREATE TABLE entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                feed_id INTEGER,
+                guid TEXT NOT NULL,
+                title TEXT NOT NULL,
+                link TEXT NOT NULL,
+                summary TEXT,
+                summary_source TEXT,
+                author TEXT,
+                published_at TEXT,
+                publication_date TEXT,
+                source TEXT,
+                pmid TEXT,
+                pmcid TEXT,
+                doi TEXT,
+                pmid_normalized TEXT,
+                doi_normalized TEXT
+            );
+            CREATE TABLE entry_identifiers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                value_normalized TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                source TEXT,
+                UNIQUE(entry_id, kind, value_normalized)
+            );
+            CREATE UNIQUE INDEX idx_entry_identifiers_active_unique
+                ON entry_identifiers(kind, value_normalized) WHERE status = 'active';
+            CREATE TABLE entry_identity_conflicts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                value TEXT NOT NULL,
+                entry_ids_json TEXT NOT NULL,
+                source TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE entry_feed_memberships (
+                entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+                feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
+                guid TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY(entry_id, feed_id),
+                UNIQUE(feed_id, guid)
+            );
+            INSERT INTO feeds (id, url) VALUES
+                (1, 'https://one.test/rss'),
+                (2, 'https://two.test/rss');
+            ",
+        )
+        .expect("create schema");
+        conn
+    }
+
+    #[test]
+    fn same_pmid_from_two_feeds_reuses_entry_and_adds_memberships() {
+        let conn = membership_db();
+        let ids = EntryIdentifiers {
+            pmid: Some("123456".to_string()),
+            pmcid: None,
+            doi: Some("10.1000/test".to_string()),
+        };
+
+        let first = upsert_feed_entry(
+            &conn,
+            1,
+            "feed-one-guid",
+            "Paper",
+            "https://example.test/1",
+            Some("Abstract"),
+            None,
+            Some("2026-07-01"),
+            Some("2026-07"),
+            Some("Journal"),
+            &ids,
+        )
+        .expect("insert first feed");
+        let second = upsert_feed_entry(
+            &conn,
+            2,
+            "feed-two-guid",
+            "Paper",
+            "https://example.test/2",
+            None,
+            None,
+            Some("2026-07-01"),
+            Some("2026-07"),
+            Some("Journal"),
+            &ids,
+        )
+        .expect("insert second feed");
+
+        assert_eq!(first.0, second.0);
+        assert!(first.1);
+        assert!(second.1);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM entry_feed_memberships", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            2
+        );
+    }
 }

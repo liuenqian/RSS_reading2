@@ -73,7 +73,21 @@ pub fn get_feed(conn: &Connection, id: i64) -> Result<Feed, String> {
 }
 
 pub fn delete_feed(conn: &Connection, id: i64) -> Result<(), String> {
-    let affected = conn
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("开始删除事务失败: {}", e))?;
+    tx.execute(
+        "UPDATE entries
+         SET feed_id = (
+             SELECT MIN(efm.feed_id)
+             FROM entry_feed_memberships efm
+             WHERE efm.entry_id = entries.id AND efm.feed_id != ?1
+         )
+         WHERE feed_id = ?1",
+        [id],
+    )
+    .map_err(|e| format!("更新文献来源失败: {}", e))?;
+    let affected = tx
         .execute("DELETE FROM feeds WHERE id = ?1", [id])
         .map_err(|e| format!("删除失败: {}", e))?;
 
@@ -81,7 +95,7 @@ pub fn delete_feed(conn: &Connection, id: i64) -> Result<(), String> {
         return Err("订阅源不存在".to_string());
     }
 
-    Ok(())
+    tx.commit().map_err(|e| format!("提交删除失败: {}", e))
 }
 
 pub fn rename_feed(conn: &Connection, id: i64, name: &str) -> Result<(), String> {
@@ -207,4 +221,51 @@ fn normalize_optional_text(value: Option<&str>) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deleting_feed_keeps_entry_and_other_membership() {
+        let conn = Connection::open_in_memory().expect("open database");
+        conn.execute_batch(
+            "
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE feeds (id INTEGER PRIMARY KEY, url TEXT NOT NULL);
+            CREATE TABLE entries (
+                id INTEGER PRIMARY KEY,
+                feed_id INTEGER REFERENCES feeds(id) ON DELETE SET NULL
+            );
+            CREATE TABLE entry_feed_memberships (
+                entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+                feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
+                guid TEXT NOT NULL,
+                PRIMARY KEY(entry_id, feed_id)
+            );
+            INSERT INTO feeds VALUES (1, 'one'), (2, 'two');
+            INSERT INTO entries VALUES (10, 1);
+            INSERT INTO entry_feed_memberships VALUES (10, 1, 'g1'), (10, 2, 'g2');
+            ",
+        )
+        .expect("seed schema");
+
+        delete_feed(&conn, 1).expect("delete feed");
+
+        assert_eq!(
+            conn.query_row("SELECT feed_id FROM entries WHERE id = 10", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM entry_feed_memberships", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+    }
 }

@@ -42,6 +42,10 @@ jobs:
             echo "No tag resolved from release event or workflow input" >&2
             exit 1
           fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: $TAG (expected v1.2.3)" >&2
+            exit 1
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Generate latest.json

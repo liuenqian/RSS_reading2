@@ -1,19 +1,18 @@
 // AI briefing service — generates weekly Chinese-language summaries of recent
-// articles via DeepSeek. Surfaced through `commands::briefing_cmd`, driven by
-// the "AI 简报" panel in the frontend (`loadBriefings` / `generateBriefingNow`).
+// articles via the active AI provider. Surfaced through `commands::briefing_cmd`,
+// driven by the "AI 简报" panel in the frontend.
 
 use crate::db::DbState;
 use crate::models::{Briefing, BriefingCounts, DeepSeekSettings};
-use crate::services::{settings_service, translate_service};
+use crate::services::{cost_service, settings_service, translate_service};
 use rusqlite::Connection;
 use serde::Deserialize;
-use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 
 const BRIEFING_WINDOW_DAYS: i64 = 7;
 // Capping the article count caps the prompt size, which is the dominant
-// factor in DeepSeek latency for briefings. 60 routinely pushed end-to-end
+// factor in AI-provider latency for briefings. 60 routinely pushed end-to-end
 // generation past a minute, making users think the click didn't register
 // and triggering duplicate manual triggers. 40 still produces a rich-enough
 // overview while shaving roughly a third off wall-clock time.
@@ -141,7 +140,7 @@ pub async fn generate_briefing(
 ) -> Result<Briefing, String> {
     // Reject overlapping calls. swap returns the previous value, so if a
     // generation is already in flight we get `true` and bail out without
-    // hitting DeepSeek again. This is the definitive guard against the
+    // hitting the AI provider again. This is the definitive guard against the
     // "user clicked the button 6 times during the 60-second wait → 6 duplicate
     // briefings" pathology; the frontend button-disabled state is a UX
     // companion, not the source of truth.
@@ -154,7 +153,7 @@ pub async fn generate_briefing(
         let conn = state.conn.lock().map_err(|e| e.to_string())?;
         let settings = settings_service::get_settings(&conn);
         if settings.api_key.is_empty() {
-            return Err("请先在设置中配置 DeepSeek API Key".to_string());
+            return Err("请先在设置中配置当前 AI 服务的 API Key".to_string());
         }
         // Frequency-aware debounce: even if the frontend scheduler misfires
         // (timezone bugs, multiple webview restarts, user mashes the button),
@@ -199,14 +198,16 @@ pub async fn generate_briefing(
         articles = article_count,
         feeds = feed_count,
         custom_prompt = custom_guidance.is_some(),
-        "生成简报：发送至 DeepSeek"
+        "生成简报：发送至当前 AI 服务"
     );
 
-    let raw = call_deepseek_for_briefing(&settings, &system_prompt, &user_prompt).await?;
-    let parsed = parse_briefing_json(&raw)?;
+    let output = call_ai_for_briefing(&settings, &system_prompt, &user_prompt).await?;
+    let parsed = parse_briefing_json(&output.content)?;
 
     let id = {
         let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        let _ =
+            cost_service::record_usage(&conn, &settings.provider, &settings.model, &output.usage);
         conn.execute(
             "INSERT INTO briefings (period, title, lead_in, content, article_count, feed_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -391,59 +392,12 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     (y, m, d)
 }
 
-async fn call_deepseek_for_briefing(
+async fn call_ai_for_briefing(
     settings: &DeepSeekSettings,
     system_prompt: &str,
     user_prompt: &str,
-) -> Result<String, String> {
-    let url = format!(
-        "{}/chat/completions",
-        settings.base_url.trim_end_matches('/')
-    );
-    let body = serde_json::json!({
-        "model": settings.model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.4,
-        "max_tokens": 4500,
-        "response_format": {"type": "json_object"},
-    });
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
-
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", settings.api_key))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("DeepSeek 请求失败: {}", e))?;
-
-    let status = resp.status();
-    let response_body: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("解析 DeepSeek 响应失败: {}", e))?;
-
-    if !status.is_success() {
-        let msg = response_body["error"]["message"]
-            .as_str()
-            .unwrap_or("未知错误");
-        return Err(format!("DeepSeek {} — {}", status.as_u16(), msg));
-    }
-
-    let content = response_body["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or_else(|| "DeepSeek 响应缺少 content 字段".to_string())?
-        .to_string();
-    let _ = &translate_service::translate_text; // keep crate import path used
-    Ok(content)
+) -> Result<translate_service::TranslationOutput, String> {
+    translate_service::complete_with_prompts(settings, system_prompt, user_prompt, 0.4, 4500).await
 }
 
 fn parse_briefing_json(raw: &str) -> Result<ParsedBriefing, String> {

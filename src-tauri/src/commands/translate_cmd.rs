@@ -15,8 +15,8 @@ pub struct TranslateEntryResult {
 struct TranslateEntryTask {
     title: String,
     summary: Option<String>,
-    has_title_translation: bool,
-    has_summary_translation: bool,
+    title_translation: Option<String>,
+    summary_translation: Option<String>,
     settings: crate::models::DeepSeekSettings,
 }
 
@@ -53,6 +53,35 @@ fn emit_translation_progress(
     );
 }
 
+fn cached_translation_progress_payload(
+    entry_id: i64,
+    field: &str,
+    text: Option<&str>,
+) -> Option<serde_json::Value> {
+    text.filter(|value| !value.trim().is_empty()).map(|value| {
+        serde_json::json!({
+            "kind": "done",
+            "entry_id": entry_id,
+            "field": field,
+            "text": value,
+            "error": null,
+        })
+    })
+}
+
+fn emit_cached_translation_progress(
+    app: &AppHandle,
+    entry_id: i64,
+    field: &str,
+    text: Option<&str>,
+) -> bool {
+    let Some(payload) = cached_translation_progress_payload(entry_id, field, text) else {
+        return false;
+    };
+    let _ = app.emit(TRANSLATION_EVENT, payload);
+    true
+}
+
 fn emit_summary_fetched(app: &AppHandle, entry_id: i64, summary: &str, source: &str) {
     let _ = app.emit(
         TRANSLATION_EVENT,
@@ -71,6 +100,7 @@ fn save_translation(
     field: &str,
     original: &str,
     translated: &str,
+    provider: &str,
     model: &str,
     usage: &TokenUsage,
 ) -> Result<(), String> {
@@ -81,7 +111,7 @@ fn save_translation(
         rusqlite::params![entry_id, field, original, translated, model],
     )
     .map_err(|e| format!("保存翻译失败: {}", e))?;
-    let _ = cost_service::record_usage(&conn, model, usage);
+    let _ = cost_service::record_usage(&conn, provider, model, usage);
     Ok(())
 }
 
@@ -119,6 +149,142 @@ fn is_chinese_text(s: &str) -> bool {
         }
     }
     total > 0 && cjk * 10 >= total * 3
+}
+
+fn load_translate_entry_task(
+    state: &State<'_, DbState>,
+    entry_id: i64,
+) -> Result<TranslateEntryTask, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    let settings = settings_service::get_settings(&conn);
+    let (title, summary, title_translation, summary_translation) = conn
+        .query_row(
+            "SELECT e.title,
+                    e.summary,
+                    (SELECT t.translated_text FROM translations t WHERE t.entry_id = e.id AND t.field = 'title' AND length(trim(t.translated_text)) > 0 LIMIT 1),
+                    (SELECT t.translated_text FROM translations t WHERE t.entry_id = e.id AND t.field = 'summary' AND length(trim(t.translated_text)) > 0 LIMIT 1)
+             FROM entries e
+             WHERE e.id = ?1",
+            [entry_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                ))
+            },
+        )
+        .map_err(|e| format!("读取文章失败: {}", e))?;
+
+    Ok(TranslateEntryTask {
+        title,
+        summary,
+        title_translation,
+        summary_translation,
+        settings,
+    })
+}
+
+async fn translate_title_for_entry(
+    app: &AppHandle,
+    state: &State<'_, DbState>,
+    entry_id: i64,
+    task: &TranslateEntryTask,
+) -> Result<bool, String> {
+    if emit_cached_translation_progress(app, entry_id, "title", task.title_translation.as_deref())
+        || is_chinese_text(&task.title)
+    {
+        return Ok(false);
+    }
+
+    emit_translation_progress(app, "start", entry_id, "title", None, None);
+    let output = translate_service::translate_text(&task.settings, &task.title).await?;
+    save_translation(
+        state,
+        entry_id,
+        "title",
+        &task.title,
+        &output.content,
+        &task.settings.provider,
+        &task.settings.model,
+        &output.usage,
+    )?;
+    emit_translation_progress(app, "done", entry_id, "title", Some(&output.content), None);
+    emit_cost_updated(app, state);
+    Ok(true)
+}
+
+async fn resolve_summary_for_translation(
+    app: &AppHandle,
+    state: &State<'_, DbState>,
+    entry_id: i64,
+    task: &TranslateEntryTask,
+) -> Result<Option<String>, String> {
+    let mut summary_text = task.summary.clone().and_then(|summary| {
+        let metadata = article_service::extract_rss_metadata(Some(&summary));
+        (!metadata.is_metadata_only).then_some(summary)
+    });
+
+    if summary_text.is_none() {
+        match article_service::fetch_abstract(&task.title).await {
+            Ok(Some(result)) => {
+                save_summary(state, entry_id, &result.text, &result.source)?;
+                emit_summary_fetched(app, entry_id, &result.text, &result.source);
+                summary_text = Some(result.text);
+            }
+            Ok(None) => {}
+            Err(err) => return Err(format!("获取 Abstract 失败: {}", err)),
+        }
+    }
+
+    Ok(summary_text)
+}
+
+async fn translate_summary_for_entry(
+    app: &AppHandle,
+    state: &State<'_, DbState>,
+    entry_id: i64,
+    task: &TranslateEntryTask,
+) -> Result<bool, String> {
+    if emit_cached_translation_progress(
+        app,
+        entry_id,
+        "summary",
+        task.summary_translation.as_deref(),
+    ) {
+        return Ok(false);
+    }
+
+    let Some(summary) = resolve_summary_for_translation(app, state, entry_id, task).await? else {
+        return Ok(false);
+    };
+    if is_chinese_text(&summary) {
+        return Ok(false);
+    }
+
+    emit_translation_progress(app, "start", entry_id, "summary", None, None);
+    let output = translate_service::translate_text(&task.settings, &summary).await?;
+    save_translation(
+        state,
+        entry_id,
+        "summary",
+        &summary,
+        &output.content,
+        &task.settings.provider,
+        &task.settings.model,
+        &output.usage,
+    )?;
+    emit_translation_progress(
+        app,
+        "done",
+        entry_id,
+        "summary",
+        Some(&output.content),
+        None,
+    );
+    emit_cost_updated(app, state);
+    Ok(true)
 }
 
 #[tauri::command]
@@ -171,7 +337,8 @@ pub async fn translate_summary(
             rusqlite::params![entry_id, &summary, &output.content, &settings.model],
         )
         .map_err(|e| format!("保存摘要翻译失败: {}", e))?;
-        let _ = cost_service::record_usage(&conn, &settings.model, &output.usage);
+        let _ =
+            cost_service::record_usage(&conn, &settings.provider, &settings.model, &output.usage);
     }
     emit_cost_updated(&app, &state);
 
@@ -184,36 +351,7 @@ pub async fn translate_entry_missing(
     state: State<'_, DbState>,
     entry_id: i64,
 ) -> Result<TranslateEntryResult, String> {
-    let task = {
-        let conn = state.conn.lock().map_err(|e| e.to_string())?;
-        let settings = settings_service::get_settings(&conn);
-        let (title, summary, has_title_translation, has_summary_translation) = conn
-            .query_row(
-                "SELECT e.title,
-                        e.summary,
-                        EXISTS(SELECT 1 FROM translations t WHERE t.entry_id = e.id AND t.field = 'title' AND length(trim(t.translated_text)) > 0),
-                        EXISTS(SELECT 1 FROM translations t WHERE t.entry_id = e.id AND t.field = 'summary' AND length(trim(t.translated_text)) > 0)
-                 FROM entries e
-                 WHERE e.id = ?1",
-                [entry_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get::<_, i64>(2)? != 0,
-                        row.get::<_, i64>(3)? != 0,
-                    ))
-                },
-            )
-            .map_err(|e| format!("读取文章失败: {}", e))?;
-        TranslateEntryTask {
-            title,
-            summary,
-            has_title_translation,
-            has_summary_translation,
-            settings,
-        }
-    };
+    let task = load_translate_entry_task(&state, entry_id)?;
 
     if task.settings.api_key.is_empty() {
         return Err("请先在设置中配置 API Key".to_string());
@@ -224,97 +362,63 @@ pub async fn translate_entry_missing(
         translated_summary: false,
     };
 
-    if !task.has_title_translation && !is_chinese_text(&task.title) {
-        emit_translation_progress(&app, "start", entry_id, "title", None, None);
-        match translate_service::translate_text(&task.settings, &task.title).await {
-            Ok(output) => {
-                save_translation(
-                    &state,
-                    entry_id,
-                    "title",
-                    &task.title,
-                    &output.content,
-                    &task.settings.model,
-                    &output.usage,
-                )?;
-                emit_translation_progress(
-                    &app,
-                    "done",
-                    entry_id,
-                    "title",
-                    Some(&output.content),
-                    None,
-                );
-                emit_cost_updated(&app, &state);
-                result.translated_title = true;
-            }
-            Err(err) => {
-                emit_translation_progress(&app, "error", entry_id, "title", None, Some(&err));
-                return Err(err);
-            }
+    match translate_title_for_entry(&app, &state, entry_id, &task).await {
+        Ok(translated) => result.translated_title = translated,
+        Err(err) => {
+            emit_translation_progress(&app, "error", entry_id, "title", None, Some(&err));
+            return Err(err);
         }
     }
 
-    if !task.has_summary_translation {
-        let mut summary_text = task.summary.clone().and_then(|summary| {
-            let metadata = article_service::extract_rss_metadata(Some(&summary));
-            (!metadata.is_metadata_only).then_some(summary)
-        });
-
-        if summary_text.is_none() {
-            match article_service::fetch_abstract(&task.title).await {
-                Ok(Some(result)) => {
-                    save_summary(&state, entry_id, &result.text, &result.source)?;
-                    emit_summary_fetched(&app, entry_id, &result.text, &result.source);
-                    summary_text = Some(result.text);
-                }
-                Ok(None) => {}
-                Err(err) => return Err(format!("获取 Abstract 失败: {}", err)),
-            }
-        }
-
-        if let Some(summary) = summary_text {
-            if !is_chinese_text(&summary) {
-                emit_translation_progress(&app, "start", entry_id, "summary", None, None);
-                match translate_service::translate_text(&task.settings, &summary).await {
-                    Ok(output) => {
-                        save_translation(
-                            &state,
-                            entry_id,
-                            "summary",
-                            &summary,
-                            &output.content,
-                            &task.settings.model,
-                            &output.usage,
-                        )?;
-                        emit_translation_progress(
-                            &app,
-                            "done",
-                            entry_id,
-                            "summary",
-                            Some(&output.content),
-                            None,
-                        );
-                        emit_cost_updated(&app, &state);
-                        result.translated_summary = true;
-                    }
-                    Err(err) => {
-                        emit_translation_progress(
-                            &app,
-                            "error",
-                            entry_id,
-                            "summary",
-                            None,
-                            Some(&err),
-                        );
-                        return Err(err);
-                    }
-                }
-            }
+    match translate_summary_for_entry(&app, &state, entry_id, &task).await {
+        Ok(translated) => result.translated_summary = translated,
+        Err(err) => {
+            emit_translation_progress(&app, "error", entry_id, "summary", None, Some(&err));
+            return Err(err);
         }
     }
 
     Ok(result)
+}
+
+#[tauri::command]
+pub async fn translate_entry_title(
+    app: AppHandle,
+    state: State<'_, DbState>,
+    entry_id: i64,
+) -> Result<bool, String> {
+    let task = load_translate_entry_task(&state, entry_id)?;
+    if task.settings.api_key.is_empty() {
+        return Err("请先在设置中配置 API Key".to_string());
+    }
+
+    match translate_title_for_entry(&app, &state, entry_id, &task).await {
+        Ok(translated) => Ok(translated),
+        Err(err) => {
+            emit_translation_progress(&app, "error", entry_id, "title", None, Some(&err));
+            Err(err)
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn translate_entry_summary(
+    app: AppHandle,
+    state: State<'_, DbState>,
+    entry_id: i64,
+) -> Result<bool, String> {
+    let task = load_translate_entry_task(&state, entry_id)?;
+    if task.settings.api_key.is_empty() {
+        return Err("请先在设置中配置 API Key".to_string());
+    }
+
+    match translate_summary_for_entry(&app, &state, entry_id, &task).await {
+        Ok(translated) => Ok(translated),
+        Err(err) => {
+            emit_translation_progress(&app, "error", entry_id, "summary", None, Some(&err));
+            Err(err)
+        }
+    }
 }
 
 #[tauri::command]
@@ -336,4 +440,21 @@ pub fn open_url(app: AppHandle, url: String) -> Result<(), String> {
 pub fn get_cost_summary(state: State<'_, DbState>) -> Result<crate::models::CostSummary, String> {
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
     cost_service::current_month_summary(&conn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cached_translation_progress_payload;
+
+    #[test]
+    fn cached_translation_emits_done_payload_with_text() {
+        let payload = cached_translation_progress_payload(42, "title", Some("缓存中文标题"))
+            .expect("cached translation should produce a progress event");
+
+        assert_eq!(payload["kind"], "done");
+        assert_eq!(payload["entry_id"], 42);
+        assert_eq!(payload["field"], "title");
+        assert_eq!(payload["text"], "缓存中文标题");
+        assert!(cached_translation_progress_payload(42, "title", None).is_none());
+    }
 }

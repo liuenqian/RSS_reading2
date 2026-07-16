@@ -69,7 +69,7 @@ pub async fn generate_reading_note(
         let conn = state.conn.lock().map_err(|e| e.to_string())?;
         let settings = settings_service::get_settings(&conn);
         if settings.api_key.trim().is_empty() {
-            return Err("请先在设置里配置 DeepSeek API Key，再生成阅读笔记".to_string());
+            return Err("请先在设置里配置当前 AI 服务的 API Key，再生成阅读笔记".to_string());
         }
         let profile = settings_service::get_reading_profiles(&conn)
             .into_iter()
@@ -83,6 +83,6 @@ pub async fn generate_reading_note(
         reading_service::generate_reading_note(&settings, &profile, &entry_context).await?;
 
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
-    let _ = cost_service::record_usage(&conn, &settings.model, &output.usage);
+    let _ = cost_service::record_usage(&conn, &settings.provider, &settings.model, &output.usage);
     reading_service::upsert_reading_note(&conn, entry_id, &profile, &output.content)
 }

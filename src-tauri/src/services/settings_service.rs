@@ -1,6 +1,10 @@
-use crate::models::{DeepSeekSettings, ReadingPromptProfile};
+use crate::models::{
+    ApiTokenProfileList, ApiTokenProfileSummary, DeepSeekSettings, ReadingPromptProfile,
+};
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
@@ -21,6 +25,283 @@ fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), String> 
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+pub fn normalize_provider_id(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "openai" => "openai",
+        "anthropic" => "anthropic",
+        "gemini" => "gemini",
+        "openai_compatible" => "openai_compatible",
+        _ => "deepseek",
+    }
+}
+
+fn provider_defaults(provider: &str) -> (&'static str, &'static str) {
+    match normalize_provider_id(provider) {
+        "openai" => ("https://api.openai.com/v1", "gpt-5.4-mini"),
+        "anthropic" => ("https://api.anthropic.com/v1", "claude-sonnet-5"),
+        "gemini" => (
+            "https://generativelanguage.googleapis.com/v1beta",
+            "gemini-3.5-flash",
+        ),
+        "openai_compatible" => ("", ""),
+        _ => (DEFAULT_BASE_URL, DEFAULT_MODEL),
+    }
+}
+
+fn provider_setting_key(provider: &str, field: &str) -> String {
+    format!("ai_provider.{}.{}", normalize_provider_id(provider), field)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredApiTokenProfile {
+    id: String,
+    name: String,
+    api_key: String,
+}
+
+fn load_token_profiles(conn: &Connection, provider: &str) -> Vec<StoredApiTokenProfile> {
+    get_setting(conn, &provider_setting_key(provider, "token_profiles"))
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
+}
+
+fn save_token_profiles(
+    conn: &Connection,
+    provider: &str,
+    profiles: &[StoredApiTokenProfile],
+) -> Result<(), String> {
+    let value = serde_json::to_string(profiles)
+        .map_err(|error| format!("序列化 API Token 档案失败: {}", error))?;
+    set_setting(
+        conn,
+        &provider_setting_key(provider, "token_profiles"),
+        &value,
+    )
+}
+
+fn stored_provider_api_key(conn: &Connection, provider: &str) -> String {
+    get_setting(conn, &provider_setting_key(provider, "api_key"))
+        .or_else(|| {
+            (provider == "deepseek")
+                .then(|| get_setting(conn, "api_key"))
+                .flatten()
+        })
+        .unwrap_or_default()
+}
+
+fn set_active_provider_api_key(
+    conn: &Connection,
+    provider: &str,
+    api_key: &str,
+) -> Result<(), String> {
+    set_setting(conn, &provider_setting_key(provider, "api_key"), api_key)?;
+    if provider == "deepseek" {
+        set_setting(conn, "api_key", api_key)?;
+    }
+    Ok(())
+}
+
+fn ensure_token_profiles(
+    conn: &Connection,
+    provider: &str,
+) -> Result<(Vec<StoredApiTokenProfile>, Option<String>), String> {
+    let provider = normalize_provider_id(provider);
+    let mut profiles = load_token_profiles(conn, provider);
+    let mut active_id = get_setting(
+        conn,
+        &provider_setting_key(provider, "active_token_profile"),
+    )
+    .filter(|id| profiles.iter().any(|profile| profile.id == *id));
+
+    if profiles.is_empty() {
+        let api_key = stored_provider_api_key(conn, provider);
+        if !api_key.trim().is_empty() {
+            profiles.push(StoredApiTokenProfile {
+                id: "default".to_string(),
+                name: "默认 Token".to_string(),
+                api_key,
+            });
+            save_token_profiles(conn, provider, &profiles)?;
+        }
+    }
+
+    if active_id.is_none() {
+        active_id = profiles.first().map(|profile| profile.id.clone());
+        if let Some(id) = active_id.as_deref() {
+            set_setting(
+                conn,
+                &provider_setting_key(provider, "active_token_profile"),
+                id,
+            )?;
+        }
+    }
+
+    Ok((profiles, active_id))
+}
+
+fn mask_api_key(api_key: &str) -> String {
+    let suffix: String = api_key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if suffix.is_empty() {
+        "未填写".to_string()
+    } else {
+        format!("••••{}", suffix)
+    }
+}
+
+fn token_profile_list(
+    provider: &str,
+    profiles: &[StoredApiTokenProfile],
+    active_id: Option<&str>,
+) -> ApiTokenProfileList {
+    ApiTokenProfileList {
+        provider: normalize_provider_id(provider).to_string(),
+        active_id: active_id.map(str::to_string),
+        profiles: profiles
+            .iter()
+            .map(|profile| ApiTokenProfileSummary {
+                id: profile.id.clone(),
+                name: profile.name.clone(),
+                masked_key: mask_api_key(&profile.api_key),
+                active: active_id == Some(profile.id.as_str()),
+            })
+            .collect(),
+    }
+}
+
+pub fn list_api_token_profiles(
+    conn: &Connection,
+    provider: &str,
+) -> Result<ApiTokenProfileList, String> {
+    let provider = normalize_provider_id(provider);
+    let (profiles, active_id) = ensure_token_profiles(conn, provider)?;
+    Ok(token_profile_list(
+        provider,
+        &profiles,
+        active_id.as_deref(),
+    ))
+}
+
+pub fn upsert_api_token_profile(
+    conn: &Connection,
+    provider: &str,
+    profile_id: Option<&str>,
+    name: &str,
+    api_key: &str,
+) -> Result<ApiTokenProfileList, String> {
+    let provider = normalize_provider_id(provider);
+    let name = name.trim();
+    let api_key = api_key.trim();
+    if name.is_empty() {
+        return Err("请填写 Token 档案名称".to_string());
+    }
+    if api_key.is_empty() {
+        return Err("请填写 API Key".to_string());
+    }
+
+    let (mut profiles, _) = ensure_token_profiles(conn, provider)?;
+    let id = match profile_id.filter(|id| !id.trim().is_empty()) {
+        Some(id) => {
+            let profile = profiles
+                .iter_mut()
+                .find(|profile| profile.id == id)
+                .ok_or_else(|| "Token 档案不存在".to_string())?;
+            profile.name = name.to_string();
+            profile.api_key = api_key.to_string();
+            id.to_string()
+        }
+        None => {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| error.to_string())?
+                .as_nanos();
+            let id = format!("token-{}", timestamp);
+            profiles.push(StoredApiTokenProfile {
+                id: id.clone(),
+                name: name.to_string(),
+                api_key: api_key.to_string(),
+            });
+            id
+        }
+    };
+
+    save_token_profiles(conn, provider, &profiles)?;
+    set_setting(
+        conn,
+        &provider_setting_key(provider, "active_token_profile"),
+        &id,
+    )?;
+    set_setting(conn, "active_ai_provider", provider)?;
+    set_active_provider_api_key(conn, provider, api_key)?;
+    Ok(token_profile_list(provider, &profiles, Some(&id)))
+}
+
+pub fn activate_api_token_profile(
+    conn: &Connection,
+    provider: &str,
+    profile_id: &str,
+) -> Result<ApiTokenProfileList, String> {
+    let provider = normalize_provider_id(provider);
+    let (profiles, _) = ensure_token_profiles(conn, provider)?;
+    let profile = profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| "Token 档案不存在".to_string())?;
+
+    set_setting(
+        conn,
+        &provider_setting_key(provider, "active_token_profile"),
+        &profile.id,
+    )?;
+    set_setting(conn, "active_ai_provider", provider)?;
+    set_active_provider_api_key(conn, provider, &profile.api_key)?;
+    Ok(token_profile_list(provider, &profiles, Some(&profile.id)))
+}
+
+pub fn delete_api_token_profile(
+    conn: &Connection,
+    provider: &str,
+    profile_id: &str,
+) -> Result<ApiTokenProfileList, String> {
+    let provider = normalize_provider_id(provider);
+    let (mut profiles, active_id) = ensure_token_profiles(conn, provider)?;
+    let previous_len = profiles.len();
+    profiles.retain(|profile| profile.id != profile_id);
+    if profiles.len() == previous_len {
+        return Err("Token 档案不存在".to_string());
+    }
+
+    let next_active_id = if active_id.as_deref() == Some(profile_id) {
+        profiles.first().map(|profile| profile.id.clone())
+    } else {
+        active_id.filter(|id| profiles.iter().any(|profile| profile.id == *id))
+    };
+    let next_key = next_active_id
+        .as_deref()
+        .and_then(|id| profiles.iter().find(|profile| profile.id == id))
+        .map(|profile| profile.api_key.as_str())
+        .unwrap_or_default();
+
+    save_token_profiles(conn, provider, &profiles)?;
+    set_setting(
+        conn,
+        &provider_setting_key(provider, "active_token_profile"),
+        next_active_id.as_deref().unwrap_or_default(),
+    )?;
+    set_active_provider_api_key(conn, provider, next_key)?;
+    Ok(token_profile_list(
+        provider,
+        &profiles,
+        next_active_id.as_deref(),
+    ))
 }
 
 fn builtin_reading_profile(
@@ -433,10 +714,49 @@ fn sanitize_reading_profiles(profiles: Vec<ReadingPromptProfile>) -> Vec<Reading
 }
 
 pub fn get_settings(conn: &Connection) -> DeepSeekSettings {
+    let provider =
+        get_setting(conn, "active_ai_provider").unwrap_or_else(|| "deepseek".to_string());
+    get_provider_settings(conn, &provider)
+}
+
+pub fn get_provider_settings(conn: &Connection, provider: &str) -> DeepSeekSettings {
+    let provider = normalize_provider_id(provider).to_string();
+    let (default_base_url, default_model) = provider_defaults(&provider);
+    let legacy_api_key = (provider == "deepseek")
+        .then(|| get_setting(conn, "api_key"))
+        .flatten();
+    let legacy_base_url = (provider == "deepseek")
+        .then(|| get_setting(conn, "base_url"))
+        .flatten();
+    let legacy_model = (provider == "deepseek")
+        .then(|| get_setting(conn, "model"))
+        .flatten();
+
+    let active_profile_id = get_setting(
+        conn,
+        &provider_setting_key(&provider, "active_token_profile"),
+    );
+    let profile_api_key = load_token_profiles(conn, &provider)
+        .into_iter()
+        .find(|profile| active_profile_id.as_deref() == Some(profile.id.as_str()))
+        .map(|profile| profile.api_key);
+
     DeepSeekSettings {
-        api_key: get_setting(conn, "api_key").unwrap_or_default(),
-        base_url: get_setting(conn, "base_url").unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-        model: get_setting(conn, "model").unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+        provider: provider.clone(),
+        api_key: profile_api_key
+            .or_else(|| get_setting(conn, &provider_setting_key(&provider, "api_key")))
+            .or(legacy_api_key)
+            .unwrap_or_default(),
+        base_url: get_setting(conn, &provider_setting_key(&provider, "base_url"))
+            .filter(|value| !value.trim().is_empty())
+            .or(legacy_base_url)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| default_base_url.to_string()),
+        model: get_setting(conn, &provider_setting_key(&provider, "model"))
+            .filter(|value| !value.trim().is_empty())
+            .or(legacy_model)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| default_model.to_string()),
         system_prompt: get_setting(conn, "system_prompt")
             .unwrap_or_else(|| DEFAULT_PROMPT.to_string()),
         read_retention_days: get_setting(conn, "read_retention_days")
@@ -446,9 +766,38 @@ pub fn get_settings(conn: &Connection) -> DeepSeekSettings {
 }
 
 pub fn save_settings(conn: &Connection, settings: &DeepSeekSettings) -> Result<(), String> {
-    set_setting(conn, "api_key", &settings.api_key)?;
-    set_setting(conn, "base_url", &settings.base_url)?;
-    set_setting(conn, "model", &settings.model)?;
+    let provider = normalize_provider_id(&settings.provider);
+    set_setting(conn, "active_ai_provider", provider)?;
+    set_setting(
+        conn,
+        &provider_setting_key(provider, "api_key"),
+        &settings.api_key,
+    )?;
+    set_setting(
+        conn,
+        &provider_setting_key(provider, "base_url"),
+        &settings.base_url,
+    )?;
+    set_setting(
+        conn,
+        &provider_setting_key(provider, "model"),
+        &settings.model,
+    )?;
+    if provider == "deepseek" {
+        set_setting(conn, "api_key", &settings.api_key)?;
+        set_setting(conn, "base_url", &settings.base_url)?;
+        set_setting(conn, "model", &settings.model)?;
+    }
+    let (mut token_profiles, active_profile_id) = ensure_token_profiles(conn, provider)?;
+    if let Some(active_profile_id) = active_profile_id {
+        if let Some(profile) = token_profiles
+            .iter_mut()
+            .find(|profile| profile.id == active_profile_id)
+        {
+            profile.api_key = settings.api_key.clone();
+            save_token_profiles(conn, provider, &token_profiles)?;
+        }
+    }
     set_setting(conn, "system_prompt", &settings.system_prompt)?;
     set_setting(
         conn,
@@ -532,5 +881,73 @@ mod tests {
             .position(|profile| profile.id == "leq-read-deep-note")
             .unwrap();
         assert!(deep_index > 2);
+    }
+
+    #[test]
+    fn provider_settings_are_stored_independently() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        let mut deepseek = get_provider_settings(&conn, "deepseek");
+        deepseek.api_key = "deepseek-key".to_string();
+        save_settings(&conn, &deepseek).unwrap();
+
+        let mut openai = get_provider_settings(&conn, "openai");
+        openai.api_key = "openai-key".to_string();
+        save_settings(&conn, &openai).unwrap();
+
+        assert_eq!(
+            get_provider_settings(&conn, "deepseek").api_key,
+            "deepseek-key"
+        );
+        assert_eq!(get_provider_settings(&conn, "openai").api_key, "openai-key");
+        assert_eq!(get_settings(&conn).provider, "openai");
+    }
+
+    #[test]
+    fn legacy_api_key_becomes_a_masked_default_profile() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        set_setting(&conn, "api_key", "legacy-secret-1234").unwrap();
+
+        let list = list_api_token_profiles(&conn, "deepseek").unwrap();
+
+        assert_eq!(list.active_id.as_deref(), Some("default"));
+        assert_eq!(list.profiles.len(), 1);
+        assert_eq!(list.profiles[0].name, "默认 Token");
+        assert_eq!(list.profiles[0].masked_key, "••••1234");
+        assert_eq!(get_settings(&conn).api_key, "legacy-secret-1234");
+    }
+
+    #[test]
+    fn switching_profiles_changes_the_key_used_by_services() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        let first = upsert_api_token_profile(&conn, "deepseek", None, "主账号", "key-one").unwrap();
+        let first_id = first.active_id.unwrap();
+        upsert_api_token_profile(&conn, "deepseek", None, "备用账号", "key-two").unwrap();
+        assert_eq!(get_settings(&conn).api_key, "key-two");
+
+        activate_api_token_profile(&conn, "deepseek", &first_id).unwrap();
+
+        assert_eq!(get_settings(&conn).api_key, "key-one");
+    }
+
+    #[test]
+    fn deleting_the_active_profile_falls_back_to_the_next_profile() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        let first = upsert_api_token_profile(&conn, "openai", None, "A", "key-a").unwrap();
+        let first_id = first.active_id.unwrap();
+        let second = upsert_api_token_profile(&conn, "openai", None, "B", "key-b").unwrap();
+        let second_id = second.active_id.unwrap();
+
+        let list = delete_api_token_profile(&conn, "openai", &second_id).unwrap();
+
+        assert_eq!(list.active_id.as_deref(), Some(first_id.as_str()));
+        assert_eq!(get_settings(&conn).api_key, "key-a");
     }
 }
