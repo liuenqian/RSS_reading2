@@ -1387,7 +1387,7 @@ fn upsert_search_record(
                 link = CASE WHEN trim(link) = '' THEN ?2 ELSE link END,
                 summary = COALESCE(NULLIF(summary, ''), ?3),
                 summary_source = CASE WHEN (summary IS NULL OR trim(summary) = '') AND ?3 IS NOT NULL THEN 'pubmed' ELSE summary_source END,
-                author = COALESCE(NULLIF(author, ''), ?4),
+                author = COALESCE(NULLIF(?4, ''), author),
                 published_at = COALESCE(NULLIF(published_at, ''), ?5),
                 publication_date = COALESCE(NULLIF(publication_date, ''), ?5),
                 publication_date_raw = COALESCE(NULLIF(publication_date_raw, ''), ?6),
@@ -2530,8 +2530,14 @@ fn parse_authors(article: Node<'_, '_>) -> Option<String> {
                 return collective;
             }
             let last = direct_child_text(author, "LastName").unwrap_or_default();
+            let fore_name = direct_child_text(author, "ForeName").unwrap_or_default();
             let initials = direct_child_text(author, "Initials").unwrap_or_default();
-            let name = format!("{} {}", last, initials).trim().to_string();
+            let given_name = if fore_name.is_empty() {
+                initials
+            } else {
+                fore_name
+            };
+            let name = format!("{} {}", given_name, last).trim().to_string();
             (!name.is_empty()).then_some(name)
         })
         .collect::<Vec<_>>();
@@ -2759,8 +2765,8 @@ mod tests {
             <ArticleTitle>Immune <i>reprogramming</i> in sepsis</ArticleTitle>
             <Abstract><AbstractText Label="BACKGROUND">First part.</AbstractText><AbstractText>Second part.</AbstractText></Abstract>
             <AuthorList>
-              <Author><LastName>Li</LastName><Initials>Q</Initials><AffiliationInfo><Affiliation>Institute A</Affiliation></AffiliationInfo></Author>
-              <Author><LastName>Smith</LastName><Initials>AB</Initials></Author>
+              <Author><LastName>Li</LastName><ForeName>Qian</ForeName><Initials>Q</Initials><AffiliationInfo><Affiliation>Institute A</Affiliation></AffiliationInfo></Author>
+              <Author><LastName>Smith</LastName><ForeName>Alice Beth</ForeName><Initials>AB</Initials></Author>
             </AuthorList>
           </Article>
         </MedlineCitation>
@@ -3000,7 +3006,10 @@ mod tests {
             records[0].abstract_text.as_deref(),
             Some("BACKGROUND: First part.\n\nSecond part.")
         );
-        assert_eq!(records[0].authors.as_deref(), Some("Li Q, Smith AB"));
+        assert_eq!(
+            records[0].authors.as_deref(),
+            Some("Qian Li, Alice Beth Smith")
+        );
         assert_eq!(records[0].publication_date.as_deref(), Some("2026-07"));
         assert_eq!(
             records[0].publication_date_precision.as_deref(),

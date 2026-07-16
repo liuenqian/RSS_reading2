@@ -4,16 +4,21 @@ import test from 'node:test';
 
 const source = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
 
-test('PubMed preview runs AI assessment before enabling formal retrieval', () => {
+const html = await readFile(new URL('../src/index.html', import.meta.url), 'utf8');
+
+test('PubMed preview enables formal retrieval before optional AI assessment', () => {
   const previewCall = source.indexOf("invoke('preview_pubmed_search'");
   const assessmentCall = source.indexOf("invoke('assess_pubmed_search_preview'", previewCall);
-  const enableRetrieval = source.indexOf("document.getElementById('pubmed-retrieval-panel').disabled = false", assessmentCall);
+  const enableRetrieval = source.indexOf("document.getElementById('pubmed-retrieval-panel').disabled = false", previewCall);
 
   assert.notEqual(previewCall, -1);
   assert.notEqual(assessmentCall, -1);
   assert.notEqual(enableRetrieval, -1);
-  assert.ok(previewCall < assessmentCall);
-  assert.ok(assessmentCall < enableRetrieval);
+  assert.ok(previewCall < enableRetrieval);
+  assert.ok(enableRetrieval < assessmentCall);
+  assert.match(html, /id="pubmed-preview-ai-enabled"[^>]*type="checkbox"[^>]*checked/);
+  assert.match(source, /document\.getElementById\('pubmed-preview-ai-enabled'\)\?\.checked/);
+  assert.match(source, /document\.getElementById\('pubmed-preview-ai-enabled'\)\.checked = true/);
   assert.match(source, /data-use-suggested-query/);
   assert.match(source, /查准率估计/);
   assert.match(source, /查全风险/);

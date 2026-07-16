@@ -8,18 +8,32 @@ pub async fn build_pubmed_rss_url(query: String, limit: u32) -> Result<String, S
 }
 
 #[tauri::command]
-pub fn build_pubmed_author_query(
+pub async fn build_pubmed_author_query(
+    state: State<'_, DbState>,
     author_name: String,
     affiliation: Option<String>,
     start_date: Option<String>,
     end_date: Option<String>,
 ) -> Result<String, String> {
-    pubmed_service::build_author_query(
+    let settings = {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        settings_service::get_settings(&conn)
+    };
+    if settings.api_key.is_empty() {
+        return Err("请先在设置中配置当前 AI 服务的 API Key".to_string());
+    }
+
+    let (query, usage) = pubmed_service::natural_language_to_author_query(
+        &settings,
         &author_name,
         affiliation.as_deref(),
         start_date.as_deref(),
         end_date.as_deref(),
     )
+    .await?;
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    let _ = cost_service::record_usage(&conn, &settings.provider, &settings.model, &usage);
+    Ok(query)
 }
 
 #[tauri::command]

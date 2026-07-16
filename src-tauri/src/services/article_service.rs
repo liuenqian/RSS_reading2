@@ -339,6 +339,30 @@ pub async fn fetch_pubmed_first_affiliation(
     Ok(extract_first_affiliation(&xml))
 }
 
+#[tracing::instrument(skip(client))]
+pub async fn fetch_pubmed_authors(
+    client: &reqwest::Client,
+    pmid: &str,
+) -> Result<Option<String>, String> {
+    let response = client
+        .get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi")
+        .query(&[("db", "pubmed"), ("id", pmid), ("retmode", "xml")])
+        .send()
+        .await
+        .map_err(|e| format!("请求 PubMed EFetch 失败: {}", e))?;
+
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+
+    let xml = response
+        .text()
+        .await
+        .map_err(|e| format!("读取 PubMed 作者响应失败: {}", e))?;
+
+    Ok(extract_authors(&xml))
+}
+
 fn extract_first_affiliation(xml: &str) -> Option<String> {
     let doc = parse_pubmed_xml(xml)?;
     let article = doc
@@ -349,6 +373,37 @@ fn extract_first_affiliation(xml: &str) -> Option<String> {
         .find(|node| node.has_tag_name("Affiliation"))
         .map(node_text)?;
     (!aff.is_empty()).then_some(aff)
+}
+
+fn extract_authors(xml: &str) -> Option<String> {
+    let doc = parse_pubmed_xml(xml)?;
+    let article = doc
+        .descendants()
+        .find(|node| node.has_tag_name("Article"))?;
+    let names = article
+        .descendants()
+        .filter(|node| node.has_tag_name("Author"))
+        .filter_map(|author| {
+            let collective = direct_child_text(author, "CollectiveName");
+            if collective.is_some() {
+                return collective;
+            }
+            let last = direct_child_text(author, "LastName").unwrap_or_default();
+            let fore_name = direct_child_text(author, "ForeName").unwrap_or_default();
+            let initials = direct_child_text(author, "Initials").unwrap_or_default();
+            let given_name = if fore_name.is_empty() { initials } else { fore_name };
+            let name = format!("{} {}", given_name, last).trim().to_string();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect::<Vec<_>>();
+    (!names.is_empty()).then(|| names.join(", "))
+}
+
+fn direct_child_text(node: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
+    node.children()
+        .find(|child| child.has_tag_name(name))
+        .map(node_text)
+        .filter(|value| !value.is_empty())
 }
 
 /// Extract a PMID from a PubMed entry link. Handles every form PubMed RSS

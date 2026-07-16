@@ -10,12 +10,12 @@
             href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Noto+Serif+SC:wght@400;500;600;700&display=swap"
             rel="stylesheet"
         />
-        <link rel="stylesheet" href="styles.css" />
+        <link rel="stylesheet" href="styles.css?v=20260716-api-meter-switch" />
         <script src="/vendor/markdown-it.js"></script>
         <script src="/vendor/markdown-it-task-lists.js"></script>
         <script src="/vendor/markdown-it-footnote.js"></script>
         <script src="/vendor/purify.js"></script>
-        <script type="module" src="/main.js" defer></script>
+        <script type="module" src="/main.js?v=20260716-api-meter-switch" defer></script>
     </head>
 
     <body data-theme="light" data-accent="coral" data-font-scale="md">
@@ -68,12 +68,45 @@
             </div>
 
             <div class="toolbar-trailing">
-                <select
-                    id="toolbar-api-token"
-                    class="toolbar-token-select hidden"
-                    aria-label="切换 API Token"
-                    title="切换 API Token"
-                ></select>
+                <div id="toolbar-api-picker" class="toolbar-api-picker">
+                    <button
+                        id="toolbar-api-button"
+                        class="toolbar-api-button"
+                        type="button"
+                        aria-haspopup="listbox"
+                        aria-expanded="false"
+                        title="切换 API 配置"
+                    >
+                        <span id="toolbar-api-label" class="toolbar-api-label">切换 API</span>
+                        <svg class="toolbar-api-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="m4 6 4 4 4-4" />
+                        </svg>
+                    </button>
+                    <div id="toolbar-api-menu" class="toolbar-api-menu hidden" role="listbox" aria-label="已保存的 API 配置">
+                        <div class="toolbar-api-menu-title">已保存的 API</div>
+                        <div id="toolbar-api-list" class="toolbar-api-list"></div>
+                        <div class="cost-meter toolbar-cost-meter" id="cost-meter">
+                            <div class="cost-meter-top">
+                                <span>本月 AI 用量</span>
+                                <span class="cost-meter-value" id="cost-value">¥ 0.00</span>
+                            </div>
+                            <div class="cost-meter-bar">
+                                <div class="cost-meter-fill" id="cost-fill"></div>
+                            </div>
+                            <div class="cost-meter-bot">
+                                <span id="cost-chars">0 tokens</span>
+                                <span class="cost-meter-model" id="cost-model">deepseek-v4</span>
+                            </div>
+                        </div>
+                        <button id="btn-manage-api-tokens" class="toolbar-api-manage" type="button">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <circle cx="12" cy="12" r="3" />
+                                <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56V21h-4v-.08A1.7 1.7 0 0 0 9 19.37a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.63 15 1.7 1.7 0 0 0 3.08 14H3v-4h.08A1.7 1.7 0 0 0 4.63 9a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.63 1.7 1.7 0 0 0 10 3.08V3h4v.08A1.7 1.7 0 0 0 15 4.63a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.37 9 1.7 1.7 0 0 0 20.92 10H21v4h-.08A1.7 1.7 0 0 0 19.4 15Z" />
+                            </svg>
+                            <span>管理 API 配置</span>
+                        </button>
+                    </div>
+                </div>
                 <div class="capsule-group">
                     <button
                         id="btn-toggle-paper-chat-toolbar"
@@ -1643,6 +1676,25 @@
 
                         <div class="settings-card">
                             <div class="settings-card-header heatmap-card-header">
+                                <span>文献更新监测</span>
+                                <select
+                                    id="literature-growth-filter"
+                                    class="settings-select compact"
+                                    aria-label="筛选文献来源"
+                                >
+                                    <option value="all">全部来源</option>
+                                    <option value="pubmed">PubMed 检索</option>
+                                    <option value="feed">订阅源</option>
+                                </select>
+                            </div>
+                            <div class="settings-card-body literature-growth-body">
+                                <div id="literature-growth-summary" class="literature-growth-summary"></div>
+                                <div id="literature-growth-list" class="literature-growth-list"></div>
+                            </div>
+                        </div>
+
+                        <div class="settings-card">
+                            <div class="settings-card-header heatmap-card-header">
                                 <span>阅读热力图</span>
                                 <select
                                     id="heatmap-year"
@@ -2151,24 +2203,7 @@
                     </div>
                     <ul id="feed-list" class="feed-list sidebar-section-list"></ul>
 
-                    <!-- Cost meter -->
-                    <div class="cost-meter" id="cost-meter">
-                        <div class="cost-meter-top">
-                            <span>本月 AI 用量</span>
-                            <span class="cost-meter-value" id="cost-value"
-                                >¥ 0.00</span
-                            >
-                        </div>
-                        <div class="cost-meter-bar">
-                            <div class="cost-meter-fill" id="cost-fill"></div>
-                        </div>
-                        <div class="cost-meter-bot">
-                            <span id="cost-chars">0 tokens</span>
-                            <span class="cost-meter-model" id="cost-model"
-                                >deepseek-v4</span
-                            >
-                        </div>
-                    </div>
+                    <div id="sidebar-ai-tools" class="sidebar-ai-tools"></div>
 
                     <div id="global-status" class="global-status"></div>
                 </aside>
@@ -2193,6 +2228,7 @@
                                     <button id="btn-cancel-pubmed-run" class="pubmed-progress-cancel" type="button">取消</button>
                                 </div>
                             </div>
+                            <div class="entry-header-top">
                             <div class="entry-header-left">
                                 <div class="entry-reading-filter-section">
                                     <span class="entry-filter-section-label">阅读状态</span>
@@ -2467,6 +2503,35 @@
                                 </select>
                                 <button id="btn-pubmed-ai-screen" class="btn btn-secondary btn-sm hidden" type="button">AI 辅助筛选</button>
                             </div>
+                            </div>
+                            <div class="entry-sort-row">
+                                <label class="entry-sort-control" for="entry-sort">
+                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                        <path d="M4 3v10M2 5l2-2 2 2M12 13V3M10 11l2 2 2-2" />
+                                    </svg>
+                                    <span class="entry-sort-label">排序</span>
+                                    <select id="entry-sort" aria-label="文献排序方式">
+                                        <option value="default">默认顺序</option>
+                                        <option value="year">年份</option>
+                                        <option value="if">影响因子</option>
+                                        <option value="jcr">JCR 分区</option>
+                                        <option value="cas">中科院分区</option>
+                                    </select>
+                                </label>
+                                <button
+                                    id="entry-sort-direction"
+                                    class="entry-sort-direction"
+                                    type="button"
+                                    aria-label="切换排序方向"
+                                    title="切换排序方向"
+                                    aria-pressed="false"
+                                >
+                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                        <path d="M5 2.5v11M2.5 5 5 2.5 7.5 5M11 13.5v-11M8.5 11 11 13.5l2.5-2.5" />
+                                    </svg>
+                                    <span class="entry-sort-direction-label">↓</span>
+                                </button>
+                            </div>
                         </div>
                         <ul id="entry-items" class="entry-items">
                             <li class="entry-empty">
@@ -2517,6 +2582,21 @@
                                     </svg>
                                 </span>
                                 <span>简报</span>
+                            </div>
+                            <div class="briefing-sort-row">
+                                <label class="entry-sort-control briefing-sort-control" for="briefing-sort">
+                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                        <path d="M4 3v10M2 5l2-2 2 2M12 13V3M10 11l2 2 2-2" />
+                                    </svg>
+                                    <span class="entry-sort-label">排序</span>
+                                    <select id="briefing-sort" aria-label="简报排序方式">
+                                        <option value="date">生成时间</option>
+                                        <option value="count">文献数量</option>
+                                    </select>
+                                </label>
+                                <button id="briefing-sort-direction" class="entry-sort-direction" type="button" aria-label="切换简报排序方向" title="切换简报排序方向" aria-pressed="false">
+                                    <span class="entry-sort-direction-label">↓</span>
+                                </button>
                             </div>
                             <button
                                 class="briefing-gen-btn"
@@ -2758,6 +2838,27 @@
                                         ></span>
                                     </div>
 
+                                    <div class="detail-view-tabs" role="tablist" aria-label="文献详情视图">
+                                        <button
+                                            id="btn-detail-view-summary"
+                                            class="detail-view-tab active"
+                                            type="button"
+                                            role="tab"
+                                            aria-selected="true"
+                                            aria-controls="detail-summary-view"
+                                        >摘要</button>
+                                        <button
+                                            id="btn-detail-view-pdf"
+                                            class="detail-view-tab"
+                                            type="button"
+                                            role="tab"
+                                            aria-selected="false"
+                                            aria-controls="detail-pdf-view"
+                                            disabled
+                                        >PDF</button>
+                                    </div>
+
+                                    <div id="detail-summary-view" role="tabpanel" aria-labelledby="btn-detail-view-summary">
                                     <div class="detail-tags-section">
                                         <div class="detail-tags-header">
                                             <div class="detail-tags-label">
@@ -2923,6 +3024,58 @@
                                             </div>
                                         </div>
                                     </div>
+                                    </div>
+
+                                    <section
+                                        id="detail-pdf-view"
+                                        class="detail-pdf-view hidden"
+                                        role="tabpanel"
+                                        aria-labelledby="btn-detail-view-pdf"
+                                    >
+                                        <div class="detail-pdf-toolbar">
+                                            <div class="detail-pdf-control-group" aria-label="PDF 页码">
+                                                <button id="btn-pdf-previous" class="btn-icon" type="button" title="上一页" aria-label="上一页">
+                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m10 3.5-4.5 4.5 4.5 4.5" /></svg>
+                                                </button>
+                                                <input id="pdf-page-input" class="detail-pdf-page-input" type="number" min="1" value="1" aria-label="当前页码" />
+                                                <span id="pdf-page-count" class="detail-pdf-page-count">/ 0</span>
+                                                <button id="btn-pdf-next" class="btn-icon" type="button" title="下一页" aria-label="下一页">
+                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 3.5 4.5 4.5L6 12.5" /></svg>
+                                                </button>
+                                            </div>
+                                            <div class="detail-pdf-control-group" aria-label="PDF 缩放">
+                                                <button id="btn-pdf-zoom-out" class="btn-icon" type="button" title="缩小" aria-label="缩小">
+                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="4" /><path d="M10 10l3 3M5 7h4" /></svg>
+                                                </button>
+                                                <span id="pdf-zoom-label" class="detail-pdf-zoom-label">100%</span>
+                                                <button id="btn-pdf-zoom-in" class="btn-icon" type="button" title="放大" aria-label="放大">
+                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="4" /><path d="M10 10l3 3M5 7h4M7 5v4" /></svg>
+                                                </button>
+                                                <button id="btn-pdf-fit-width" class="btn-icon active" type="button" title="适合宽度" aria-label="适合宽度">
+                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4v8M13.5 4v8M5.5 8h5M5.5 8 7 6.5M5.5 8 7 9.5M10.5 8 9 6.5M10.5 8 9 9.5" /></svg>
+                                                </button>
+                                            </div>
+                                            <div class="detail-pdf-search">
+                                                <input id="pdf-search-input" type="search" placeholder="搜索 PDF" aria-label="搜索 PDF" />
+                                                <button id="btn-pdf-search-next" class="btn-icon" type="button" title="查找下一处" aria-label="查找下一处">
+                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="4" /><path d="M10 10l3 3" /></svg>
+                                                </button>
+                                                <span id="pdf-search-status" class="detail-pdf-search-status" role="status"></span>
+                                            </div>
+                                            <div class="detail-pdf-actions">
+                                                <button id="btn-pdf-open-external" class="btn-icon" type="button" title="在浏览器中打开 PDF" aria-label="在浏览器中打开 PDF">
+                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 3h4v4M13 3 7 9M12 9.5V12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h2.5" /></svg>
+                                                </button>
+                                                <button id="btn-pdf-download" class="btn-icon" type="button" title="下载 PDF" aria-label="下载 PDF">
+                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2.5v7M5.2 6.8 8 9.6l2.8-2.8M3 12.5h10" /></svg>
+                                                </button>
+                                            </div>
+                                        </div>
+                                        <div id="detail-pdf-status" class="detail-pdf-status" role="status"></div>
+                                        <div id="detail-pdf-stage" class="detail-pdf-stage">
+                                            <canvas id="detail-pdf-canvas" aria-label="PDF 当前页面"></canvas>
+                                        </div>
+                                    </section>
                                 </div>
                             </div>
                         </div>
@@ -3281,12 +3434,12 @@
                     </div>
                     <div id="feed-add-author-builder" class="pubmed-author-builder hidden">
                         <label class="pubmed-field">
-                            <span>作者姓名</span>
-                            <input id="feed-author-name" type="text" maxlength="200" placeholder="例如：Jia Guo 或 Guo Jia" />
+                            <span>作者姓名或描述</span>
+                            <input id="feed-author-name" type="text" maxlength="200" placeholder="例如：梁瑞政，或北京安贞医院的梁瑞政医生" />
                         </label>
                         <label class="pubmed-field">
                             <span>机构（可选）</span>
-                            <input id="feed-author-affiliation" type="text" maxlength="200" placeholder="建议填写英文机构关键词" />
+                            <input id="feed-author-affiliation" type="text" maxlength="200" placeholder="例如：首都医科大学附属北京安贞医院" />
                         </label>
                         <div class="pubmed-author-date-grid">
                             <label class="pubmed-field">
@@ -3351,12 +3504,12 @@
                     </div>
                     <div id="pubmed-author-builder" class="pubmed-author-builder hidden">
                         <label class="pubmed-field">
-                            <span>作者姓名</span>
-                            <input id="pubmed-author-name" type="text" maxlength="200" placeholder="例如：Jia Guo 或 Guo Jia" />
+                            <span>作者姓名或描述</span>
+                            <input id="pubmed-author-name" type="text" maxlength="200" placeholder="例如：梁瑞政，或北京安贞医院的梁瑞政医生" />
                         </label>
                         <label class="pubmed-field">
                             <span>机构（可选）</span>
-                            <input id="pubmed-author-affiliation" type="text" maxlength="200" placeholder="建议填写英文机构关键词" />
+                            <input id="pubmed-author-affiliation" type="text" maxlength="200" placeholder="例如：首都医科大学附属北京安贞医院" />
                         </label>
                         <div class="pubmed-author-date-grid">
                             <label class="pubmed-field">
@@ -3369,7 +3522,7 @@
                             </label>
                         </div>
                         <div class="pubmed-field-action">
-                            <button id="btn-build-pubmed-author-query" class="btn btn-secondary" type="button">构建作者检索式</button>
+                            <button id="btn-build-pubmed-author-query" class="btn btn-secondary" type="button">AI 构建作者检索式</button>
                         </div>
                     </div>
                     <label class="pubmed-field">
@@ -3381,7 +3534,19 @@
                         <input id="pubmed-search-name" type="text" maxlength="80" placeholder="例如：脓毒症免疫重编程" />
                     </label>
                     <div class="pubmed-preview-actions">
+                        <button id="btn-open-pubmed-query" class="btn btn-secondary" type="button">
+                            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <path d="M9 3h4v4" />
+                                <path d="m13 3-6 6" />
+                                <path d="M12 9.5V12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h2.5" />
+                            </svg>
+                            <span>在 PubMed 检查</span>
+                        </button>
                         <button id="btn-preview-pubmed-search" class="btn btn-secondary" type="button">预览结果</button>
+                        <label class="pubmed-preview-ai-option">
+                            <input id="pubmed-preview-ai-enabled" type="checkbox" checked />
+                            <span>AI 评估</span>
+                        </label>
                         <span id="pubmed-preview-status" class="pubmed-preview-status"></span>
                     </div>
                     <div id="pubmed-preview-results" class="pubmed-preview-results hidden"></div>

@@ -1,6 +1,7 @@
-use crate::models::{DeepSeekSettings, Entry, ReadingStats, TokenUsage};
+use crate::models::{DeepSeekSettings, Entry, LiteratureGrowthSource, ReadingStats, TokenUsage};
 use crate::services::{article_service, pubmed_search_service, translate_service};
 use rusqlite::{params, types::Value, Connection};
+use std::collections::HashMap;
 
 pub fn list_entries(conn: &Connection, feed_id: Option<i64>) -> Result<Vec<Entry>, String> {
     let retention_days: i64 = conn
@@ -295,6 +296,153 @@ fn parse_entry_tags(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+fn literature_growth_sources(conn: &Connection) -> Result<Vec<LiteratureGrowthSource>, String> {
+    let mut source_stmt = conn
+        .prepare(
+            "WITH source_entries AS (
+                SELECT
+                    'feed' AS source_kind,
+                    f.id AS source_id,
+                    COALESCE(NULLIF(trim(f.title), ''), f.url) AS source_name,
+                    m.first_seen_at,
+                    CASE
+                        WHEN length(trim(e.publication_date)) >= 10 THEN substr(trim(e.publication_date), 1, 10)
+                        WHEN length(trim(e.publication_date)) = 7 THEN trim(e.publication_date) || '-15'
+                        WHEN length(trim(e.publication_date)) = 6 THEN substr(trim(e.publication_date), 1, 4) || '-' || substr(trim(e.publication_date), 5, 2) || '-15'
+                        WHEN length(trim(e.publication_date)) = 4 THEN trim(e.publication_date) || '-07-01'
+                        WHEN length(trim(e.published_at)) >= 10 THEN substr(trim(e.published_at), 1, 10)
+                        ELSE date(m.first_seen_at, 'localtime')
+                    END AS activity_day
+                FROM feeds f
+                LEFT JOIN entry_feed_memberships m ON m.feed_id = f.id
+                LEFT JOIN entries e ON e.id = m.entry_id
+
+                UNION ALL
+
+                SELECT
+                    'pubmed' AS source_kind,
+                    p.id AS source_id,
+                    p.name AS source_name,
+                    pse.first_seen_at,
+                    CASE
+                        WHEN length(trim(e.publication_date)) >= 10 THEN substr(trim(e.publication_date), 1, 10)
+                        WHEN length(trim(e.publication_date)) = 7 THEN trim(e.publication_date) || '-15'
+                        WHEN length(trim(e.publication_date)) = 6 THEN substr(trim(e.publication_date), 1, 4) || '-' || substr(trim(e.publication_date), 5, 2) || '-15'
+                        WHEN length(trim(e.publication_date)) = 4 THEN trim(e.publication_date) || '-07-01'
+                        WHEN length(trim(e.published_at)) >= 10 THEN substr(trim(e.published_at), 1, 10)
+                        ELSE date(pse.first_seen_at, 'localtime')
+                    END AS activity_day
+                FROM pubmed_searches p
+                LEFT JOIN pubmed_search_entries pse ON pse.search_id = p.id
+                LEFT JOIN entries e ON e.id = pse.entry_id
+            )
+            SELECT
+                source_kind,
+                source_id,
+                source_name,
+                COUNT(first_seen_at) AS total_entries,
+                COALESCE(SUM(CASE
+                    WHEN activity_day >= date('now', 'localtime', '-6 days')
+                    THEN 1 ELSE 0 END), 0) AS last_7_days,
+                COALESCE(SUM(CASE
+                    WHEN activity_day BETWEEN date('now', 'localtime', '-13 days')
+                        AND date('now', 'localtime', '-7 days')
+                    THEN 1 ELSE 0 END), 0) AS previous_7_days,
+                COALESCE(SUM(CASE
+                    WHEN activity_day >= date('now', 'localtime', '-29 days')
+                    THEN 1 ELSE 0 END), 0) AS last_30_days,
+                MAX(first_seen_at) AS last_added_at
+            FROM source_entries
+            GROUP BY source_kind, source_id, source_name
+            ORDER BY last_30_days DESC, source_name COLLATE NOCASE",
+        )
+        .map_err(|e| format!("准备文献增长统计失败: {}", e))?;
+    let rows = source_stmt
+        .query_map([], |row| {
+            let last_30_days = row.get::<_, i64>(6)?;
+            Ok(LiteratureGrowthSource {
+                source_kind: row.get(0)?,
+                source_id: row.get(1)?,
+                name: row.get(2)?,
+                total_entries: row.get(3)?,
+                last_7_days: row.get(4)?,
+                previous_7_days: row.get(5)?,
+                last_30_days,
+                weekly_average: (last_30_days as f64 * 7.0 / 30.0 * 10.0).round() / 10.0,
+                last_added_at: row.get(7)?,
+                day_counts: Vec::new(),
+            })
+        })
+        .map_err(|e| format!("读取文献增长统计失败: {}", e))?;
+    let mut sources = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("读取文献增长统计失败: {}", e))?;
+
+    let mut daily_stmt = conn
+        .prepare(
+            "WITH source_entries AS (
+                SELECT
+                    'feed' AS source_kind,
+                    m.feed_id AS source_id,
+                    CASE
+                        WHEN length(trim(e.publication_date)) >= 10 THEN substr(trim(e.publication_date), 1, 10)
+                        WHEN length(trim(e.publication_date)) = 7 THEN trim(e.publication_date) || '-15'
+                        WHEN length(trim(e.publication_date)) = 6 THEN substr(trim(e.publication_date), 1, 4) || '-' || substr(trim(e.publication_date), 5, 2) || '-15'
+                        WHEN length(trim(e.publication_date)) = 4 THEN trim(e.publication_date) || '-07-01'
+                        WHEN length(trim(e.published_at)) >= 10 THEN substr(trim(e.published_at), 1, 10)
+                        ELSE date(m.first_seen_at, 'localtime')
+                    END AS activity_day
+                FROM entry_feed_memberships m
+                JOIN entries e ON e.id = m.entry_id
+                UNION ALL
+                SELECT
+                    'pubmed' AS source_kind,
+                    pse.search_id AS source_id,
+                    CASE
+                        WHEN length(trim(e.publication_date)) >= 10 THEN substr(trim(e.publication_date), 1, 10)
+                        WHEN length(trim(e.publication_date)) = 7 THEN trim(e.publication_date) || '-15'
+                        WHEN length(trim(e.publication_date)) = 6 THEN substr(trim(e.publication_date), 1, 4) || '-' || substr(trim(e.publication_date), 5, 2) || '-15'
+                        WHEN length(trim(e.publication_date)) = 4 THEN trim(e.publication_date) || '-07-01'
+                        WHEN length(trim(e.published_at)) >= 10 THEN substr(trim(e.published_at), 1, 10)
+                        ELSE date(pse.first_seen_at, 'localtime')
+                    END AS activity_day
+                FROM pubmed_search_entries pse
+                JOIN entries e ON e.id = pse.entry_id
+            )
+            SELECT source_kind, source_id, activity_day AS day, COUNT(*)
+            FROM source_entries
+            WHERE activity_day >= date('now', 'localtime', '-29 days')
+            GROUP BY source_kind, source_id, day
+            ORDER BY day",
+        )
+        .map_err(|e| format!("准备每日文献增长统计失败: {}", e))?;
+    let daily_rows = daily_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|e| format!("读取每日文献增长统计失败: {}", e))?;
+    let mut daily_by_source: HashMap<(String, i64), Vec<(String, i64)>> = HashMap::new();
+    for row in daily_rows {
+        let (source_kind, source_id, day, count) =
+            row.map_err(|e| format!("读取每日文献增长统计失败: {}", e))?;
+        daily_by_source
+            .entry((source_kind, source_id))
+            .or_default()
+            .push((day, count));
+    }
+    for source in &mut sources {
+        source.day_counts = daily_by_source
+            .remove(&(source.source_kind.clone(), source.source_id))
+            .unwrap_or_default();
+    }
+    Ok(sources)
+}
+
 /// Compute reading stats from the immutable `reading_events` log. Decoupled
 /// from `entries` so feed deletion and retention-based pruning never erase a
 /// user's historical stats.
@@ -401,6 +549,7 @@ pub fn reading_stats(conn: &Connection) -> Result<ReadingStats, String> {
         .map_err(|e| format!("统计订阅源阅读失败: {}", e))?
         .filter_map(|r| r.ok())
         .collect();
+    let growth_sources = literature_growth_sources(conn)?;
 
     Ok(ReadingStats {
         total_entries,
@@ -409,6 +558,7 @@ pub fn reading_stats(conn: &Connection) -> Result<ReadingStats, String> {
         fetched_day_counts,
         read_hour_counts,
         feed_read_counts,
+        growth_sources,
     })
 }
 
@@ -476,8 +626,8 @@ pub async fn generate_flavor_pool(
 #[cfg(test)]
 mod tests {
     use super::{
-        escape_like_pattern, normalize_entry_tag, normalize_search_terms, parse_entry_tags,
-        search_entries,
+        escape_like_pattern, literature_growth_sources, normalize_entry_tag,
+        normalize_search_terms, parse_entry_tags, search_entries,
     };
     use rusqlite::Connection;
 
@@ -565,6 +715,64 @@ mod tests {
         assert_eq!(
             feed_scoped.iter().map(|entry| entry.id).collect::<Vec<_>>(),
             vec![1]
+        );
+    }
+
+    #[test]
+    fn literature_growth_separates_feed_and_pubmed_windows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE feeds (id INTEGER PRIMARY KEY, title TEXT, url TEXT NOT NULL);
+             CREATE TABLE entries (id INTEGER PRIMARY KEY, publication_date TEXT, published_at TEXT);
+             CREATE TABLE entry_feed_memberships (entry_id INTEGER, feed_id INTEGER, first_seen_at TEXT NOT NULL);
+             CREATE TABLE pubmed_searches (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE pubmed_search_entries (search_id INTEGER, entry_id INTEGER, first_seen_at TEXT NOT NULL);
+             INSERT INTO feeds VALUES (1, 'Nature RSS', 'https://example.com/rss');
+             INSERT INTO entries VALUES
+                (1, date('now', '-1 day'), NULL),
+                (2, date('now', '-8 days'), NULL),
+                (3, date('now', '-20 days'), NULL),
+                (4, date('now'), NULL),
+                (5, date('now', '-2 days'), NULL),
+                (6, date('now', '-3 days'), NULL),
+                (7, date('now', '-10 days'), NULL),
+                (8, date('now', '-40 days'), NULL);
+             INSERT INTO entry_feed_memberships VALUES
+                (1, 1, datetime('now')),
+                (2, 1, datetime('now')),
+                (3, 1, datetime('now'));
+             INSERT INTO pubmed_searches VALUES (7, '心肌纤维化');
+             INSERT INTO pubmed_search_entries VALUES
+                (7, 4, datetime('now')),
+                (7, 5, datetime('now')),
+                (7, 6, datetime('now')),
+                (7, 7, datetime('now')),
+                (7, 8, datetime('now'));",
+        )
+        .unwrap();
+
+        let sources = literature_growth_sources(&conn).unwrap();
+        let feed = sources
+            .iter()
+            .find(|source| source.source_kind == "feed")
+            .unwrap();
+        assert_eq!((feed.total_entries, feed.last_7_days), (3, 1));
+        assert_eq!((feed.previous_7_days, feed.last_30_days), (1, 3));
+        assert_eq!(feed.weekly_average, 0.7);
+
+        let pubmed = sources
+            .iter()
+            .find(|source| source.source_kind == "pubmed")
+            .unwrap();
+        assert_eq!((pubmed.total_entries, pubmed.last_7_days), (5, 3));
+        assert_eq!((pubmed.previous_7_days, pubmed.last_30_days), (1, 4));
+        assert_eq!(
+            pubmed
+                .day_counts
+                .iter()
+                .map(|(_, count)| count)
+                .sum::<i64>(),
+            4
         );
     }
 }

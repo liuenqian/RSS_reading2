@@ -106,6 +106,8 @@ pub fn run() {
             entry_cmd::add_entry_tag,
             entry_cmd::fetch_abstract,
             entry_cmd::fetch_affiliation,
+            entry_cmd::fetch_entry_authors,
+            entry_cmd::fetch_entry_pdf,
             entry_cmd::fetch_entry_identifiers,
             entry_cmd::resolve_entry_pdf_url,
             entry_cmd::ensure_free_fulltext_status,

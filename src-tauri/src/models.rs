@@ -453,6 +453,20 @@ pub struct Briefing {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiteratureGrowthSource {
+    pub source_kind: String,
+    pub source_id: i64,
+    pub name: String,
+    pub total_entries: i64,
+    pub last_7_days: i64,
+    pub previous_7_days: i64,
+    pub last_30_days: i64,
+    pub weekly_average: f64,
+    pub last_added_at: Option<String>,
+    pub day_counts: Vec<(String, i64)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadingStats {
     pub total_entries: i64,
     pub total_read: i64,
@@ -469,6 +483,7 @@ pub struct ReadingStats {
     /// deleted — the frontend prefers the live feed title when available and
     /// falls back to the snapshot otherwise.
     pub feed_read_counts: Vec<(i64, Option<String>, i64)>,
+    pub growth_sources: Vec<LiteratureGrowthSource>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

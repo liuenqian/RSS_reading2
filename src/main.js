@@ -2,6 +2,7 @@ import {
   DEFAULT_TRANSLATION_CONCURRENCY,
   runConcurrentQueue,
 } from './translation_queue.js';
+import { normalizeEntrySortMode, sortEntries } from './entry_sort.js';
 const { invoke } = window.__TAURI__.core;
 const markdownitFactory = globalThis.markdownit;
 const markdownitTaskLists = globalThis.markdownitTaskLists;
@@ -113,7 +114,8 @@ function decorateMarkdownHtml(html) {
 // ── DOM refs ──────────────────────────────────────
 let settingsView, mainView, contentArea;
 let btnSettings, btnSidebar, btnRefresh, refreshIcon, btnTogglePaperChatToolbar;
-let toolbarSubtitle, toolbarApiTokenSelect;
+let toolbarSubtitle, toolbarApiPicker, toolbarApiButton, toolbarApiLabel;
+let toolbarApiMenu, toolbarApiList, btnManageApiTokens;
 let providerSelect, apiKeyInput, baseUrlInput, modelInput, systemPromptInput;
 let btnToggleApiKey, btnTest, btnSaveSettings, btnSaveGeneral;
 let apiTokenProfileSelect, apiTokenProfileNameInput, btnNewApiToken, btnDeleteApiToken;
@@ -127,9 +129,9 @@ let pubmedProgressEl, pubmedProgressFill, pubmedProgressLabel, btnRunPubmedSearc
 let pubmedExportFormat, btnExportPubmed;
 let pubmedSnapshotSelect, btnSavePubmedSnapshot, btnDeletePubmedSnapshot;
 let pubmedBulkStatus, btnPubmedAiScreen;
-let entryListEl, briefingListEl, briefingItemsEl;
+let entryListEl, briefingListEl, briefingItemsEl, briefingSortSelect, briefingSortDirection;
 let entryItemsEl, entryFilter;
-let entryMetricIfFilter, entryMetricQFilter, entryMetricBFilter, entryMetricTopFilter, entryTagFilter;
+let entrySortSelect, entrySortDirection, entryMetricIfFilter, entryMetricQFilter, entryMetricBFilter, entryMetricTopFilter, entryTagFilter;
 let entryMetricFilterSummaryCount;
 let entryBulkActions, entryBulkCount, btnEntrySelectMode, btnEntryBulkSelectAll, btnEntryBulkSelectUnnoted, btnEntryBulkSelectNoted, btnEntryBulkInvert, btnEntryBulkDeselect, entryBulkExportFormat, btnEntryBulkExport, entryBulkExistingMode, btnEntryBulkGenerate, btnEntryBulkClear;
 let detailPanelEl, paperChatPanelEl, briefingDetailEl;
@@ -138,6 +140,8 @@ let detailEmpty, detailContent, detailTitle, detailJournal, detailAffiliation;
 let detailIdentifierStrip;
 let detailPublicationDate, detailDateSub;
 let detailSummaryContent, detailSummarySection, detailSummaryRetry;
+let detailSummaryView, detailPdfView, btnDetailViewSummary, btnDetailViewPdf;
+let btnPdfOpenExternal, btnPdfDownload;
 let detailReadingNotesContent;
 let detailPaperChatHint, detailPaperChatMessages, detailPaperChatScopes, paperChatInput, paperChatComposer;
 let paperChatScopeCaption, btnSendPaperChat, btnClearPaperChat, btnTogglePaperChat, btnShowPaperChat;
@@ -173,6 +177,11 @@ let hasConfiguredApiKey = false;
 let sidebarCollapsed = false;
 let entryFilterValue = 'all';   // 'all' | 'unread' | 'starred' | 'reading-notes'
 let entryTagFilterValue = 'all';
+let entrySortMode = 'default';
+let entrySortField = 'default';
+let entrySortDirectionMode = 'desc';
+let briefingSortField = 'date';
+let briefingSortDirectionMode = 'desc';
 let currentTheme = 'light';
 let currentAccent = 'coral';
 let currentFontScale = 'md';
@@ -192,9 +201,13 @@ const entryMetricFilters = { if: 'all', q: 'all', b: 'all', top: 'all' };
 const freeFulltextCheckInFlight = new Set();
 const entryPdfLinkCache = new Map();
 const entryPdfLinkCheckInFlight = new Map();
+let detailPdfReader = null;
+let detailPdfUrl = '';
+let detailPdfRequestId = 0;
 let entrySelectionMode = false;
 let selectedEntryIds = new Set();
 let apiTokenProfileData = { provider: 'deepseek', active_id: null, profiles: [] };
+let toolbarApiProfileRefreshId = 0;
 
 const SCI_HUB_BASE_URL = 'https://www.sci-hub.st/';
 const SCI_HUB_LAST_RELIABLE_PUBLICATION_YEAR = 2020;
@@ -264,6 +277,9 @@ const SIDEBAR_SECTION_COLLAPSED_STORAGE_KEY = 'sidebar-section-collapsed-v1';
 const ENTRY_FILTER_STORAGE_KEY = 'entry-filter-v1';
 const ENTRY_FILTER_OPTIONS = ['all', 'unread', 'starred', 'reading-notes'];
 const ENTRY_METRIC_FILTER_STORAGE_KEY = 'entry-metric-filters-v1';
+const ENTRY_SORT_STORAGE_KEY = 'entry-sort-v2';
+const LEGACY_ENTRY_SORT_STORAGE_KEY = 'entry-sort-v1';
+const BRIEFING_SORT_STORAGE_KEY = 'briefing-sort-v1';
 const ENTRY_METRIC_FILTER_OPTIONS = {
   if: ['all', 'ge5', 'ge10', 'ge20', 'na'],
   q: ['all', 'Q1', 'Q2', 'Q3', 'Q4', 'na'],
@@ -537,9 +553,12 @@ function updateCostMeter() {
   const breakdown = summary?.breakdown || [];
   const activeProvider = providerSelect?.value || 'deepseek';
   const activeMeta = AI_PROVIDER_META[activeProvider] || AI_PROVIDER_META.deepseek;
-  el('cost-model').textContent = breakdown.length > 0
-    ? `${AI_PROVIDER_META[breakdown[0].provider]?.label || breakdown[0].provider} · ${breakdown[0].model}`
-    : `${activeMeta.label} · ${(modelInput?.value || activeMeta.model).trim()}`;
+  const costModel = el('cost-model');
+  if (costModel) {
+    costModel.textContent = breakdown.length > 0
+      ? `${AI_PROVIDER_META[breakdown[0].provider]?.label || breakdown[0].provider} · ${breakdown[0].model}`
+      : `${activeMeta.label} · ${(modelInput?.value || activeMeta.model).trim()}`;
+  }
   // Detailed hover-tooltip so curious users can see the full breakdown
   // (cache hit/miss/output tokens per model).
   const meter = document.getElementById('cost-meter');
@@ -656,18 +675,122 @@ function activeTokenProfile() {
   ) || null;
 }
 
-function fillTokenProfileSelect(select, profiles, activeId, { toolbar = false } = {}) {
+function fillTokenProfileSelect(select, profiles, activeId) {
   if (!select) return;
   select.replaceChildren();
   profiles.forEach(profile => {
     const option = document.createElement('option');
     option.value = profile.id;
-    option.textContent = toolbar
-      ? `${AI_PROVIDER_META[apiTokenProfileData.provider]?.label || apiTokenProfileData.provider} · ${profile.name}`
-      : `${profile.name} · ${profile.masked_key}`;
+    option.textContent = `${profile.name} · ${profile.masked_key}`;
     select.appendChild(option);
   });
   if (activeId) select.value = activeId;
+}
+
+function closeToolbarApiMenu() {
+  if (!toolbarApiMenu || !toolbarApiButton) return;
+  toolbarApiMenu.classList.add('hidden');
+  toolbarApiButton.setAttribute('aria-expanded', 'false');
+}
+
+function toggleToolbarApiMenu() {
+  if (!toolbarApiMenu || !toolbarApiButton) return;
+  const shouldOpen = toolbarApiMenu.classList.contains('hidden');
+  toolbarApiMenu.classList.toggle('hidden', !shouldOpen);
+  toolbarApiButton.setAttribute('aria-expanded', String(shouldOpen));
+}
+
+function renderToolbarApiProfiles(profileLists) {
+  if (!toolbarApiPicker || !toolbarApiList || !toolbarApiLabel) return;
+
+  const availableLists = profileLists.filter(list => (list.profiles || []).length > 0);
+  const profileCount = availableLists.reduce(
+    (total, list) => total + list.profiles.length,
+    0
+  );
+  const currentProvider = activeProviderId();
+  const currentList = availableLists.find(list => list.provider === currentProvider);
+  const currentProfile = currentList?.profiles.find(
+    profile => profile.id === currentList.active_id
+  );
+  const currentProviderLabel = AI_PROVIDER_META[currentProvider]?.label || currentProvider;
+
+  toolbarApiLabel.textContent = currentProfile
+    ? `${currentProviderLabel} · ${currentProfile.name}`
+    : '配置 API';
+  toolbarApiPicker.classList.remove('hidden');
+
+  toolbarApiList.replaceChildren();
+  if (profileCount === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'toolbar-api-empty';
+    empty.textContent = '尚未保存 API 配置';
+    toolbarApiList.appendChild(empty);
+  }
+  availableLists.forEach(list => {
+    const providerLabel = AI_PROVIDER_META[list.provider]?.label || list.provider;
+    const group = document.createElement('div');
+    group.className = 'toolbar-api-provider';
+
+    const heading = document.createElement('div');
+    heading.className = 'toolbar-api-provider-label';
+    heading.textContent = providerLabel;
+    group.appendChild(heading);
+
+    list.profiles.forEach(profile => {
+      const isActive = list.provider === currentProvider
+        && profile.id === list.active_id;
+      const option = document.createElement('button');
+      option.type = 'button';
+      option.className = 'toolbar-api-option' + (isActive ? ' active' : '');
+      option.dataset.provider = list.provider;
+      option.dataset.profileId = profile.id;
+      option.setAttribute('role', 'option');
+      option.setAttribute('aria-selected', String(isActive));
+
+      const providerMark = document.createElement('span');
+      providerMark.className = 'toolbar-api-provider-mark';
+      providerMark.textContent = providerLabel
+        .split(/\s+/)
+        .map(part => part[0])
+        .join('')
+        .slice(0, 3)
+        .toUpperCase();
+
+      const copy = document.createElement('span');
+      copy.className = 'toolbar-api-option-copy';
+      const name = document.createElement('span');
+      name.className = 'toolbar-api-option-name';
+      name.textContent = profile.name;
+      const meta = document.createElement('span');
+      meta.className = 'toolbar-api-option-meta';
+      meta.textContent = profile.masked_key;
+      copy.append(name, meta);
+
+      const check = document.createElement('span');
+      check.className = 'toolbar-api-check';
+      check.textContent = isActive ? '✓' : '';
+      check.setAttribute('aria-hidden', 'true');
+
+      option.append(providerMark, copy, check);
+      group.appendChild(option);
+    });
+    toolbarApiList.appendChild(group);
+  });
+}
+
+async function refreshToolbarApiProfiles() {
+  const requestId = ++toolbarApiProfileRefreshId;
+  const providers = Object.keys(AI_PROVIDER_META);
+  const results = await Promise.allSettled(
+    providers.map(async provider => invoke('list_api_token_profiles', { provider }))
+  );
+  if (requestId !== toolbarApiProfileRefreshId) return;
+
+  const profileLists = results
+    .filter(result => result.status === 'fulfilled')
+    .map(result => result.value);
+  renderToolbarApiProfiles(profileLists);
 }
 
 function renderApiTokenProfiles({ preserveDraft = false } = {}) {
@@ -677,17 +800,6 @@ function renderApiTokenProfiles({ preserveDraft = false } = {}) {
     profiles,
     apiTokenProfileData.active_id
   );
-  fillTokenProfileSelect(
-    toolbarApiTokenSelect,
-    profiles,
-    apiTokenProfileData.active_id,
-    { toolbar: true }
-  );
-
-  if (toolbarApiTokenSelect) {
-    toolbarApiTokenSelect.classList.toggle('hidden', profiles.length < 2);
-    toolbarApiTokenSelect.disabled = profiles.length < 2;
-  }
   if (btnDeleteApiToken) btnDeleteApiToken.disabled = profiles.length === 0;
 
   if (preserveDraft && apiTokenProfileSelect) {
@@ -709,13 +821,17 @@ async function loadApiTokenProfiles(provider) {
     if (activeProviderId() !== provider) return;
     apiTokenProfileData = data;
     renderApiTokenProfiles();
+    await refreshToolbarApiProfiles();
   } catch (error) {
     showSettingsStatus('加载 Token 档案失败: ' + error, 'error');
   }
 }
 
-async function activateApiTokenProfile(profileId) {
-  const provider = activeProviderId();
+async function activateApiTokenProfile(
+  profileId,
+  provider = activeProviderId(),
+  { fromToolbar = false } = {}
+) {
   if (!profileId || profileId === '__new__') return;
   try {
     apiTokenProfileData = await invoke('activate_api_token_profile', {
@@ -723,17 +839,22 @@ async function activateApiTokenProfile(profileId) {
       profileId,
     });
     const settings = await invoke('get_provider_settings', { provider });
-    if (activeProviderId() !== provider) return;
     applyProviderSettings(settings);
     renderApiTokenProfiles();
+    await refreshToolbarApiProfiles();
     updateView(!!settings.api_key);
-    showSettingsStatus(`已切换到 ${activeTokenProfile()?.name || '当前 Token'}`, 'success');
+    const profileName = activeTokenProfile()?.name || '当前 Token';
+    const providerLabel = AI_PROVIDER_META[provider]?.label || provider;
+    showSettingsStatus(`已切换到 ${profileName}`, 'success');
+    if (fromToolbar) setGlobalStatus(`已切换到 ${providerLabel} · ${profileName}`, 'success');
     setTimeout(() => showSettingsStatus('', ''), 2200);
     invoke('start_translation_pipeline').catch(() => {});
     if (provider === 'deepseek') refreshDeepSeekBalance({ silent: true });
   } catch (error) {
     renderApiTokenProfiles();
+    await refreshToolbarApiProfiles();
     showSettingsStatus('切换失败: ' + error, 'error');
+    if (fromToolbar) setGlobalStatus('API 切换失败: ' + error, 'error');
   }
 }
 
@@ -760,6 +881,7 @@ async function deleteCurrentApiTokenProfile() {
     const settings = await invoke('get_provider_settings', { provider });
     applyProviderSettings(settings);
     renderApiTokenProfiles();
+    await refreshToolbarApiProfiles();
     updateView(!!settings.api_key);
     showSettingsStatus('Token 已删除', 'success');
   } catch (error) {
@@ -910,6 +1032,7 @@ async function saveTranslationSettings() {
     }
     await invoke('save_settings', { settings });
     renderApiTokenProfiles();
+    await refreshToolbarApiProfiles();
     showSettingsStatus('设置已保存', 'success');
     updateView(!!settings.api_key);
     // If the user just configured (or updated) the API key, kick the pipeline so
@@ -1960,6 +2083,7 @@ function openPubmedSearchModal({ source = null, editing = false } = {}) {
   document.getElementById('pubmed-preview-results').classList.add('hidden');
   document.getElementById('btn-create-pubmed-search').disabled = true;
   document.getElementById('pubmed-retrieval-panel').disabled = true;
+  document.getElementById('pubmed-preview-ai-enabled').checked = true;
   pubmedPreview = null;
   pubmedPreviewAssessment = null;
   updatePubmedRetrievalUi();
@@ -1976,6 +2100,7 @@ async function buildPubmedAuthorQuery() {
   const button = document.getElementById('btn-build-pubmed-author-query');
   const status = document.getElementById('pubmed-preview-status');
   button.disabled = true;
+  status.textContent = 'AI 正在识别作者和机构并构建检索式…';
   try {
     const query = await invoke('build_pubmed_author_query', {
       authorName,
@@ -1983,12 +2108,13 @@ async function buildPubmedAuthorQuery() {
       startDate: startDate || null,
       endDate: endDate || null,
     });
+    loadCostSummary();
     document.getElementById('pubmed-batch-query-input').value = query;
     const nameInput = document.getElementById('pubmed-search-name');
-    if (!nameInput.value.trim()) nameInput.value = `${authorName} 文献`;
+    if (!nameInput.value.trim()) nameInput.value = `【作者｜${authorName}】`;
     document.getElementById('pubmed-question').value = `持续关注作者 ${authorName}${affiliation ? `（${affiliation}）` : ''} 的 PubMed 文献`;
     invalidatePubmedPreview();
-    status.textContent = '作者检索式已构建，请预览并核对作者与机构';
+    status.textContent = 'AI 作者检索式已构建，请预览并核对作者与机构';
   } catch (e) {
     status.textContent = `构建失败：${e}`;
   } finally {
@@ -2023,6 +2149,21 @@ async function generatePubmedQuery() {
   } finally {
     button.disabled = false;
   }
+}
+
+function openPubmedQueryInBrowser() {
+  const input = document.getElementById('pubmed-batch-query-input');
+  const query = input?.value.trim() || '';
+  const status = document.getElementById('pubmed-preview-status');
+  if (!query) {
+    if (status) status.textContent = '请先填写 PubMed 检索式';
+    input?.focus();
+    return;
+  }
+
+  const url = new URL('https://pubmed.ncbi.nlm.nih.gov/');
+  url.searchParams.set('term', query);
+  openUrl(url.toString());
 }
 
 function pubmedPreviewEntryAssessmentMeta(status) {
@@ -2219,9 +2360,12 @@ async function previewPubmedSearch() {
   try {
     pubmedPreview = await invoke('preview_pubmed_search', { query, options });
     renderPubmedPreviewResults(pubmedPreview);
+    document.getElementById('pubmed-retrieval-panel').disabled = false;
+    updatePubmedRetrievalUi();
 
     const shouldAssess = pubmedSearchBuilderMode === 'topic'
       && question
+      && document.getElementById('pubmed-preview-ai-enabled')?.checked
       && (pubmedPreview.entries || []).length > 0;
     if (shouldAssess) {
       status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇，AI 正在评估 ${pubmedPreview.entries.length} 篇题名与摘要…`;
@@ -2240,10 +2384,13 @@ async function previewPubmedSearch() {
         status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇 · AI 初判失败`;
       }
     } else {
-      status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇${pubmedSearchBuilderMode === 'topic' ? ' · 填写研究问题后可进行 AI 初判' : ''}`;
+      const assessmentHint = pubmedSearchBuilderMode === 'topic'
+        && document.getElementById('pubmed-preview-ai-enabled')?.checked
+        && !question
+        ? ' · 填写研究问题后可进行 AI 初判'
+        : '';
+      status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇${assessmentHint}`;
     }
-    document.getElementById('pubmed-retrieval-panel').disabled = false;
-    updatePubmedRetrievalUi();
   } catch (e) {
     pubmedPreview = null;
     pubmedPreviewAssessment = null;
@@ -3228,13 +3375,14 @@ async function createFeedFromModal() {
   status.textContent = '';
   try {
     if (feedAddMode === 'author') {
-      status.textContent = '正在生成作者检索式…';
+      status.textContent = 'AI 正在识别作者和机构并构建检索式…';
       const query = await invoke('build_pubmed_author_query', {
         authorName,
         affiliation: document.getElementById('feed-author-affiliation').value.trim() || null,
         startDate: document.getElementById('feed-author-start-date').value || null,
         endDate: document.getElementById('feed-author-end-date').value || null,
       });
+      loadCostSummary();
       const pubmedLimit = clampPubmedLimit(document.getElementById('feed-author-limit').value);
       status.textContent = '正在生成 PubMed RSS…';
       const generatedUrl = await invoke('build_pubmed_rss_url', { query, limit: pubmedLimit });
@@ -3643,7 +3791,7 @@ function getFilteredEntries(entries = allEntries) {
   if (hasActiveEntryMetricFilters()) {
     filtered = filtered.filter(matchesEntryMetricFilters);
   }
-  return filtered;
+  return sortEntries(filtered, entrySortMode, lookupJournalMetrics);
 }
 
 function getFilteredPubmedEntries(entries = allEntries) {
@@ -3702,7 +3850,7 @@ function getFilteredPubmedEntries(entries = allEntries) {
       default: return nullLast(left.publication_sort_key, right.publication_sort_key, -1);
     }
   });
-  return filtered;
+  return sortEntries(filtered, entrySortMode, lookupJournalMetrics);
 }
 
 function metricIfValue(entry) {
@@ -4186,13 +4334,14 @@ function showReadingProfilePickerMenu(x, y, onSelect) {
 
 async function setEntryRead(entry, isRead) {
   const prev = entry.is_read;
+  const listScrollTop = entryItemsEl?.scrollTop ?? 0;
   entry.is_read = isRead;
   const g = globalEntries.find(e => e.id === entry.id);
   if (g) {
     g.is_read = isRead;
     if (isRead && !g.read_at) g.read_at = new Date().toISOString();
   }
-  renderEntryList(allEntries);
+  renderEntryList(allEntries, { preserveScrollTop: listScrollTop });
   updateOverviewCounts();
   renderFeedList(allFeeds);
   const feed = allFeeds.find(f => f.id === entry.feed_id);
@@ -4202,7 +4351,7 @@ async function setEntryRead(entry, isRead) {
   } catch (e) {
     entry.is_read = prev;
     if (g) g.is_read = prev;
-    renderEntryList(allEntries);
+    renderEntryList(allEntries, { preserveScrollTop: listScrollTop });
     updateOverviewCounts();
     renderFeedList(allFeeds);
     setGlobalStatus('更新已读状态失败: ' + e, 'error');
@@ -4260,6 +4409,64 @@ function renderMetricBadges(metrics, { compact = false } = {}) {
 function parseMetricIf(value) {
   const match = String(value || '').trim().match(/[\d.]+/);
   return match ? parseFloat(match[0]) : null;
+}
+
+function persistEntrySortMode() {
+  try {
+    localStorage.setItem(
+      ENTRY_SORT_STORAGE_KEY,
+      entrySortField === 'default' ? 'default' : `${entrySortField}-${entrySortDirectionMode}`,
+    );
+  } catch (error) {
+    console.warn('保存文献排序失败:', error);
+  }
+}
+
+function restoreEntrySortMode() {
+  try {
+    const stored = localStorage.getItem(ENTRY_SORT_STORAGE_KEY)
+      || localStorage.getItem(LEGACY_ENTRY_SORT_STORAGE_KEY)
+      || 'default';
+    const normalized = normalizeEntrySortMode(stored);
+    if (normalized === 'default') {
+      entrySortField = 'default';
+      entrySortDirectionMode = 'desc';
+    } else {
+      const [field, direction] = normalized.split('-');
+      entrySortField = ['year', 'if', 'jcr', 'cas'].includes(field) ? field : 'default';
+      entrySortDirectionMode = direction === 'asc' ? 'asc' : 'desc';
+    }
+    syncEntrySortMode();
+  } catch (error) {
+    entrySortField = 'default';
+    entrySortDirectionMode = 'desc';
+    syncEntrySortMode();
+    console.warn('恢复文献排序失败:', error);
+  }
+}
+
+function syncEntrySortMode() {
+  entrySortMode = entrySortField === 'default'
+    ? 'default'
+    : `${entrySortField}-${entrySortDirectionMode}`;
+}
+
+function defaultEntrySortDirection(field) {
+  return field === 'jcr' || field === 'cas' ? 'asc' : 'desc';
+}
+
+function syncEntrySortControl() {
+  syncEntrySortMode();
+  if (entrySortSelect && entrySortSelect.value !== entrySortField) {
+    entrySortSelect.value = entrySortField;
+  }
+  if (entrySortDirection) {
+    const isAscending = entrySortDirectionMode === 'asc';
+    entrySortDirection.setAttribute('aria-pressed', String(isAscending));
+    entrySortDirection.title = isAscending ? '当前为升序，点击切换为降序' : '当前为降序，点击切换为升序';
+    entrySortDirection.querySelector('.entry-sort-direction-label').textContent = isAscending ? '↑' : '↓';
+    entrySortDirection.disabled = entrySortField === 'default';
+  }
 }
 
 function normalizeEntryMetricFilterValue(key, value) {
@@ -5214,6 +5421,7 @@ async function loadReadingNotes(entryId) {
   const section = document.getElementById('detail-reading-notes-section');
   const content = detailReadingNotesContent;
   if (!section || !content) return;
+  const listScrollTop = entryItemsEl?.scrollTop ?? 0;
 
   const targetEntry = currentEntry;
   if (targetEntry?.id === entryId && targetEntry?.has_reading_note) {
@@ -5227,7 +5435,7 @@ async function loadReadingNotes(entryId) {
   try {
     const notes = await invoke('list_reading_notes', { entryId });
     applyEntryUpdate(entryId, x => { x.has_reading_note = notes.length > 0; });
-    renderEntryList(allEntries);
+    renderEntryList(allEntries, { preserveScrollTop: listScrollTop });
     if (currentEntry?.id === entryId) {
       renderReadingNotes(notes);
     }
@@ -5853,10 +6061,10 @@ async function loadEntries(feedId) {
   }
 }
 
-function renderEntryList(entries) {
+function renderEntryList(entries, options = {}) {
   syncCompactFilterSummaries();
   if (mode === 'pubmed' || mode === 'kept' || mode !== 'search') {
-    renderPubmedEntryList(entries);
+    renderPubmedEntryList(entries, options);
     return;
   }
   syncEntryFilterControls();
@@ -5894,7 +6102,7 @@ function renderEntryList(entries) {
     const hasReadingNote = !!entry.has_reading_note;
     const isBulkSelected = entrySelectionMode && selectedEntryIds.has(entry.id);
     const titles = displayTitles(entry);
-    const timeStr = entry.published_at ? timeAgo(entry.published_at) : '';
+    const timeStr = entry.published_at ? formatSlashDate(entry.published_at) : '';
     const source = journalName(entry);
 
     // Visual translation status — spinner during work, small error pill on failure.
@@ -5975,13 +6183,15 @@ function renderEntryList(entries) {
       showEntryContextMenu(e.clientX, e.clientY, entry);
     });
 
-    entryItemsEl.appendChild(li);
+  entryItemsEl.appendChild(li);
   });
+
+  restoreEntryListScrollTop(options.preserveScrollTop);
 
   syncEntryBulkActions();
 }
 
-function renderPubmedEntryList(entries) {
+function renderPubmedEntryList(entries, options = {}) {
   syncEntryFilterControls();
   syncEntryMetricFilterControls();
   updateTopEntryFilterCounts(entries);
@@ -6017,7 +6227,9 @@ function renderPubmedEntryList(entries) {
     const metrics = renderMetricBadges(lookupJournalMetrics(entry), { compact: true });
     const publication = isPubmedList
       ? formatPubmedPublicationDate(entry)
-      : (entry.publication_date || (entry.published_at ? timeAgo(entry.published_at) : ''));
+      : (entry.publication_date
+        ? formatSlashDate(entry.publication_date)
+        : (entry.published_at ? formatSlashDate(entry.published_at) : ''));
     const titles = displayTitles(entry);
     const isStarred = starredIds().has(entry.id);
     const source = entry.journal || journalName(entry);
@@ -6088,7 +6300,7 @@ function renderPubmedEntryList(entries) {
       if (event.target.closest('input, select, button')) return;
       showDetail(entry);
       if (!entry.is_read) await setEntryRead(entry, true);
-      else renderEntryList(allEntries);
+      else renderEntryList(allEntries, { preserveScrollTop: entryItemsEl?.scrollTop ?? 0 });
     });
     li.addEventListener('contextmenu', event => {
       event.preventDefault();
@@ -6111,7 +6323,16 @@ function renderPubmedEntryList(entries) {
     });
     entryItemsEl.appendChild(more);
   }
+  restoreEntryListScrollTop(options.preserveScrollTop);
   syncEntryBulkActions();
+}
+
+function restoreEntryListScrollTop(scrollTop) {
+  if (scrollTop == null || !entryItemsEl) return;
+  entryItemsEl.scrollTop = scrollTop;
+  requestAnimationFrame(() => {
+    if (entryItemsEl) entryItemsEl.scrollTop = scrollTop;
+  });
 }
 
 function formatPubmedPublicationDate(entry) {
@@ -6119,12 +6340,7 @@ function formatPubmedPublicationDate(entry) {
     return entry.publication_date_raw || entry.publication_date || '';
   }
   const value = entry.publication_date || '';
-  if (/^\d{4}-\d{2}/.test(value)) {
-    const [year, month] = value.split('-');
-    return `${year}${month}`;
-  }
-  if (/^\d{4}$/.test(value)) return value;
-  return entry.publication_date_raw || value;
+  return formatSlashDate(value) || entry.publication_date_raw || value;
 }
 
 async function updatePubmedScreeningStatus(entry, status) {
@@ -6168,7 +6384,12 @@ function pubmedStatusLabel(status) {
 function showDetail(entry) {
   const entryChanged = currentEntry?.id !== entry.id;
   currentEntry = entry;
-  if (entryChanged) resetPaperGraph();
+  if (entryChanged) {
+    resetPaperGraph();
+    detailPdfRequestId += 1;
+    detailPdfUrl = '';
+    setDetailViewMode('summary');
+  }
   paperChatScope = 'single';
   detailEmpty.classList.add('hidden');
   detailContent.classList.remove('hidden');
@@ -6180,6 +6401,7 @@ function showDetail(entry) {
   applyAffiliation(entry);
   renderDetailIdentifiers(entry);
   ensureAffiliationLoaded(entry);
+  ensureAuthorsLoaded(entry);
   ensureEntryIdentifiersLoaded(entry);
 
   detailDateSub.textContent = formatPublicationDate(entry);
@@ -6252,6 +6474,87 @@ function syncDetailExternalActions(entry) {
   btnDetailSciHub.onclick = btnDetailSciHub.disabled ? null : () => openUrl(sciHubUrl);
 }
 
+function setDetailViewMode(view) {
+  const showPdf = view === 'pdf' && !!detailPdfUrl;
+  detailSummaryView?.classList.toggle('hidden', showPdf);
+  detailPdfView?.classList.toggle('hidden', !showPdf);
+  btnDetailViewSummary?.classList.toggle('active', !showPdf);
+  btnDetailViewSummary?.setAttribute('aria-selected', String(!showPdf));
+  btnDetailViewPdf?.classList.toggle('active', showPdf);
+  btnDetailViewPdf?.setAttribute('aria-selected', String(showPdf));
+  btnDetailPdf?.classList.toggle('active', showPdf);
+}
+
+function pdfReaderPageKey(entryId) {
+  return `pdf-reader-page-v1-${entryId}`;
+}
+
+function restorePdfReaderPage(entryId) {
+  try {
+    return Math.max(1, Number(localStorage.getItem(pdfReaderPageKey(entryId))) || 1);
+  } catch {
+    return 1;
+  }
+}
+
+function persistPdfReaderPage(entryId, pageNumber) {
+  if (!entryId) return;
+  try {
+    localStorage.setItem(pdfReaderPageKey(entryId), String(pageNumber));
+  } catch {}
+}
+
+async function ensureDetailPdfReader() {
+  if (detailPdfReader) return detailPdfReader;
+  const { PdfReader } = await import('./pdf_reader.js');
+  detailPdfReader = new PdfReader({
+    view: detailPdfView,
+    stage: document.getElementById('detail-pdf-stage'),
+    canvas: document.getElementById('detail-pdf-canvas'),
+    status: document.getElementById('detail-pdf-status'),
+    previous: document.getElementById('btn-pdf-previous'),
+    next: document.getElementById('btn-pdf-next'),
+    pageInput: document.getElementById('pdf-page-input'),
+    pageCount: document.getElementById('pdf-page-count'),
+    zoomOut: document.getElementById('btn-pdf-zoom-out'),
+    zoomIn: document.getElementById('btn-pdf-zoom-in'),
+    fitWidth: document.getElementById('btn-pdf-fit-width'),
+    zoomLabel: document.getElementById('pdf-zoom-label'),
+    searchInput: document.getElementById('pdf-search-input'),
+    searchNext: document.getElementById('btn-pdf-search-next'),
+    searchStatus: document.getElementById('pdf-search-status'),
+  }, {
+    onPageChange: persistPdfReaderPage,
+  });
+  return detailPdfReader;
+}
+
+async function openDetailPdfView() {
+  if (!currentEntry || !detailPdfUrl) return;
+  const entry = currentEntry;
+  const requestId = ++detailPdfRequestId;
+  setDetailViewMode('pdf');
+  const reader = await ensureDetailPdfReader();
+  if (reader.entryId === entry.id && reader.document) {
+    reader.renderPage();
+    return;
+  }
+
+  reader.setStatus('正在获取全文 PDF…', 'loading');
+  try {
+    const binary = await invoke('fetch_entry_pdf', { entryId: entry.id });
+    if (requestId !== detailPdfRequestId || currentEntry?.id !== entry.id) return;
+    await reader.load(binary, {
+      entryId: entry.id,
+      page: restorePdfReaderPage(entry.id),
+    });
+  } catch (error) {
+    if (requestId !== detailPdfRequestId || currentEntry?.id !== entry.id) return;
+    console.error('内置 PDF 阅读失败:', error);
+    reader.setStatus(`无法在应用内读取 PDF：${error}`, 'error');
+  }
+}
+
 function entryPdfIdentity(entry) {
   return [entry.id, entry.doi || '', entry.pmid || '', entry.pmcid || ''].join('|');
 }
@@ -6268,14 +6571,24 @@ function syncDetailPdfAction(entry) {
   btnDetailPdf.setAttribute('aria-busy', 'true');
   btnDetailPdf.title = '正在检查全文 PDF…';
   btnDetailPdf.onclick = null;
+  if (btnDetailViewPdf) {
+    btnDetailViewPdf.disabled = true;
+    btnDetailViewPdf.title = '正在检查全文 PDF…';
+  }
   ensureEntryPdfLink(entry, identity);
 }
 
 function applyDetailPdfUrl(url) {
+  detailPdfUrl = url || '';
   btnDetailPdf.removeAttribute('aria-busy');
   btnDetailPdf.disabled = !url;
-  btnDetailPdf.title = url ? '打开全文 PDF' : '未找到可直接打开的全文 PDF';
-  btnDetailPdf.onclick = url ? () => openUrl(url) : null;
+  btnDetailPdf.title = url ? '在详情中阅读 PDF' : '未找到可直接打开的全文 PDF';
+  btnDetailPdf.onclick = url ? openDetailPdfView : null;
+  if (btnDetailViewPdf) {
+    btnDetailViewPdf.disabled = !url;
+    btnDetailViewPdf.title = url ? '在详情中阅读 PDF' : '未找到可直接打开的全文 PDF';
+  }
+  if (!url) setDetailViewMode('summary');
 }
 
 async function ensureEntryPdfLink(entry, identity) {
@@ -6912,6 +7225,30 @@ async function ensureAffiliationLoaded(entry) {
     console.warn('fetch_affiliation 失败:', e);
   } finally {
     entry._affiliationLoading = false;
+  }
+}
+
+async function ensureAuthorsLoaded(entry) {
+  if (!entry || entry._authorsLoaded || !entry.link?.includes('pubmed.ncbi.nlm.nih.gov')) return;
+  if (entry._authorsLoading) return;
+  entry._authorsLoading = true;
+  try {
+    const authors = await invoke('fetch_entry_authors', { entryId: entry.id });
+    entry._authorsLoaded = true;
+    if (authors) {
+      applyEntryUpdate(entry.id, item => { item.author = authors; });
+      if (currentEntry?.id === entry.id) {
+        const authorEl = document.getElementById('detail-author');
+        const authorSep = document.getElementById('detail-author-sep');
+        const formatted = formatAuthors(authors);
+        if (authorEl) authorEl.textContent = formatted;
+        authorSep?.classList.toggle('hidden', !formatted);
+      }
+    }
+  } catch (e) {
+    console.warn('fetch_entry_authors 失败:', e);
+  } finally {
+    entry._authorsLoading = false;
   }
 }
 
@@ -7799,6 +8136,8 @@ async function loadBriefings() {
   } catch {
     BRIEFINGS = [];
   }
+  restoreBriefingSort();
+  syncBriefingSortControl();
   renderBriefingList();
   updateOverviewCounts();
 }
@@ -7863,11 +8202,50 @@ function briefingMatchesLiteratureSearchQuery(briefing, query) {
 
 function filteredBriefingsForCurrentQuery() {
   const query = literatureSearchInput?.value.trim() || '';
-  return query ? BRIEFINGS.filter(briefing => briefingMatchesLiteratureSearchQuery(briefing, query)) : BRIEFINGS;
+  const filtered = query ? BRIEFINGS.filter(briefing => briefingMatchesLiteratureSearchQuery(briefing, query)) : BRIEFINGS;
+  const direction = briefingSortDirectionMode === 'asc' ? 1 : -1;
+  return [...filtered].sort((left, right) => {
+    if (briefingSortField === 'count') {
+      return ((left.counts?.articles || 0) - (right.counts?.articles || 0)) * direction;
+    }
+    const leftDate = Date.parse(left.date || left.created_at || left.generated_at || '') || 0;
+    const rightDate = Date.parse(right.date || right.created_at || right.generated_at || '') || 0;
+    return (leftDate - rightDate) * direction;
+  });
+}
+
+function persistBriefingSort() {
+  try {
+    localStorage.setItem(BRIEFING_SORT_STORAGE_KEY, `${briefingSortField}-${briefingSortDirectionMode}`);
+  } catch (error) {
+    console.warn('保存简报排序失败:', error);
+  }
+}
+
+function restoreBriefingSort() {
+  try {
+    const [field, direction] = String(localStorage.getItem(BRIEFING_SORT_STORAGE_KEY) || 'date-desc').split('-');
+    briefingSortField = ['date', 'count'].includes(field) ? field : 'date';
+    briefingSortDirectionMode = direction === 'asc' ? 'asc' : 'desc';
+  } catch {
+    briefingSortField = 'date';
+    briefingSortDirectionMode = 'desc';
+  }
+}
+
+function syncBriefingSortControl() {
+  if (briefingSortSelect) briefingSortSelect.value = briefingSortField;
+  if (briefingSortDirection) {
+    const isAscending = briefingSortDirectionMode === 'asc';
+    briefingSortDirection.setAttribute('aria-pressed', String(isAscending));
+    briefingSortDirection.title = isAscending ? '当前为升序，点击切换为降序' : '当前为降序，点击切换为升序';
+    briefingSortDirection.querySelector('.entry-sort-direction-label').textContent = isAscending ? '↑' : '↓';
+  }
 }
 
 function renderBriefingList() {
   if (!briefingItemsEl) return;
+  syncBriefingSortControl();
   briefingItemsEl.innerHTML = '';
 
   const visibleBriefings = filteredBriefingsForCurrentQuery();
@@ -8761,11 +9139,132 @@ async function renderReadingStats() {
   setupStatsPeriodSwitch();
   setupHeatmapYearSelect();
   applyStatsPeriod();
+  setupLiteratureGrowthFilter();
+  renderLiteratureGrowth(stats.growth_sources || []);
   renderFeedPrefsFromCounts(stats.feed_read_counts || []);
 
   // Easter-egg copy refresh runs detached so a slow provider round trip never
   // blocks the stats render — local pool always paints first.
   maybeRefreshFlavorPool();
+}
+
+function setupLiteratureGrowthFilter() {
+  const filter = document.getElementById('literature-growth-filter');
+  if (!filter || filter.dataset.bound) return;
+  filter.dataset.bound = '1';
+  filter.addEventListener('change', () => {
+    renderLiteratureGrowth(cachedReadingStats?.growth_sources || []);
+  });
+}
+
+function literatureGrowthTrend(source) {
+  const current = Number(source.last_7_days || 0);
+  const previous = Number(source.previous_7_days || 0);
+  if (current === 0) return { label: '近期无发表', className: 'idle' };
+  if (previous === 0) return { label: '开始发表', className: 'accelerating' };
+  const change = (current - previous) / previous;
+  if (change >= 0.25) return { label: '发表加快', className: 'accelerating' };
+  if (change <= -0.25) return { label: '发表放缓', className: 'slowing' };
+  return { label: '发表平稳', className: 'stable' };
+}
+
+function parseSqliteTimestamp(value) {
+  if (!value) return null;
+  const normalized = value.includes('T') ? value : value.replace(' ', 'T');
+  const date = new Date(/[zZ]|[+-]\d\d:\d\d$/.test(normalized) ? normalized : `${normalized}Z`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function formatLiteratureGrowthLastAdded(value) {
+  const date = parseSqliteTimestamp(value);
+  if (!date) return '尚无记录';
+  const elapsedDays = Math.max(0, Math.floor((Date.now() - date.getTime()) / 86400000));
+  if (elapsedDays === 0) return '今天';
+  if (elapsedDays === 1) return '昨天';
+  if (elapsedDays < 30) return `${elapsedDays} 天前`;
+  return date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
+}
+
+function formatLiteratureGrowthDayLabel(value) {
+  const [, month, day] = String(value || '').split('-');
+  if (!month || !day) return value || '';
+  return `${Number(month)}/${Number(day)}`;
+}
+
+function renderLiteratureGrowthSparkline(dayCounts) {
+  const counts = new Map(dayCounts || []);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const days = [];
+  for (let offset = 29; offset >= 0; offset--) {
+    const day = new Date(today);
+    day.setDate(today.getDate() - offset);
+    const key = ymdLocal(day);
+    days.push({ key, count: Number(counts.get(key) || 0) });
+  }
+  const max = Math.max(1, ...days.map(day => day.count));
+  return days.map(day => {
+    const height = day.count ? Math.max(12, Math.round(day.count / max * 100)) : 4;
+    const dateLabel = formatLiteratureGrowthDayLabel(day.key);
+    return `
+      <div class="literature-growth-point" title="${day.key}: ${day.count} 篇" aria-label="${dateLabel}，${day.count} 篇">
+        <span class="literature-growth-count${day.count ? ' has-value' : ''}">${day.count}</span>
+        <span class="literature-growth-bar-track">
+          <span class="literature-growth-bar${day.count ? ' has-value' : ''}" style="height:${height}%"></span>
+        </span>
+        <time class="literature-growth-day" datetime="${day.key}">${dateLabel}</time>
+      </div>`;
+  }).join('');
+}
+
+function renderLiteratureGrowth(sources) {
+  const list = document.getElementById('literature-growth-list');
+  const summary = document.getElementById('literature-growth-summary');
+  if (!list || !summary) return;
+  const filter = document.getElementById('literature-growth-filter')?.value || 'all';
+  const visible = (sources || [])
+    .filter(source => filter === 'all' || source.source_kind === filter)
+    .sort((left, right) => (
+      Number(right.last_7_days || 0) - Number(left.last_7_days || 0)
+      || Number(right.last_30_days || 0) - Number(left.last_30_days || 0)
+      || String(left.name || '').localeCompare(String(right.name || ''), 'zh-CN')
+    ));
+
+  const last7 = visible.reduce((total, source) => total + Number(source.last_7_days || 0), 0);
+  const last30 = visible.reduce((total, source) => total + Number(source.last_30_days || 0), 0);
+  summary.textContent = `${visible.length} 个来源 · 近 7 天发表 ${last7.toLocaleString('zh-CN')} 篇 · 近 30 天 ${last30.toLocaleString('zh-CN')} 篇`;
+
+  if (!visible.length) {
+    list.innerHTML = '<div class="literature-growth-empty">当前分类还没有可统计的来源</div>';
+    return;
+  }
+
+  list.innerHTML = visible.map(source => {
+    const trend = literatureGrowthTrend(source);
+    const kindLabel = source.source_kind === 'pubmed' ? 'PubMed' : '订阅源';
+    return `
+      <div class="literature-growth-row">
+        <div class="literature-growth-heading">
+          <div class="literature-growth-title-wrap">
+            <span class="literature-growth-kind ${source.source_kind}">${kindLabel}</span>
+            <span class="literature-growth-name" title="${escapeHtml(source.name || '')}">${escapeHtml(source.name || '未命名来源')}</span>
+          </div>
+          <span class="literature-growth-trend ${trend.className}">${trend.label}</span>
+        </div>
+        <div class="literature-growth-metrics">
+          <div><span>近 7 天发表</span><strong>${Number(source.last_7_days || 0).toLocaleString('zh-CN')}</strong></div>
+          <div><span>前 7 天发表</span><strong>${Number(source.previous_7_days || 0).toLocaleString('zh-CN')}</strong></div>
+          <div><span>近 30 天发表</span><strong>${Number(source.last_30_days || 0).toLocaleString('zh-CN')}</strong></div>
+          <div><span>周均发表</span><strong>${Number(source.weekly_average || 0).toFixed(1)}</strong></div>
+          <div><span>最后新增</span><strong>${formatLiteratureGrowthLastAdded(source.last_added_at)}</strong></div>
+        </div>
+        <div class="literature-growth-sparkline" aria-label="${escapeHtml(source.name || '')} 近 30 天发表趋势">
+          <div class="literature-growth-series">
+            ${renderLiteratureGrowthSparkline(source.day_counts)}
+          </div>
+        </div>
+      </div>`;
+  }).join('');
 }
 
 function setupStatsPeriodSwitch() {
@@ -9165,15 +9664,20 @@ function renderFeedPrefsFromCounts(feedReadCounts) {
 }
 
 // ── Utils ──────────────────────────────────────
-function timeAgo(dateStr) {
-  const now = Date.now(), then = new Date(dateStr).getTime();
-  if (isNaN(then)) return '';
-  const diff = Math.floor((now - then) / 1000);
-  if (diff < 60) return '刚刚';
-  if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
-  if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前';
-  if (diff < 604800) return Math.floor(diff / 86400) + ' 天前';
-  return new Date(dateStr).toLocaleDateString('zh-CN');
+function formatSlashDate(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+
+  // Date-only values are formatted from their components to avoid timezone shifts.
+  const match = text.match(/^(\d{4})[-\/](\d{1,2})(?:[-\/](\d{1,2}))?/);
+  if (match) {
+    const [, year, month, day] = match;
+    return `${year}/${Number(month)}${day ? `/${Number(day)}` : ''}`;
+  }
+
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) return text;
+  return `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`;
 }
 
 function escapeHtml(text) {
@@ -9193,12 +9697,7 @@ function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 function formatAuthors(authorStr) {
   if (!authorStr) return '';
   const authors = authorStr.split(',').map(s => s.trim()).filter(Boolean);
-  if (authors.length === 0) return '';
-  if (authors.length === 1) return authors[0];
-  const first = authors[0];
-  const last = authors[authors.length - 1];
-  if (first === last) return first;
-  return `${first}, ⋆ ${last}`;
+  return authors.join(', ');
 }
 
 // entry.source is the journal name parsed from the RSS description by
@@ -9210,11 +9709,9 @@ function journalName(entry) {
 }
 
 function formatPublicationDate(entry) {
-  if (entry.publication_date) return entry.publication_date;
+  if (entry.publication_date) return formatSlashDate(entry.publication_date);
   if (!entry.published_at) return '';
-  const d = new Date(entry.published_at);
-  if (Number.isNaN(d.getTime())) return entry.published_at;
-  return d.toLocaleDateString('zh-CN');
+  return formatSlashDate(entry.published_at);
 }
 
 // ── Init ───────────────────────────────────────
@@ -9230,7 +9727,23 @@ window.addEventListener('DOMContentLoaded', () => {
   mainView     = document.getElementById('main-view');
   contentArea  = document.getElementById('content-area');
   toolbarSubtitle = document.getElementById('toolbar-subtitle');
-  toolbarApiTokenSelect = document.getElementById('toolbar-api-token');
+  toolbarApiPicker = document.getElementById('toolbar-api-picker');
+  toolbarApiButton = document.getElementById('toolbar-api-button');
+  toolbarApiLabel = document.getElementById('toolbar-api-label');
+  toolbarApiMenu = document.getElementById('toolbar-api-menu');
+  toolbarApiList = document.getElementById('toolbar-api-list');
+  btnManageApiTokens = document.getElementById('btn-manage-api-tokens');
+  const sidebarAiTools = document.getElementById('sidebar-ai-tools');
+  const costMeter = document.getElementById('cost-meter');
+  if (sidebarAiTools && toolbarApiPicker && costMeter) {
+    toolbarApiPicker.classList.add('sidebar-api-picker');
+    costMeter.classList.remove('toolbar-cost-meter');
+    const costMeterBot = costMeter.querySelector('.cost-meter-bot');
+    document.getElementById('cost-model')?.remove();
+    costMeter.remove();
+    costMeterBot?.append(toolbarApiPicker);
+    sidebarAiTools.append(costMeter);
+  }
 
   // Toolbar
   btnSettings = document.getElementById('btn-settings');
@@ -9277,6 +9790,10 @@ window.addEventListener('DOMContentLoaded', () => {
   entryListEl     = document.getElementById('entry-list');
   entryItemsEl    = document.getElementById('entry-items');
   entryFilter     = document.getElementById('entry-filter');
+  entrySortSelect = document.getElementById('entry-sort');
+  entrySortDirection = document.getElementById('entry-sort-direction');
+  briefingSortSelect = document.getElementById('briefing-sort');
+  briefingSortDirection = document.getElementById('briefing-sort-direction');
   entryBulkActions = document.getElementById('entry-bulk-actions');
   entryBulkCount = document.getElementById('entry-bulk-count');
   btnEntrySelectMode = document.getElementById('btn-entry-select-mode');
@@ -9322,6 +9839,8 @@ window.addEventListener('DOMContentLoaded', () => {
   syncEntryFilterControls();
   restoreEntryMetricFilters();
   syncEntryMetricFilterControls();
+  restoreEntrySortMode();
+  syncEntrySortControl();
 
   // Briefing list
   briefingListEl  = document.getElementById('briefing-list');
@@ -9345,6 +9864,12 @@ window.addEventListener('DOMContentLoaded', () => {
   detailSummaryContent = document.getElementById('detail-summary-content');
   detailSummarySection = document.getElementById('detail-summary-section');
   detailSummaryRetry  = document.getElementById('detail-summary-retry');
+  detailSummaryView = document.getElementById('detail-summary-view');
+  detailPdfView = document.getElementById('detail-pdf-view');
+  btnDetailViewSummary = document.getElementById('btn-detail-view-summary');
+  btnDetailViewPdf = document.getElementById('btn-detail-view-pdf');
+  btnPdfOpenExternal = document.getElementById('btn-pdf-open-external');
+  btnPdfDownload = document.getElementById('btn-pdf-download');
   detailReadingNotesContent = document.getElementById('detail-reading-notes-content');
   detailPaperChatHint = document.getElementById('detail-paper-chat-hint');
   detailPaperChatMessages = document.getElementById('detail-paper-chat-messages');
@@ -9414,8 +9939,29 @@ window.addEventListener('DOMContentLoaded', () => {
   apiTokenProfileSelect?.addEventListener('change', () => {
     activateApiTokenProfile(apiTokenProfileSelect.value);
   });
-  toolbarApiTokenSelect?.addEventListener('change', () => {
-    activateApiTokenProfile(toolbarApiTokenSelect.value);
+  toolbarApiButton?.addEventListener('click', (event) => {
+    event.stopPropagation();
+    toggleToolbarApiMenu();
+  });
+  toolbarApiList?.addEventListener('click', (event) => {
+    const option = event.target.closest('.toolbar-api-option');
+    if (!option) return;
+    closeToolbarApiMenu();
+    activateApiTokenProfile(
+      option.dataset.profileId,
+      option.dataset.provider,
+      { fromToolbar: true }
+    );
+  });
+  btnManageApiTokens?.addEventListener('click', () => {
+    closeToolbarApiMenu();
+    showSettings('translation');
+  });
+  document.addEventListener('click', (event) => {
+    if (!toolbarApiPicker?.contains(event.target)) closeToolbarApiMenu();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') closeToolbarApiMenu();
   });
   btnNewApiToken?.addEventListener('click', beginNewApiTokenProfile);
   btnDeleteApiToken?.addEventListener('click', deleteCurrentApiTokenProfile);
@@ -9632,6 +10178,15 @@ window.addEventListener('DOMContentLoaded', () => {
   });
 
   // Abstract toggle
+  btnDetailViewSummary?.addEventListener('click', () => setDetailViewMode('summary'));
+  btnDetailViewPdf?.addEventListener('click', openDetailPdfView);
+  btnPdfOpenExternal?.addEventListener('click', () => {
+    if (detailPdfUrl) openUrl(detailPdfUrl);
+  });
+  btnPdfDownload?.addEventListener('click', () => {
+    if (currentEntry) downloadEntriesWithNature([currentEntry]);
+  });
+
   document.querySelectorAll('.abstract-toggle-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       abstractLang = btn.dataset.lang;
@@ -9659,6 +10214,42 @@ window.addEventListener('DOMContentLoaded', () => {
     entryTagFilterValue = entryTagFilter.value || 'all';
     renderEntryList(allEntries);
     refreshPaperChatAfterScopeDataChange();
+  });
+
+  entrySortSelect?.addEventListener('change', () => {
+    clearEntrySelection({ render: false, syncPaperChat: false });
+    entrySortField = entrySortSelect.value || 'default';
+    entrySortDirectionMode = defaultEntrySortDirection(entrySortField);
+    syncEntrySortMode();
+    persistEntrySortMode();
+    syncEntrySortControl();
+    renderEntryList(allEntries);
+    refreshPaperChatAfterScopeDataChange();
+  });
+
+  entrySortDirection?.addEventListener('click', () => {
+    if (entrySortField === 'default') return;
+    clearEntrySelection({ render: false, syncPaperChat: false });
+    entrySortDirectionMode = entrySortDirectionMode === 'asc' ? 'desc' : 'asc';
+    syncEntrySortMode();
+    persistEntrySortMode();
+    syncEntrySortControl();
+    renderEntryList(allEntries);
+    refreshPaperChatAfterScopeDataChange();
+  });
+
+  briefingSortSelect?.addEventListener('change', () => {
+    briefingSortField = briefingSortSelect.value || 'date';
+    briefingSortDirectionMode = 'desc';
+    persistBriefingSort();
+    syncBriefingSortControl();
+    renderBriefingList();
+  });
+  briefingSortDirection?.addEventListener('click', () => {
+    briefingSortDirectionMode = briefingSortDirectionMode === 'asc' ? 'desc' : 'asc';
+    persistBriefingSort();
+    syncBriefingSortControl();
+    renderBriefingList();
   });
 
   btnDetailAddTag?.addEventListener('click', () => addTagsToCurrentEntry());
@@ -9823,6 +10414,7 @@ window.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('[data-pubmed-search-mode]').forEach(button => {
     button.addEventListener('click', () => setPubmedSearchBuilderMode(button.dataset.pubmedSearchMode));
   });
+  document.getElementById('btn-open-pubmed-query')?.addEventListener('click', openPubmedQueryInBrowser);
   document.getElementById('btn-preview-pubmed-search')?.addEventListener('click', previewPubmedSearch);
   document.getElementById('btn-create-pubmed-search')?.addEventListener('click', createAndRunPubmedSearch);
   document.querySelectorAll('input[name="pubmed-retrieval-scope"]').forEach(input => {

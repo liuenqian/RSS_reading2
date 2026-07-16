@@ -163,7 +163,25 @@ fn enforce_limit_param(url: &str, limit: u32) -> Result<String, String> {
 // being wasteful.
 const NL_QUERY_MAX_TOKENS: u32 = 1500;
 
-pub fn build_author_query(
+const AUTHOR_QUERY_PROMPT: &str = "\
+You are a PubMed author-search expert. Convert the supplied author identity and optional \
+affiliation, which may be written in Chinese or English natural language, into a valid \
+PubMed advanced-search query.
+
+Rules:
+- Treat the author input as a person identity, never as a biomedical topic.
+- Translate natural-language descriptions and Chinese affiliation names into useful English PubMed terms.
+- For a Chinese personal name, use reasonable romanized author-name variants and group alternatives with OR when name order or initials may vary.
+- Every author-name alternative must use [Author].
+- If an affiliation is supplied, add a focused affiliation clause using [Affiliation] or [Affiliation:~50]. Translate the institution name, but do not invent a different institution.
+- Do not add topic, journal, publication-type, or date filters that the user did not supply.
+- Do not add a date clause; the application appends the exact selected dates separately.
+- Use uppercase AND/OR/NOT and parentheses for grouped alternatives.
+
+Output only one valid PubMed query string. No markdown, explanation, or surrounding code fence.";
+
+#[cfg(test)]
+fn build_author_query(
     author_name: &str,
     affiliation: Option<&str>,
     start_date: Option<&str>,
@@ -191,6 +209,62 @@ pub fn build_author_query(
     }
 
     Ok(clauses.join(" AND "))
+}
+
+fn build_author_ai_request(author_name: &str, affiliation: Option<&str>) -> Result<String, String> {
+    let author_name = normalize_author_query_value(author_name, "作者姓名或描述")?;
+    let affiliation = normalize_optional_query_value(affiliation, "机构描述")?;
+    Ok(format!(
+        "作者姓名或自然语言描述：{}\n机构描述：{}",
+        author_name,
+        affiliation.as_deref().unwrap_or("未提供")
+    ))
+}
+
+fn build_author_date_clause(
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+) -> Result<Option<String>, String> {
+    let start_date = normalize_optional_date(start_date, "起始日期")?;
+    let end_date = normalize_optional_date(end_date, "结束日期")?;
+    if start_date.is_none() && end_date.is_none() {
+        return Ok(None);
+    }
+
+    let start = start_date.as_deref().unwrap_or("1000/01/01");
+    let end = end_date.as_deref().unwrap_or("3000/12/31");
+    if start > end {
+        return Err("起始日期不能晚于结束日期".to_string());
+    }
+    Ok(Some(format!("{}:{}[Date - Publication]", start, end)))
+}
+
+pub async fn natural_language_to_author_query(
+    settings: &DeepSeekSettings,
+    author_name: &str,
+    affiliation: Option<&str>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+) -> Result<(String, TokenUsage), String> {
+    let request = build_author_ai_request(author_name, affiliation)?;
+    let date_clause = build_author_date_clause(start_date, end_date)?;
+    let output = translate_service::complete_with_prompts(
+        settings,
+        AUTHOR_QUERY_PROMPT,
+        &request,
+        0.1,
+        i64::from(NL_QUERY_MAX_TOKENS),
+    )
+    .await?;
+
+    let author_query = validate_query_syntax(&output.content)
+        .map_err(|error| format!("AI 生成的作者检索式不完整：{}。请重新生成", error))?;
+    let query = match date_clause {
+        Some(date_clause) => format!("({}) AND {}", author_query, date_clause),
+        None => author_query,
+    };
+    let query = validate_query_syntax(&query)?;
+    Ok((query, output.usage))
 }
 
 fn normalize_author_query_value(value: &str, label: &str) -> Result<String, String> {
@@ -249,6 +323,7 @@ fn normalize_optional_date(value: Option<&str>, label: &str) -> Result<Option<St
     Ok(Some(parts.join("/")))
 }
 
+#[cfg(test)]
 fn escape_pubmed_phrase(value: &str) -> String {
     value.replace('"', "")
 }
@@ -414,7 +489,10 @@ mod urlencoding {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_author_query, validate_query_syntax};
+    use super::{
+        build_author_ai_request, build_author_date_clause, build_author_query,
+        validate_query_syntax,
+    };
 
     #[test]
     fn builds_author_query_without_optional_filters() {
@@ -452,6 +530,21 @@ mod tests {
         assert!(build_author_query("Smith JA", None, Some("2025-02-29"), None).is_err());
         assert!(
             build_author_query("Smith JA", None, Some("2025-01-02"), Some("2025-01-01"),).is_err()
+        );
+    }
+
+    #[test]
+    fn accepts_chinese_natural_language_author_requests() {
+        let request = build_author_ai_request(
+            "北京安贞医院的梁瑞政医生",
+            Some("首都医科大学附属北京安贞医院"),
+        )
+        .unwrap();
+        assert!(request.contains("梁瑞政"));
+        assert!(request.contains("首都医科大学附属北京安贞医院"));
+        assert_eq!(
+            build_author_date_clause(Some("2020-01-02"), Some("2025-12-31")).unwrap(),
+            Some("2020/01/02:2025/12/31[Date - Publication]".to_string())
         );
     }
 

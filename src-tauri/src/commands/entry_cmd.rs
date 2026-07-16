@@ -1,7 +1,7 @@
 use crate::db::DbState;
 use crate::models::{Entry, EntryIdentifiers, ReadingStats};
 use crate::services::{article_service, entry_service, fulltext_service};
-use tauri::State;
+use tauri::{ipc::Response, State};
 use tracing::{info, warn};
 
 #[tauri::command]
@@ -233,6 +233,45 @@ pub async fn fetch_affiliation(
 }
 
 #[tauri::command]
+pub async fn fetch_entry_authors(
+    state: State<'_, DbState>,
+    entry_id: i64,
+) -> Result<Option<String>, String> {
+    let (link, guid, summary, cached_pmid): (String, String, Option<String>, Option<String>) = {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT link, guid, summary, pmid FROM entries WHERE id = ?1",
+            [entry_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|e| format!("文章不存在: {}", e))?
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent("RSSReading/0.1 (https://github.com/liuenqian/RSS_reading)")
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+    let pmid = cached_pmid
+        .or_else(|| article_service::extract_pmid_from_link(&link))
+        .or_else(|| article_service::extract_pmid_from_guid(&guid))
+        .or_else(|| summary.as_deref().and_then(article_service::extract_pmid_from_text));
+    let Some(pmid) = pmid else {
+        return Ok(None);
+    };
+    let authors = article_service::fetch_pubmed_authors(&client, &pmid).await?;
+    if let Some(ref authors) = authors {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE entries SET author = ?1 WHERE id = ?2",
+            rusqlite::params![authors, entry_id],
+        )
+            .map_err(|e| format!("保存作者失败: {}", e))?;
+    }
+    Ok(authors)
+}
+
+#[tauri::command]
 pub async fn fetch_entry_identifiers(
     state: State<'_, DbState>,
     entry_id: i64,
@@ -346,6 +385,18 @@ pub async fn resolve_entry_pdf_url(
         publication_year,
     )
     .await
+}
+
+#[tauri::command]
+pub async fn fetch_entry_pdf(
+    state: State<'_, DbState>,
+    entry_id: i64,
+) -> Result<Response, String> {
+    let url = resolve_entry_pdf_url(state, entry_id)
+        .await?
+        .ok_or_else(|| "未找到可直接读取的全文 PDF".to_string())?;
+    let bytes = fulltext_service::fetch_pdf_bytes(&url).await?;
+    Ok(Response::new(bytes))
 }
 
 #[tauri::command]

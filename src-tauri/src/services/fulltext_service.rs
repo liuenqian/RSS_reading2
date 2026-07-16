@@ -1,16 +1,18 @@
-use reqwest::header::{ACCEPT, CONTENT_TYPE, RANGE};
+use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, RANGE};
 use reqwest::{Client, Url};
 use serde_json::Value;
 use std::time::Duration;
 use tracing::warn;
 
 const EUROPE_PMC_SEARCH_URL: &str = "https://www.ebi.ac.uk/europepmc/webservices/rest/search";
+const NCBI_PMC_OA_URL: &str = "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi";
 const OPENALEX_WORKS_URL: &str = "https://api.openalex.org/works";
 const SEMANTIC_SCHOLAR_PAPER_URL: &str = "https://api.semanticscholar.org/graph/v1/paper";
 const UNPAYWALL_API_URL: &str = "https://api.unpaywall.org/v2";
 const UNPAYWALL_CONTACT_EMAIL: &str = "itsdrchen@users.noreply.github.com";
 const SCI_HUB_BASE_URL: &str = "https://www.sci-hub.st/";
 const SCI_HUB_LAST_RELIABLE_PUBLICATION_YEAR: i32 = 2020;
+const MAX_INLINE_PDF_BYTES: usize = 40 * 1024 * 1024;
 
 pub async fn resolve_pdf_url(
     title: &str,
@@ -37,18 +39,33 @@ pub async fn resolve_pdf_url(
         }
     }
 
-    if let Some(url) = pmcid.and_then(europe_pmc_pdf_url) {
-        if let Some(url) = verify_pdf_candidate(&client, url).await {
-            return Ok(Some(url));
+    if let Some(pmcid) = pmcid.filter(|value| !value.trim().is_empty()) {
+        match resolve_ncbi_pmc_pdf(&client, pmcid).await {
+            Ok(Some(url)) => {
+                if let Some(url) = verify_pdf_candidate(&client, url).await {
+                    return Ok(Some(url));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => warn!(%error, "NCBI PMC PDF 解析失败"),
+        }
+        if let Some(url) = europe_pmc_pdf_url(pmcid) {
+            if let Some(url) = verify_pdf_candidate(&client, url).await {
+                return Ok(Some(url));
+            }
         }
     }
 
     match resolve_europe_pmc_pmcid(&client, doi, pmid).await {
         Ok(Some(value)) => {
-            if let Some(url) = europe_pmc_pdf_url(&value) {
-                if let Some(url) = verify_pdf_candidate(&client, url).await {
-                    return Ok(Some(url));
+            match resolve_ncbi_pmc_pdf(&client, &value).await {
+                Ok(Some(url)) => {
+                    if let Some(url) = verify_pdf_candidate(&client, url).await {
+                        return Ok(Some(url));
+                    }
                 }
+                Ok(None) => {}
+                Err(error) => warn!(%error, "NCBI PMC PDF 解析失败"),
             }
         }
         Ok(None) => {}
@@ -93,6 +110,92 @@ pub async fn resolve_pdf_url(
     }
 
     Ok(None)
+}
+
+async fn resolve_ncbi_pmc_pdf(client: &Client, pmcid: &str) -> Result<Option<String>, String> {
+    let mut url = Url::parse(NCBI_PMC_OA_URL).map_err(|e| format!("PMC OA 地址无效: {}", e))?;
+    url.query_pairs_mut().append_pair("id", pmcid.trim());
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("PMC OA 请求失败: {}", e))?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("读取 PMC OA 响应失败: {}", e))?;
+    parse_ncbi_pmc_pdf(&body)
+}
+
+fn parse_ncbi_pmc_pdf(xml: &str) -> Result<Option<String>, String> {
+    let document = roxmltree::Document::parse(xml)
+        .map_err(|e| format!("解析 PMC OA 响应失败: {}", e))?;
+    let href = document
+        .descendants()
+        .find(|node| node.has_tag_name("link") && node.attribute("format") == Some("pdf"))
+        .and_then(|node| node.attribute("href"));
+    Ok(href.and_then(normalize_ncbi_pdf_url))
+}
+
+fn normalize_ncbi_pdf_url(value: &str) -> Option<String> {
+    let url = Url::parse(value.trim()).ok()?;
+    if url.host_str() != Some("ftp.ncbi.nlm.nih.gov") || !matches!(url.scheme(), "ftp" | "https") {
+        return None;
+    }
+    let mut https_url = url;
+    https_url.set_scheme("https").ok()?;
+    Some(https_url.to_string())
+}
+
+pub async fn fetch_pdf_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let url = valid_http_url(url).ok_or_else(|| "PDF 地址无效".to_string())?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(45))
+        .user_agent("RSSReading/1.0 (embedded PDF reader)")
+        .build()
+        .map_err(|e| format!("创建 PDF 下载客户端失败: {}", e))?;
+    let mut response = client
+        .get(url)
+        .header(ACCEPT, "application/pdf")
+        .send()
+        .await
+        .map_err(|e| format!("下载 PDF 失败: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("下载 PDF 失败: HTTP {}", response.status()));
+    }
+    if let Some(size) = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        ensure_inline_pdf_size(size)?;
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("读取 PDF 数据失败: {}", e))?
+    {
+        ensure_inline_pdf_size(bytes.len().saturating_add(chunk.len()))?;
+        bytes.extend_from_slice(&chunk);
+    }
+    if !contains_pdf_signature(&bytes) {
+        return Err("下载内容不是有效的 PDF，可能需要登录或验证".to_string());
+    }
+    Ok(bytes)
+}
+
+fn ensure_inline_pdf_size(size: usize) -> Result<(), String> {
+    if size > MAX_INLINE_PDF_BYTES {
+        return Err("PDF 超过 40 MB，请使用外部浏览器打开".to_string());
+    }
+    Ok(())
 }
 
 async fn verify_pdf_candidate(client: &Client, url: String) -> Option<String> {
@@ -466,6 +569,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_ncbi_oa_pdf_and_upgrades_ftp_to_https() {
+        let xml = r#"<OA><records><record id="PMC5334499"><link format="tgz" href="ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/paper.tar.gz"/><link format="pdf" href="ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_pdf/8e/71/paper.PMC5334499.pdf"/></record></records></OA>"#;
+        assert_eq!(
+            parse_ncbi_pmc_pdf(xml).unwrap().as_deref(),
+            Some("https://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_pdf/8e/71/paper.PMC5334499.pdf")
+        );
+        assert_eq!(parse_ncbi_pmc_pdf("<OA><records/></OA>").unwrap(), None);
+    }
+
+    #[test]
     fn parses_sci_hub_embed_pdf() {
         let html = r#"<embed type="application/pdf" src="//cdn.example.test/paper.pdf#view=FitH" id="pdf">"#;
         assert_eq!(
@@ -484,5 +597,11 @@ mod tests {
     fn recognizes_pdf_signature_near_start() {
         assert!(contains_pdf_signature(b"\n%PDF-1.7\n"));
         assert!(!contains_pdf_signature(b"<html>login</html>"));
+    }
+
+    #[test]
+    fn rejects_oversized_inline_pdf() {
+        assert!(ensure_inline_pdf_size(MAX_INLINE_PDF_BYTES).is_ok());
+        assert!(ensure_inline_pdf_size(MAX_INLINE_PDF_BYTES + 1).is_err());
     }
 }

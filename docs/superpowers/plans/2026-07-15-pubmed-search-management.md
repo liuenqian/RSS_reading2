@@ -1,7 +1,7 @@
 # PubMed 检索批次管理实施计划
 
-日期：2026-07-15
-依据：[PubMed 检索批次管理设计](../specs/2026-07-15-pubmed-search-management-design.md)
+日期：2026-07-15  
+依据：[PubMed 检索批次管理设计](../specs/2026-07-15-pubmed-search-management-design.md)  
 状态：待执行
 
 ## 目标
