@@ -52,7 +52,14 @@ test('wires all entry sorting modes into the feed list and persists the selectio
   assert.match(source, /ENTRY_SORT_STORAGE_KEY\s*=\s*'entry-sort-v2'/);
   assert.match(source, /entrySortDirectionMode\s*=\s*entrySortDirectionMode === 'asc' \? 'desc' : 'asc'/);
   assert.match(source, /sortEntries\(filtered, entrySortMode, lookupJournalMetrics\)/);
-  assert.match(source, /function getFilteredPubmedEntries[\s\S]*return sortEntries\(filtered, entrySortMode, lookupJournalMetrics\)/);
+  assert.match(source, /function getFilteredPubmedEntries[\s\S]*return sortPubmedEntriesForCurrentView\(filtered\)/);
+  assert.match(source, /function sortPubmedEntriesForCurrentView[\s\S]*return sortEntries\(sorted, entrySortMode, lookupJournalMetrics\)/);
+});
+
+test('prioritizes the current PubMed list order for batch translation', () => {
+  assert.match(source, /const followsCurrentView = mode === 'pubmed' && currentPubmedSearch\?\.id === search\.id/);
+  assert.match(source, /const orderedEntries = followsCurrentView[\s\S]*sortPubmedEntriesForCurrentView\(entries\)[\s\S]*: entries/);
+  assert.match(source, /await translateEntries\(orderedEntries, field\)/);
 });
 
 test('all article overview pages share the article sorter and briefings have their own sorter', () => {

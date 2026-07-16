@@ -3,6 +3,13 @@ import {
   runConcurrentQueue,
 } from './translation_queue.js';
 import { normalizeEntrySortMode, sortEntries } from './entry_sort.js';
+import { shortJournalDisplayName } from './journal_name.js';
+import {
+  createDefaultFilterScopeState,
+  filterScopeKey,
+  normalizeFilterScopeState,
+  writeFilterScopeState,
+} from './filter_scope.js';
 const { invoke } = window.__TAURI__.core;
 const markdownitFactory = globalThis.markdownit;
 const markdownitTaskLists = globalThis.markdownitTaskLists;
@@ -277,6 +284,7 @@ const SIDEBAR_SECTION_COLLAPSED_STORAGE_KEY = 'sidebar-section-collapsed-v1';
 const ENTRY_FILTER_STORAGE_KEY = 'entry-filter-v1';
 const ENTRY_FILTER_OPTIONS = ['all', 'unread', 'starred', 'reading-notes'];
 const ENTRY_METRIC_FILTER_STORAGE_KEY = 'entry-metric-filters-v1';
+const FILTER_SCOPE_STORAGE_KEY = 'entry-filter-scopes-v1';
 const ENTRY_SORT_STORAGE_KEY = 'entry-sort-v2';
 const LEGACY_ENTRY_SORT_STORAGE_KEY = 'entry-sort-v1';
 const BRIEFING_SORT_STORAGE_KEY = 'briefing-sort-v1';
@@ -337,6 +345,7 @@ const pubmedFilters = {
   addedFrom: '',
   addedTo: '',
 };
+let filterScopeStates = loadFilterScopeStates();
 
 const DRAG_BLOCK_SELECTOR = [
   'a',
@@ -455,7 +464,7 @@ function entryFilterLabel(value) {
 
 function persistEntryFilter() {
   try {
-    localStorage.setItem(ENTRY_FILTER_STORAGE_KEY, normalizeEntryFilterValue(entryFilterValue));
+    persistCurrentFilterScope();
   } catch (error) {
     console.warn('保存顶部筛选失败:', error);
   }
@@ -468,6 +477,82 @@ function restoreEntryFilter() {
     console.warn('恢复顶部筛选失败:', error);
     entryFilterValue = 'all';
   }
+}
+
+function loadFilterScopeStates() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(FILTER_SCOPE_STORAGE_KEY) || '{}');
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch (error) {
+    console.warn('读取分范围筛选失败:', error);
+    return {};
+  }
+}
+
+function currentFilterScopeKey() {
+  return filterScopeKey({
+    mode,
+    pubmedSearchId: currentPubmedSearch?.id ?? null,
+    feedId: selectedFeedId,
+  });
+}
+
+function captureCurrentFilterScopeState() {
+  return normalizeFilterScopeState({
+    entryFilter: entryFilterValue,
+    tagFilter: entryTagFilterValue,
+    entrySortField,
+    entrySortDirection: entrySortDirectionMode,
+    metricFilters: { ...entryMetricFilters },
+    pubmedFilters: { ...pubmedFilters },
+    pubmedSnapshotId: activePubmedSnapshotId,
+  });
+}
+
+function applyFilterScopeState(state) {
+  const next = normalizeFilterScopeState(state);
+  entryFilterValue = next.entryFilter;
+  entryTagFilterValue = next.tagFilter;
+  entrySortField = next.entrySortField;
+  entrySortDirectionMode = next.entrySortDirection;
+  Object.assign(entryMetricFilters, next.metricFilters);
+  Object.assign(pubmedFilters, next.pubmedFilters);
+  activePubmedSnapshotId = next.pubmedSnapshotId;
+  syncEntryFilterControls();
+  syncEntrySortControl();
+  syncEntryMetricFilterControls();
+  syncPubmedFilterInputs();
+  if (entryTagFilter) entryTagFilter.value = entryTagFilterValue;
+  if (['pubmed', 'kept'].includes(mode)) refreshPubmedSnapshotControls();
+}
+
+function persistCurrentFilterScope() {
+  const scopeKey = currentFilterScopeKey();
+  filterScopeStates = writeFilterScopeState(
+    filterScopeStates,
+    scopeKey,
+    captureCurrentFilterScopeState()
+  );
+  localStorage.setItem(FILTER_SCOPE_STORAGE_KEY, JSON.stringify(filterScopeStates));
+
+  if (scopeKey === 'all') {
+    localStorage.setItem(ENTRY_FILTER_STORAGE_KEY, normalizeEntryFilterValue(entryFilterValue));
+    localStorage.setItem(ENTRY_METRIC_FILTER_STORAGE_KEY, JSON.stringify(entryMetricFilters));
+    localStorage.setItem(
+      ENTRY_SORT_STORAGE_KEY,
+      entrySortField === 'default' ? 'default' : `${entrySortField}-${entrySortDirectionMode}`,
+    );
+  }
+}
+
+function restoreCurrentFilterScope({ useCurrentAsFallback = false } = {}) {
+  const scopeKey = currentFilterScopeKey();
+  const saved = filterScopeStates[scopeKey];
+  const fallback = useCurrentAsFallback
+    ? captureCurrentFilterScopeState()
+    : createDefaultFilterScopeState();
+  applyFilterScopeState(saved || fallback);
+  if (!saved) persistCurrentFilterScope();
 }
 
 function syncEntryFilterControls() {
@@ -1868,6 +1953,7 @@ function activatePubmedSnapshot(snapshotId) {
     refreshEntryTagFilterOptions(allEntries);
     if (entryTagFilter) entryTagFilter.value = entryTagFilterValue;
   }
+  persistCurrentFilterScope();
   clearEntrySelection({ render: false, syncPaperChat: false });
   pubmedRenderLimit = 200;
   refreshPubmedSnapshotControls();
@@ -1899,6 +1985,7 @@ function saveCurrentPubmedSnapshot() {
   pubmedSnapshots.push(snapshot);
   persistPubmedSnapshots();
   activePubmedSnapshotId = snapshot.id;
+  persistCurrentFilterScope();
   refreshPubmedSnapshotControls();
   renderEntryList(allEntries);
   setGlobalStatus(`已保存快照“${snapshot.name}”，共 ${snapshot.entryIds.length} 篇`, 'success');
@@ -1914,6 +2001,7 @@ async function deleteCurrentPubmedSnapshot() {
   pubmedSnapshots = pubmedSnapshots.filter(item => item.id !== snapshot.id);
   persistPubmedSnapshots();
   activePubmedSnapshotId = null;
+  persistCurrentFilterScope();
   refreshPubmedSnapshotControls();
   renderEntryList(allEntries);
   setGlobalStatus('筛选快照已删除', 'success');
@@ -2211,7 +2299,7 @@ function renderPubmedPreviewResults(preview, assessment = null, assessmentError 
           <div class="pubmed-preview-item-title">${escapeHtml(entry.title)}</div>
           ${assessmentMeta ? `<span class="pubmed-preview-entry-status ${assessmentMeta.className}">${assessmentMeta.label}</span>` : ''}
         </div>
-        <div class="pubmed-preview-item-meta">${escapeHtml(entry.journal || '期刊待确认')} · ${escapeHtml(formatPubmedPublicationDate(entry) || '日期待确认')} · PMID ${escapeHtml(entry.pmid)}</div>
+        <div class="pubmed-preview-item-meta">${escapeHtml(shortJournalDisplayName(entry.journal) || '期刊待确认')} · ${escapeHtml(formatPubmedPublicationDate(entry) || '日期待确认')} · PMID ${escapeHtml(entry.pmid)}</div>
         <div class="pubmed-preview-item-abstract">${escapeHtml(abstractText)}</div>
         ${itemAssessment?.reason ? `<div class="pubmed-preview-item-reason">${escapeHtml(itemAssessment.reason)}</div>` : ''}
         ${pubmedSearchBuilderMode === 'author' ? `<div class="pubmed-preview-item-meta">作者：${escapeHtml(entry.authors || '作者待确认')}</div><div class="pubmed-preview-item-meta">机构：${escapeHtml(entry.affiliation || '机构待确认')}</div>` : ''}
@@ -2821,8 +2909,8 @@ async function selectPubmedSearch(searchId) {
   mode = 'pubmed';
   currentPubmedSearch = search;
   selectedFeedId = null;
+  restoreCurrentFilterScope();
   pubmedRenderLimit = 200;
-  activePubmedSnapshotId = null;
   enterLiteratureMode();
   document.body.classList.add('pubmed-mode');
   document.querySelectorAll('.feed-item').forEach(el => el.classList.remove('selected'));
@@ -2847,8 +2935,8 @@ async function enterKeptMode(options = {}) {
   mode = 'kept';
   currentPubmedSearch = null;
   selectedFeedId = null;
+  restoreCurrentFilterScope();
   pubmedRenderLimit = 200;
-  activePubmedSnapshotId = null;
   enterLiteratureMode();
   document.body.classList.add('pubmed-mode');
   renderPubmedSearchList();
@@ -3029,7 +3117,7 @@ function selectFeed(feedId) {
   enterFeedMode();
   document.querySelectorAll('.feed-item').forEach(el => el.classList.toggle('selected', parseInt(el.dataset.feedId) === feedId));
   selectedFeedId = feedId;
-  syncEntryFilterControls();
+  restoreCurrentFilterScope();
   const feed = allFeeds.find(f => f.id === feedId);
   if (feed) updateToolbarFeedInfo(feed);
   if (query) {
@@ -3166,7 +3254,7 @@ function clearLiteratureSearch() {
       enterFeedMode();
       selectedFeedId = null;
       document.querySelectorAll('.feed-item').forEach(el => el.classList.remove('selected'));
-      syncEntryFilterControls();
+      restoreCurrentFilterScope();
       setToolbarSubtitle('main');
       loadEntries(null);
     }
@@ -3187,7 +3275,7 @@ function clearLiteratureSearch() {
     else {
       enterFeedMode();
       selectedFeedId = null;
-      syncEntryFilterControls();
+      restoreCurrentFilterScope();
       setToolbarSubtitle('main');
       loadEntries(null);
     }
@@ -3830,6 +3918,11 @@ function getFilteredPubmedEntries(entries = allEntries) {
   }
   if (hasActiveEntryMetricFilters()) filtered = filtered.filter(matchesEntryMetricFilters);
 
+  return sortPubmedEntriesForCurrentView(filtered);
+}
+
+function sortPubmedEntriesForCurrentView(entries) {
+  const sorted = [...entries];
   const nullLast = (left, right, direction = 1) => {
     const leftMissing = left == null || left === '';
     const rightMissing = right == null || right === '';
@@ -3839,7 +3932,7 @@ function getFilteredPubmedEntries(entries = allEntries) {
     if (left > right) return direction;
     return 0;
   };
-  filtered.sort((left, right) => {
+  sorted.sort((left, right) => {
     switch (pubmedFilters.sort) {
       case 'publication-asc': return nullLast(left.publication_sort_key, right.publication_sort_key, 1);
       case 'added-desc': return nullLast(left.first_seen_at, right.first_seen_at, -1);
@@ -3850,7 +3943,7 @@ function getFilteredPubmedEntries(entries = allEntries) {
       default: return nullLast(left.publication_sort_key, right.publication_sort_key, -1);
     }
   });
-  return sortEntries(filtered, entrySortMode, lookupJournalMetrics);
+  return sortEntries(sorted, entrySortMode, lookupJournalMetrics);
 }
 
 function metricIfValue(entry) {
@@ -3878,6 +3971,7 @@ function refreshEntryTagFilterOptions(entries = allEntries) {
   if (!entryTagFilter) return;
 
   const options = collectEntryTagOptions(entries);
+  const previousValue = entryTagFilterValue;
   const nextValue = entryTagFilterValue !== 'all'
     && options.some(item => item.tag === entryTagFilterValue)
     ? entryTagFilterValue
@@ -3899,6 +3993,7 @@ function refreshEntryTagFilterOptions(entries = allEntries) {
 
   entryTagFilterValue = nextValue;
   entryTagFilter.value = nextValue;
+  if (nextValue !== previousValue) persistCurrentFilterScope();
 }
 
 function renderEntryTagBadges(tags, { limit = 3 } = {}) {
@@ -4285,10 +4380,14 @@ async function translatePubmedSearchEntries(search, field) {
   const fieldLabel = field === 'title' ? '标题' : '摘要';
   setGlobalStatus(`正在读取「${search.name}」的文章…`, 'progress');
   try {
-    const entries = mode === 'pubmed' && currentPubmedSearch?.id === search.id
+    const followsCurrentView = mode === 'pubmed' && currentPubmedSearch?.id === search.id;
+    const entries = followsCurrentView
       ? allEntries
       : (await invoke('list_pubmed_search_entries', { searchId: search.id })).map(normalizePubmedEntry);
-    await translateEntries(entries, field);
+    const orderedEntries = followsCurrentView
+      ? sortPubmedEntriesForCurrentView(entries)
+      : entries;
+    await translateEntries(orderedEntries, field);
   } catch (e) {
     setGlobalStatus(`批量翻译「${search.name}」${fieldLabel}失败: ${e}`, 'error');
   }
@@ -4413,10 +4512,7 @@ function parseMetricIf(value) {
 
 function persistEntrySortMode() {
   try {
-    localStorage.setItem(
-      ENTRY_SORT_STORAGE_KEY,
-      entrySortField === 'default' ? 'default' : `${entrySortField}-${entrySortDirectionMode}`,
-    );
+    persistCurrentFilterScope();
   } catch (error) {
     console.warn('保存文献排序失败:', error);
   }
@@ -4476,7 +4572,7 @@ function normalizeEntryMetricFilterValue(key, value) {
 
 function persistEntryMetricFilters() {
   try {
-    localStorage.setItem(ENTRY_METRIC_FILTER_STORAGE_KEY, JSON.stringify(entryMetricFilters));
+    persistCurrentFilterScope();
   } catch (error) {
     console.warn('保存分区筛选失败:', error);
   }
@@ -4590,7 +4686,7 @@ function scheduleFreeFulltextChecks(entries) {
 }
 
 function renderDetailJournalMeta(entry) {
-  const journal = journalName(entry);
+  const journal = shortJournalDisplayName(journalName(entry));
   const metricHtml = renderMetricBadges(lookupJournalMetrics(entry));
   if (detailJournal) {
     if (journal || metricHtml) {
@@ -6103,7 +6199,7 @@ function renderEntryList(entries, options = {}) {
     const isBulkSelected = entrySelectionMode && selectedEntryIds.has(entry.id);
     const titles = displayTitles(entry);
     const timeStr = entry.published_at ? formatSlashDate(entry.published_at) : '';
-    const source = journalName(entry);
+    const source = shortJournalDisplayName(journalName(entry));
 
     // Visual translation status — spinner during work, small error pill on failure.
     // No "待翻译" tag — translation now runs automatically in the background, so
@@ -6232,7 +6328,7 @@ function renderPubmedEntryList(entries, options = {}) {
         : (entry.published_at ? formatSlashDate(entry.published_at) : ''));
     const titles = displayTitles(entry);
     const isStarred = starredIds().has(entry.id);
-    const source = entry.journal || journalName(entry);
+    const source = shortJournalDisplayName(entry.journal || journalName(entry));
     const status = entry.screening_status || 'unreviewed';
     const badges = [];
     if (entry.summary_translated) {
@@ -7146,6 +7242,7 @@ function renderDetailTags(entry) {
       if (!entryTagFilter) return;
       entryTagFilterValue = tag;
       entryTagFilter.value = tag;
+      persistCurrentFilterScope();
       clearEntrySelection({ render: false, syncPaperChat: false });
       renderEntryList(allEntries);
       refreshPaperChatAfterScopeDataChange();
@@ -9836,11 +9933,9 @@ window.addEventListener('DOMContentLoaded', () => {
   pubmedBulkStatus = document.getElementById('pubmed-bulk-status');
   btnPubmedAiScreen = document.getElementById('btn-pubmed-ai-screen');
   restoreEntryFilter();
-  syncEntryFilterControls();
   restoreEntryMetricFilters();
-  syncEntryMetricFilterControls();
   restoreEntrySortMode();
-  syncEntrySortControl();
+  restoreCurrentFilterScope({ useCurrentAsFallback: true });
 
   // Briefing list
   briefingListEl  = document.getElementById('briefing-list');
@@ -10102,6 +10197,7 @@ window.addEventListener('DOMContentLoaded', () => {
       enterFeedMode();
       document.querySelectorAll('.feed-item').forEach(el => el.classList.remove('selected'));
       selectedFeedId = null;
+      restoreCurrentFilterScope();
       entryFilterValue = normalizeEntryFilterValue(view);
       persistEntryFilter();
       syncEntryFilterControls();
@@ -10212,6 +10308,7 @@ window.addEventListener('DOMContentLoaded', () => {
   entryTagFilter?.addEventListener('change', () => {
     clearEntrySelection({ render: false, syncPaperChat: false });
     entryTagFilterValue = entryTagFilter.value || 'all';
+    persistCurrentFilterScope();
     renderEntryList(allEntries);
     refreshPaperChatAfterScopeDataChange();
   });
@@ -10467,6 +10564,7 @@ window.addEventListener('DOMContentLoaded', () => {
   ].forEach(([element, key]) => {
     element?.addEventListener('change', () => {
       pubmedFilters[key] = element.value || (key === 'status' || key === 'star' ? 'all' : (key === 'sort' ? 'publication-desc' : ''));
+      persistCurrentFilterScope();
       pubmedRenderLimit = 200;
       clearEntrySelection({ render: false, syncPaperChat: false });
       renderEntryList(allEntries);
