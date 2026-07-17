@@ -1,5 +1,7 @@
 use crate::models::{
-    ApiTokenProfileList, ApiTokenProfileSummary, DeepSeekSettings, ReadingPromptProfile,
+    AiModelSummary, ApiTokenProfileList, ApiTokenProfileSummary, DeepSeekSettings,
+    ReadingPromptProfile, DEFAULT_CONTEXT_INPUT_TOKENS, DEFAULT_CONTEXT_OUTPUT_TOKENS,
+    DEFAULT_TOOL_CALL_ROUNDS,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -8,6 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+const AI_MODEL_CONFIGS_KEY: &str = "ai_model_configs";
+const ACTIVE_AI_MODEL_ID_KEY: &str = "active_ai_model_id";
 const DEFAULT_PROMPT: &str = "你是一个专业的学术与新闻翻译助手。你的任务是将英文 RSS 标题和摘要翻译成简洁、准确的中文。\n\n翻译规则：\n1. 准确优先：专业术语必须使用学术界通用的中文译法。如果某个术语没有公认译法，保留英文原文并用括号简要解释。\n2. 人名不翻译：所有人名保留英文原文，不做音译。\n3. 机构与期刊名：优先使用官方中文名（如 \"Nature\" → \"《自然》\"）。没有官方中文名则保留英文。\n4. 简洁：标题翻译控制在 30 个汉字以内。摘要翻译保留所有关键信息，但删除冗余的修饰语、套话和背景铺垫。\n5. 语体风格：学术内容使用正式学术语言；新闻内容使用标准新闻语言。不添加任何原文中没有的意见、评价或补充说明。\n6. HTML 标签：如果原文包含 HTML 标签（如 <p>、<a>、<em>），移除它们，只翻译纯文本内容。\n7. 仅返回翻译结果：不要在回复中包含原文、解释、备注或任何其他内容。只输出翻译后的中文文本。";
 
 fn get_setting(conn: &Connection, key: &str) -> Option<String> {
@@ -54,6 +58,17 @@ fn provider_setting_key(provider: &str, field: &str) -> String {
     format!("ai_provider.{}.{}", normalize_provider_id(provider), field)
 }
 
+fn positive_provider_setting(conn: &Connection, provider: &str, field: &str, default: i64) -> i64 {
+    get_setting(conn, &provider_setting_key(provider, field))
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn sanitized_model_display_name(value: &str) -> String {
+    value.trim().chars().take(32).collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredApiTokenProfile {
     id: String,
@@ -73,7 +88,7 @@ fn save_token_profiles(
     profiles: &[StoredApiTokenProfile],
 ) -> Result<(), String> {
     let value = serde_json::to_string(profiles)
-        .map_err(|error| format!("序列化 API Token 档案失败: {}", error))?;
+        .map_err(|error| format!("序列化 API Key 列表失败: {}", error))?;
     set_setting(
         conn,
         &provider_setting_key(provider, "token_profiles"),
@@ -100,6 +115,15 @@ fn set_active_provider_api_key(
     if provider == "deepseek" {
         set_setting(conn, "api_key", api_key)?;
     }
+    let active_id = get_setting(conn, ACTIVE_AI_MODEL_ID_KEY);
+    let mut models = load_ai_model_configs(conn);
+    if let Some(model) = models.iter_mut().find(|model| {
+        model.config_id.as_deref() == active_id.as_deref()
+            && normalize_provider_id(&model.provider) == provider
+    }) {
+        model.api_key = api_key.to_string();
+        save_ai_model_configs(conn, &models)?;
+    }
     Ok(())
 }
 
@@ -120,7 +144,7 @@ fn ensure_token_profiles(
         if !api_key.trim().is_empty() {
             profiles.push(StoredApiTokenProfile {
                 id: "default".to_string(),
-                name: "默认 Token".to_string(),
+                name: "默认 API Key".to_string(),
                 api_key,
             });
             save_token_profiles(conn, provider, &profiles)?;
@@ -201,7 +225,7 @@ pub fn upsert_api_token_profile(
     let name = name.trim();
     let api_key = api_key.trim();
     if name.is_empty() {
-        return Err("请填写 Token 档案名称".to_string());
+        return Err("请填写 API Key 名称".to_string());
     }
     if api_key.is_empty() {
         return Err("请填写 API Key".to_string());
@@ -213,7 +237,7 @@ pub fn upsert_api_token_profile(
             let profile = profiles
                 .iter_mut()
                 .find(|profile| profile.id == id)
-                .ok_or_else(|| "Token 档案不存在".to_string())?;
+                .ok_or_else(|| "API Key 不存在".to_string())?;
             profile.name = name.to_string();
             profile.api_key = api_key.to_string();
             id.to_string()
@@ -254,7 +278,7 @@ pub fn activate_api_token_profile(
     let profile = profiles
         .iter()
         .find(|profile| profile.id == profile_id)
-        .ok_or_else(|| "Token 档案不存在".to_string())?;
+        .ok_or_else(|| "API Key 不存在".to_string())?;
 
     set_setting(
         conn,
@@ -276,7 +300,7 @@ pub fn delete_api_token_profile(
     let previous_len = profiles.len();
     profiles.retain(|profile| profile.id != profile_id);
     if profiles.len() == previous_len {
-        return Err("Token 档案不存在".to_string());
+        return Err("API Key 不存在".to_string());
     }
 
     let next_active_id = if active_id.as_deref() == Some(profile_id) {
@@ -713,7 +737,177 @@ fn sanitize_reading_profiles(profiles: Vec<ReadingPromptProfile>) -> Vec<Reading
     out
 }
 
+fn load_ai_model_configs(conn: &Connection) -> Vec<DeepSeekSettings> {
+    get_setting(conn, AI_MODEL_CONFIGS_KEY)
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
+}
+
+fn save_ai_model_configs(conn: &Connection, models: &[DeepSeekSettings]) -> Result<(), String> {
+    let value =
+        serde_json::to_string(models).map_err(|error| format!("序列化模型配置失败: {}", error))?;
+    set_setting(conn, AI_MODEL_CONFIGS_KEY, &value)
+}
+
+fn next_ai_model_id() -> String {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("model-{}", stamp)
+}
+
+fn model_summary_name(settings: &DeepSeekSettings) -> String {
+    let display_name = sanitized_model_display_name(&settings.model_display_name);
+    if display_name.is_empty() {
+        settings.model.trim().to_string()
+    } else {
+        display_name
+    }
+}
+
+fn model_summary_provider(settings: &DeepSeekSettings) -> String {
+    if normalize_provider_id(&settings.provider) == "deepseek"
+        && settings
+            .base_url
+            .trim()
+            .starts_with("https://token.sensenova.cn")
+    {
+        "sensenova".to_string()
+    } else {
+        settings.provider.clone()
+    }
+}
+
+fn apply_global_settings(conn: &Connection, settings: &mut DeepSeekSettings) {
+    settings.system_prompt =
+        get_setting(conn, "system_prompt").unwrap_or_else(|| DEFAULT_PROMPT.to_string());
+    settings.read_retention_days = get_setting(conn, "read_retention_days")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+}
+
+fn ensure_ai_model_configs(conn: &Connection) -> Vec<DeepSeekSettings> {
+    let models = load_ai_model_configs(conn);
+    if !models.is_empty() {
+        return models;
+    }
+
+    let provider =
+        get_setting(conn, "active_ai_provider").unwrap_or_else(|| "deepseek".to_string());
+    let mut legacy = get_provider_settings(conn, &provider);
+    let id = next_ai_model_id();
+    legacy.config_id = Some(id.clone());
+    let models = vec![legacy];
+    let _ = save_ai_model_configs(conn, &models);
+    let _ = set_setting(conn, ACTIVE_AI_MODEL_ID_KEY, &id);
+    models
+}
+
+pub fn list_ai_models(conn: &Connection) -> Vec<AiModelSummary> {
+    let models = ensure_ai_model_configs(conn);
+    let active_id = get_setting(conn, ACTIVE_AI_MODEL_ID_KEY);
+    models
+        .into_iter()
+        .filter_map(|settings| {
+            let id = settings.config_id.clone()?;
+            Some(AiModelSummary {
+                active: active_id.as_deref() == Some(id.as_str()),
+                id,
+                name: model_summary_name(&settings),
+                provider: model_summary_provider(&settings),
+                model: settings.model,
+            })
+        })
+        .collect()
+}
+
+pub fn get_ai_model(conn: &Connection, config_id: &str) -> Result<DeepSeekSettings, String> {
+    let mut settings = ensure_ai_model_configs(conn)
+        .into_iter()
+        .find(|settings| settings.config_id.as_deref() == Some(config_id))
+        .ok_or_else(|| "模型配置不存在".to_string())?;
+    apply_global_settings(conn, &mut settings);
+    Ok(settings)
+}
+
+pub fn save_ai_model(
+    conn: &Connection,
+    settings: &DeepSeekSettings,
+) -> Result<DeepSeekSettings, String> {
+    if settings.base_url.trim().is_empty() {
+        return Err("请填写 Base URL".to_string());
+    }
+    if settings.model.trim().is_empty() {
+        return Err("请填写 Model ID".to_string());
+    }
+
+    let mut saved = settings.clone();
+    let id = saved.config_id.clone().unwrap_or_else(next_ai_model_id);
+    saved.config_id = Some(id.clone());
+    saved.provider = normalize_provider_id(&saved.provider).to_string();
+    saved.model_display_name = sanitized_model_display_name(&saved.model_display_name);
+    saved.context_input_tokens = saved.context_input_tokens.max(1);
+    saved.context_output_tokens = saved.context_output_tokens.max(1);
+    saved.tool_call_rounds = saved.tool_call_rounds.max(1);
+
+    save_settings(conn, &saved)?;
+    let mut models = load_ai_model_configs(conn);
+    if let Some(existing) = models
+        .iter_mut()
+        .find(|model| model.config_id.as_deref() == Some(id.as_str()))
+    {
+        *existing = saved.clone();
+    } else {
+        models.push(saved.clone());
+    }
+    save_ai_model_configs(conn, &models)?;
+    set_setting(conn, ACTIVE_AI_MODEL_ID_KEY, &id)?;
+    Ok(saved)
+}
+
+pub fn activate_ai_model(conn: &Connection, config_id: &str) -> Result<DeepSeekSettings, String> {
+    let mut settings = get_ai_model(conn, config_id)?;
+    set_setting(conn, ACTIVE_AI_MODEL_ID_KEY, config_id)?;
+    set_setting(
+        conn,
+        "active_ai_provider",
+        normalize_provider_id(&settings.provider),
+    )?;
+    if let Some(profile_id) = settings.api_token_profile_id.as_deref() {
+        activate_api_token_profile(conn, &settings.provider, profile_id)?;
+        settings.api_key = stored_provider_api_key(conn, normalize_provider_id(&settings.provider));
+    }
+    apply_global_settings(conn, &mut settings);
+    Ok(settings)
+}
+
+pub fn delete_ai_model(conn: &Connection, config_id: &str) -> Result<Vec<AiModelSummary>, String> {
+    if get_setting(conn, ACTIVE_AI_MODEL_ID_KEY).as_deref() == Some(config_id) {
+        return Err("当前正在使用的模型不能删除，请先启用其他模型".to_string());
+    }
+    let mut models = load_ai_model_configs(conn);
+    let original_len = models.len();
+    models.retain(|model| model.config_id.as_deref() != Some(config_id));
+    if models.len() == original_len {
+        return Err("模型配置不存在".to_string());
+    }
+    save_ai_model_configs(conn, &models)?;
+    Ok(list_ai_models(conn))
+}
+
 pub fn get_settings(conn: &Connection) -> DeepSeekSettings {
+    let models = load_ai_model_configs(conn);
+    if !models.is_empty() {
+        let active_id = get_setting(conn, ACTIVE_AI_MODEL_ID_KEY);
+        let mut settings = models
+            .iter()
+            .find(|settings| settings.config_id.as_deref() == active_id.as_deref())
+            .cloned()
+            .unwrap_or_else(|| models[0].clone());
+        apply_global_settings(conn, &mut settings);
+        return settings;
+    }
     let provider =
         get_setting(conn, "active_ai_provider").unwrap_or_else(|| "deepseek".to_string());
     get_provider_settings(conn, &provider)
@@ -742,6 +936,8 @@ pub fn get_provider_settings(conn: &Connection, provider: &str) -> DeepSeekSetti
         .map(|profile| profile.api_key);
 
     DeepSeekSettings {
+        config_id: None,
+        api_token_profile_id: active_profile_id,
         provider: provider.clone(),
         api_key: profile_api_key
             .or_else(|| get_setting(conn, &provider_setting_key(&provider, "api_key")))
@@ -757,6 +953,30 @@ pub fn get_provider_settings(conn: &Connection, provider: &str) -> DeepSeekSetti
             .or(legacy_model)
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| default_model.to_string()),
+        model_display_name: get_setting(
+            conn,
+            &provider_setting_key(&provider, "model_display_name"),
+        )
+        .map(|value| sanitized_model_display_name(&value))
+        .unwrap_or_default(),
+        context_input_tokens: positive_provider_setting(
+            conn,
+            &provider,
+            "context_input_tokens",
+            DEFAULT_CONTEXT_INPUT_TOKENS,
+        ),
+        context_output_tokens: positive_provider_setting(
+            conn,
+            &provider,
+            "context_output_tokens",
+            DEFAULT_CONTEXT_OUTPUT_TOKENS,
+        ),
+        tool_call_rounds: positive_provider_setting(
+            conn,
+            &provider,
+            "tool_call_rounds",
+            DEFAULT_TOOL_CALL_ROUNDS,
+        ),
         system_prompt: get_setting(conn, "system_prompt")
             .unwrap_or_else(|| DEFAULT_PROMPT.to_string()),
         read_retention_days: get_setting(conn, "read_retention_days")
@@ -783,20 +1003,30 @@ pub fn save_settings(conn: &Connection, settings: &DeepSeekSettings) -> Result<(
         &provider_setting_key(provider, "model"),
         &settings.model,
     )?;
+    set_setting(
+        conn,
+        &provider_setting_key(provider, "model_display_name"),
+        &sanitized_model_display_name(&settings.model_display_name),
+    )?;
+    set_setting(
+        conn,
+        &provider_setting_key(provider, "context_input_tokens"),
+        &settings.context_input_tokens.max(1).to_string(),
+    )?;
+    set_setting(
+        conn,
+        &provider_setting_key(provider, "context_output_tokens"),
+        &settings.context_output_tokens.max(1).to_string(),
+    )?;
+    set_setting(
+        conn,
+        &provider_setting_key(provider, "tool_call_rounds"),
+        &settings.tool_call_rounds.max(1).to_string(),
+    )?;
     if provider == "deepseek" {
         set_setting(conn, "api_key", &settings.api_key)?;
         set_setting(conn, "base_url", &settings.base_url)?;
         set_setting(conn, "model", &settings.model)?;
-    }
-    let (mut token_profiles, active_profile_id) = ensure_token_profiles(conn, provider)?;
-    if let Some(active_profile_id) = active_profile_id {
-        if let Some(profile) = token_profiles
-            .iter_mut()
-            .find(|profile| profile.id == active_profile_id)
-        {
-            profile.api_key = settings.api_key.clone();
-            save_token_profiles(conn, provider, &token_profiles)?;
-        }
     }
     set_setting(conn, "system_prompt", &settings.system_prompt)?;
     set_setting(
@@ -890,10 +1120,16 @@ mod tests {
             .unwrap();
         let mut deepseek = get_provider_settings(&conn, "deepseek");
         deepseek.api_key = "deepseek-key".to_string();
+        deepseek.model_display_name = "DeepSeek 论文翻译".to_string();
+        deepseek.context_input_tokens = 1_140_000;
+        deepseek.context_output_tokens = 16_000;
+        deepseek.tool_call_rounds = 500;
         save_settings(&conn, &deepseek).unwrap();
 
         let mut openai = get_provider_settings(&conn, "openai");
         openai.api_key = "openai-key".to_string();
+        openai.model_display_name = "OpenAI 摘要".to_string();
+        openai.context_input_tokens = 200_000;
         save_settings(&conn, &openai).unwrap();
 
         assert_eq!(
@@ -901,7 +1137,72 @@ mod tests {
             "deepseek-key"
         );
         assert_eq!(get_provider_settings(&conn, "openai").api_key, "openai-key");
+        assert_eq!(
+            get_provider_settings(&conn, "deepseek").model_display_name,
+            "DeepSeek 论文翻译"
+        );
+        assert_eq!(
+            get_provider_settings(&conn, "deepseek").context_input_tokens,
+            1_140_000
+        );
+        assert_eq!(
+            get_provider_settings(&conn, "deepseek").tool_call_rounds,
+            500
+        );
+        assert_eq!(
+            get_provider_settings(&conn, "openai").model_display_name,
+            "OpenAI 摘要"
+        );
+        assert_eq!(
+            get_provider_settings(&conn, "openai").context_input_tokens,
+            200_000
+        );
         assert_eq!(get_settings(&conn).provider, "openai");
+    }
+
+    #[test]
+    fn new_model_capability_settings_use_requested_defaults() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+
+        let settings = get_provider_settings(&conn, "deepseek");
+
+        assert!(settings.model_display_name.is_empty());
+        assert_eq!(settings.context_input_tokens, 1_140_000);
+        assert_eq!(settings.context_output_tokens, 16_000);
+        assert_eq!(settings.tool_call_rounds, 500);
+    }
+
+    #[test]
+    fn model_registry_supports_multiple_models_and_active_switching() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+
+        let mut first = get_provider_settings(&conn, "openai_compatible");
+        first.base_url = "https://one.example/v1".to_string();
+        first.model = "model-one".to_string();
+        first.model_display_name = "模型一".to_string();
+        let first = save_ai_model(&conn, &first).unwrap();
+
+        let mut second = first.clone();
+        second.config_id = None;
+        second.base_url = "https://two.example/v1".to_string();
+        second.model = "model-two".to_string();
+        second.model_display_name = "模型二".to_string();
+        let second = save_ai_model(&conn, &second).unwrap();
+
+        let models = list_ai_models(&conn);
+        assert_eq!(models.len(), 2);
+        assert_eq!(get_settings(&conn).model, "model-two");
+        assert!(delete_ai_model(&conn, second.config_id.as_deref().unwrap()).is_err());
+
+        activate_ai_model(&conn, first.config_id.as_deref().unwrap()).unwrap();
+        assert_eq!(get_settings(&conn).model, "model-one");
+        let models = delete_ai_model(&conn, second.config_id.as_deref().unwrap()).unwrap();
+        assert_eq!(models.len(), 1);
+        assert!(models[0].active);
     }
 
     #[test]
@@ -915,7 +1216,7 @@ mod tests {
 
         assert_eq!(list.active_id.as_deref(), Some("default"));
         assert_eq!(list.profiles.len(), 1);
-        assert_eq!(list.profiles[0].name, "默认 Token");
+        assert_eq!(list.profiles[0].name, "默认 API Key");
         assert_eq!(list.profiles[0].masked_key, "••••1234");
         assert_eq!(get_settings(&conn).api_key, "legacy-secret-1234");
     }

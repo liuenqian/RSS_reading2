@@ -1,5 +1,5 @@
 use crate::db::DbState;
-use crate::models::{ApiTokenProfileList, DeepSeekBalance, DeepSeekSettings};
+use crate::models::{AiModelSummary, ApiTokenProfileList, DeepSeekBalance, DeepSeekSettings};
 use crate::services::{settings_service, translate_service};
 use tauri::State;
 
@@ -22,6 +22,45 @@ pub fn get_provider_settings(
 pub fn save_settings(state: State<DbState>, settings: DeepSeekSettings) -> Result<(), String> {
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
     settings_service::save_settings(&conn, &settings)
+}
+
+#[tauri::command]
+pub fn list_ai_models(state: State<DbState>) -> Result<Vec<AiModelSummary>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    Ok(settings_service::list_ai_models(&conn))
+}
+
+#[tauri::command]
+pub fn get_ai_model(state: State<DbState>, config_id: String) -> Result<DeepSeekSettings, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    settings_service::get_ai_model(&conn, &config_id)
+}
+
+#[tauri::command]
+pub fn save_ai_model(
+    state: State<DbState>,
+    settings: DeepSeekSettings,
+) -> Result<DeepSeekSettings, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    settings_service::save_ai_model(&conn, &settings)
+}
+
+#[tauri::command]
+pub fn activate_ai_model(
+    state: State<DbState>,
+    config_id: String,
+) -> Result<DeepSeekSettings, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    settings_service::activate_ai_model(&conn, &config_id)
+}
+
+#[tauri::command]
+pub fn delete_ai_model(
+    state: State<DbState>,
+    config_id: String,
+) -> Result<Vec<AiModelSummary>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    settings_service::delete_ai_model(&conn, &config_id)
 }
 
 #[tauri::command]

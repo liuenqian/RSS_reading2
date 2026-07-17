@@ -1,5 +1,21 @@
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_CONTEXT_INPUT_TOKENS: i64 = 1_140_000;
+pub const DEFAULT_CONTEXT_OUTPUT_TOKENS: i64 = 16_000;
+pub const DEFAULT_TOOL_CALL_ROUNDS: i64 = 500;
+
+fn default_context_input_tokens() -> i64 {
+    DEFAULT_CONTEXT_INPUT_TOKENS
+}
+
+fn default_context_output_tokens() -> i64 {
+    DEFAULT_CONTEXT_OUTPUT_TOKENS
+}
+
+fn default_tool_call_rounds() -> i64 {
+    DEFAULT_TOOL_CALL_ROUNDS
+}
+
 fn default_reading_mode() -> String {
     "quick".to_string()
 }
@@ -316,13 +332,34 @@ pub struct PubmedSearchProgress {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeepSeekSettings {
+    #[serde(default)]
+    pub config_id: Option<String>,
+    #[serde(default)]
+    pub api_token_profile_id: Option<String>,
     #[serde(default = "default_ai_provider")]
     pub provider: String,
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    #[serde(default)]
+    pub model_display_name: String,
+    #[serde(default = "default_context_input_tokens")]
+    pub context_input_tokens: i64,
+    #[serde(default = "default_context_output_tokens")]
+    pub context_output_tokens: i64,
+    #[serde(default = "default_tool_call_rounds")]
+    pub tool_call_rounds: i64,
     pub system_prompt: String,
     pub read_retention_days: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiModelSummary {
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

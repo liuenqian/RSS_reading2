@@ -123,8 +123,12 @@ let settingsView, mainView, contentArea;
 let btnSettings, btnSidebar, btnRefresh, refreshIcon, btnTogglePaperChatToolbar;
 let toolbarSubtitle, toolbarApiPicker, toolbarApiButton, toolbarApiLabel;
 let toolbarApiMenu, toolbarApiList, btnManageApiTokens;
-let providerSelect, apiKeyInput, baseUrlInput, modelInput, systemPromptInput;
+let providerSelect, apiKeyInput, baseUrlInput, modelInput, modelPresetSelect, customModelInput, systemPromptInput;
+let modelDisplayNameInput, modelDisplayNameCount, contextInputTokensInput, contextOutputTokensInput, toolCallRoundsInput;
+let btnApiModeProvider, btnApiModeCustom, apiProviderPanel, apiCustomPanel;
 let btnToggleApiKey, btnTest, btnSaveSettings, btnSaveGeneral;
+let aiModelList, aiModelEmpty, aiModelEditor, aiModelEditorTitle, aiModelStatus;
+let btnAddAiModel, btnCancelAiModel;
 let apiTokenProfileSelect, apiTokenProfileNameInput, btnNewApiToken, btnDeleteApiToken;
 let settingsStatus, generalStatus;
 let retentionSelect, themeControl, accentSwatches, fontscaleControl, titleDisplaySelect;
@@ -215,11 +219,20 @@ let entrySelectionMode = false;
 let selectedEntryIds = new Set();
 let apiTokenProfileData = { provider: 'deepseek', active_id: null, profiles: [] };
 let toolbarApiProfileRefreshId = 0;
+let lastPresetProvider = 'sensenova';
+let aiModels = [];
+let editingAiModelId = null;
+let editingApiTokenProfileId = null;
 
 const SCI_HUB_BASE_URL = 'https://www.sci-hub.st/';
 const SCI_HUB_LAST_RELIABLE_PUBLICATION_YEAR = 2020;
 
 const AI_PROVIDER_META = {
+  sensenova: {
+    label: 'SenseNova',
+    baseUrl: 'https://token.sensenova.cn/v1',
+    model: 'deepseek-v4-flash',
+  },
   deepseek: {
     label: 'DeepSeek',
     baseUrl: 'https://api.deepseek.com',
@@ -245,6 +258,11 @@ const AI_PROVIDER_META = {
     baseUrl: 'https://example.com/v1',
     model: 'model-name',
   },
+};
+const SENSENOVA_PRESET = {
+  provider: 'deepseek',
+  baseUrl: 'https://token.sensenova.cn/v1',
+  model: 'deepseek-v4-flash',
 };
 let entrySelectionAnchorId = null;
 let entryBulkExistingStrategy = 'skip';
@@ -636,13 +654,13 @@ function updateCostMeter() {
   const pct = total == null ? 0 : Math.min(100, total / 20 * 100);
   el('cost-fill').style.width = pct + '%';
   const breakdown = summary?.breakdown || [];
-  const activeProvider = providerSelect?.value || 'deepseek';
+  const activeProvider = activeProviderId();
   const activeMeta = AI_PROVIDER_META[activeProvider] || AI_PROVIDER_META.deepseek;
   const costModel = el('cost-model');
   if (costModel) {
     costModel.textContent = breakdown.length > 0
       ? `${AI_PROVIDER_META[breakdown[0].provider]?.label || breakdown[0].provider} · ${breakdown[0].model}`
-      : `${activeMeta.label} · ${(modelInput?.value || activeMeta.model).trim()}`;
+      : `${activeMeta.label} · ${activeModelDisplayName()}`;
   }
   // Detailed hover-tooltip so curious users can see the full breakdown
   // (cache hit/miss/output tokens per model).
@@ -728,30 +746,287 @@ function activeProviderId() {
   return providerSelect?.value || 'deepseek';
 }
 
+function providerStorageId(provider = activeProviderId()) {
+  return provider === 'sensenova' ? 'deepseek' : provider;
+}
+
+function isSenseNovaUrl(value) {
+  return /^https:\/\/token\.sensenova\.cn(?:\/|$)/i.test((value || '').trim());
+}
+
+function displayProviderId(settings) {
+  if (settings?.provider === 'deepseek' && isSenseNovaUrl(settings.base_url)) {
+    return 'sensenova';
+  }
+  return settings?.provider || 'deepseek';
+}
+
+function supportsDeepSeekBalance(provider, baseUrl) {
+  return provider === 'deepseek'
+    && /^https:\/\/api\.deepseek\.com(?:\/|$)/i.test((baseUrl || '').trim());
+}
+
+function syncModelControls() {
+  const provider = activeProviderId();
+  const meta = AI_PROVIDER_META[provider] || AI_PROVIDER_META.deepseek;
+  const configuredModel = (modelInput?.value || meta.model).trim();
+
+  if (provider === 'openai_compatible') {
+    if (customModelInput) customModelInput.value = (modelInput?.value || '').trim();
+    return;
+  }
+
+  if (!modelPresetSelect) return;
+  const models = [...new Set([meta.model, configuredModel].filter(Boolean))];
+  const displayName = modelDisplayNameInput?.value.trim();
+  modelPresetSelect.replaceChildren(...models.map(model => {
+    const option = document.createElement('option');
+    option.value = model;
+    option.textContent = displayName && model === configuredModel
+      ? `${displayName} (${model})`
+      : model;
+    return option;
+  }));
+  modelPresetSelect.value = configuredModel;
+  if (modelInput) modelInput.value = configuredModel;
+}
+
+function updateModelDisplayNameCount() {
+  if (!modelDisplayNameCount) return;
+  modelDisplayNameCount.textContent = `${modelDisplayNameInput?.value.length || 0}/32`;
+}
+
+function activeModelDisplayName() {
+  const providerMeta = AI_PROVIDER_META[activeProviderId()] || AI_PROVIDER_META.deepseek;
+  return modelDisplayNameInput?.value.trim()
+    || (modelInput?.value || providerMeta.model).trim()
+    || providerMeta.label;
+}
+
+function positiveIntegerValue(input, fallback) {
+  const value = Math.trunc(Number(input?.value));
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function syncApiConfigMode() {
+  const customMode = activeProviderId() === 'openai_compatible';
+  btnApiModeProvider?.classList.toggle('active', !customMode);
+  btnApiModeCustom?.classList.toggle('active', customMode);
+  btnApiModeProvider?.setAttribute('aria-selected', String(!customMode));
+  btnApiModeCustom?.setAttribute('aria-selected', String(customMode));
+  apiProviderPanel?.classList.toggle('hidden', customMode);
+  apiCustomPanel?.classList.toggle('hidden', !customMode);
+  syncModelControls();
+}
+
+function selectApiConfigMode(mode) {
+  const customMode = mode === 'custom';
+  const currentProvider = activeProviderId();
+  if (customMode && currentProvider !== 'openai_compatible') {
+    lastPresetProvider = currentProvider;
+    providerSelect.value = 'openai_compatible';
+  } else if (!customMode && currentProvider === 'openai_compatible') {
+    providerSelect.value = lastPresetProvider;
+  }
+  syncApiConfigMode();
+  syncProviderUi();
+  loadProviderSettings(activeProviderId());
+}
+
 function syncProviderUi() {
   const provider = activeProviderId();
   const meta = AI_PROVIDER_META[provider] || AI_PROVIDER_META.deepseek;
   if (baseUrlInput) baseUrlInput.placeholder = meta.baseUrl;
-  if (modelInput) modelInput.placeholder = meta.model;
-  const modelLabel = `${meta.label} · ${(modelInput?.value || meta.model).trim()}`;
+  if (customModelInput) customModelInput.placeholder = meta.model;
+  const modelLabel = `${meta.label} · ${activeModelDisplayName()}`;
   const briefingSettingsModel = document.getElementById('briefing-settings-model');
   const briefingDetailModel = document.getElementById('briefing-detail-model');
   if (briefingSettingsModel) briefingSettingsModel.textContent = modelLabel;
   if (briefingDetailModel) briefingDetailModel.textContent = modelLabel;
-  document.getElementById('deepseek-balance-card')?.classList.toggle('hidden', provider !== 'deepseek');
+  const configuredBaseUrl = (baseUrlInput?.value || meta.baseUrl).trim();
+  const supportsBalance = supportsDeepSeekBalance(provider, configuredBaseUrl);
+  document.getElementById('deepseek-balance-card')?.classList.toggle('hidden', !supportsBalance);
+  const keySourceText = document.getElementById('api-key-source-text');
+  const keySourceLink = document.getElementById('api-key-source-link');
+  if (keySourceLink && keySourceText) {
+    const linkConfig = provider === 'sensenova'
+      ? { text: '没有 API Key？', label: '申请免费 API Key', href: 'https://www.sensenova.cn/' }
+      : provider === 'deepseek'
+        ? { text: '没有 API Key？', label: '前往 DeepSeek 控制台', href: 'https://platform.deepseek.com/api_keys' }
+        : null;
+    keySourceText.textContent = linkConfig?.text || '请在所选服务商控制台创建 API Key。';
+    keySourceLink.classList.toggle('hidden', !linkConfig);
+    if (linkConfig) {
+      keySourceLink.textContent = linkConfig.label;
+      keySourceLink.href = linkConfig.href;
+    }
+  }
   updateCostMeter();
 }
 
 function applyProviderSettings(settings, { includeGlobal = false } = {}) {
-  if (providerSelect) providerSelect.value = settings.provider || 'deepseek';
+  const displayProvider = displayProviderId(settings);
+  if (providerSelect) providerSelect.value = displayProvider;
+  if (displayProvider !== 'openai_compatible') lastPresetProvider = displayProvider;
   apiKeyInput.value = settings.api_key || '';
   baseUrlInput.value = settings.base_url || '';
   modelInput.value = settings.model || '';
+  modelDisplayNameInput.value = settings.model_display_name || '';
+  contextInputTokensInput.value = String(settings.context_input_tokens || 1140000);
+  contextOutputTokensInput.value = String(settings.context_output_tokens || 16000);
+  toolCallRoundsInput.value = String(settings.tool_call_rounds || 500);
+  editingApiTokenProfileId = settings.api_token_profile_id || null;
+  updateModelDisplayNameCount();
+  syncApiConfigMode();
   if (includeGlobal) {
     systemPromptInput.value = settings.system_prompt || '';
     retentionSelect.value = String(settings.read_retention_days ?? 0);
   }
   syncProviderUi();
+}
+
+function setAiModelEditorVisible(visible, title = '编辑模型') {
+  aiModelEditor?.classList.toggle('hidden', !visible);
+  if (aiModelEditorTitle) aiModelEditorTitle.textContent = title;
+  if (visible) aiModelEditor?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function setAiModelStatus(message = '', type = '') {
+  if (!aiModelStatus) return;
+  aiModelStatus.textContent = message;
+  aiModelStatus.className = `settings-status ai-model-manager-status${type ? ` ${type}` : ''}`;
+}
+
+function renderAiModels(models) {
+  aiModels = Array.isArray(models) ? models : [];
+  if (!aiModelList) return;
+  aiModelList.replaceChildren();
+  aiModelEmpty?.classList.toggle('hidden', aiModels.length > 0);
+
+  aiModels.forEach(model => {
+    const row = document.createElement('tr');
+    row.dataset.modelId = model.id;
+
+    const modelCell = document.createElement('td');
+    const name = document.createElement('span');
+    name.className = 'ai-model-name';
+    name.textContent = model.name || model.model;
+    const modelId = document.createElement('span');
+    modelId.className = 'ai-model-id';
+    modelId.textContent = model.model;
+    modelCell.append(name, modelId);
+
+    const providerCell = document.createElement('td');
+    providerCell.className = 'ai-model-provider';
+    providerCell.textContent = AI_PROVIDER_META[model.provider]?.label || model.provider;
+
+    const stateCell = document.createElement('td');
+    stateCell.className = `ai-model-state${model.active ? ' active' : ''}`;
+    stateCell.textContent = model.active ? '当前使用' : '已保存';
+
+    const actionsCell = document.createElement('td');
+    actionsCell.className = 'ai-model-actions';
+    const editButton = document.createElement('button');
+    editButton.type = 'button';
+    editButton.className = 'ai-model-action';
+    editButton.dataset.action = 'edit';
+    editButton.textContent = '编辑';
+    const activateButton = document.createElement('button');
+    activateButton.type = 'button';
+    activateButton.className = 'ai-model-action';
+    activateButton.dataset.action = 'activate';
+    activateButton.textContent = model.active ? '使用中' : '启用';
+    activateButton.disabled = model.active;
+    const deleteButton = document.createElement('button');
+    deleteButton.type = 'button';
+    deleteButton.className = 'ai-model-action danger';
+    deleteButton.dataset.action = 'delete';
+    deleteButton.textContent = '删除';
+    deleteButton.disabled = model.active;
+    actionsCell.append(editButton);
+    if (!model.active) actionsCell.append(activateButton);
+    actionsCell.append(deleteButton);
+
+    row.append(modelCell, providerCell, stateCell, actionsCell);
+    aiModelList.appendChild(row);
+  });
+}
+
+async function refreshAiModels() {
+  try {
+    const models = await invoke('list_ai_models');
+    renderAiModels(models);
+    return models;
+  } catch (error) {
+    setAiModelStatus('加载模型列表失败: ' + error, 'error');
+    return [];
+  }
+}
+
+async function beginAddAiModel() {
+  editingAiModelId = null;
+  editingApiTokenProfileId = null;
+  providerSelect.value = 'sensenova';
+  lastPresetProvider = 'sensenova';
+  apiKeyInput.value = '';
+  baseUrlInput.value = SENSENOVA_PRESET.baseUrl;
+  modelInput.value = SENSENOVA_PRESET.model;
+  modelDisplayNameInput.value = '';
+  contextInputTokensInput.value = '1140000';
+  contextOutputTokensInput.value = '16000';
+  toolCallRoundsInput.value = '500';
+  updateModelDisplayNameCount();
+  syncApiConfigMode();
+  syncProviderUi();
+  await loadApiTokenProfiles('sensenova');
+  beginNewApiTokenProfile();
+  showSettingsStatus('', '');
+  setAiModelEditorVisible(true, '添加模型');
+}
+
+async function editAiModel(configId) {
+  try {
+    const settings = await invoke('get_ai_model', { configId });
+    editingAiModelId = settings.config_id;
+    applyProviderSettings(settings);
+    await loadApiTokenProfiles(activeProviderId());
+    if (settings.api_token_profile_id && apiTokenProfileSelect) {
+      apiTokenProfileSelect.value = settings.api_token_profile_id;
+    }
+    setAiModelEditorVisible(true, '编辑模型');
+    showSettingsStatus('', '');
+  } catch (error) {
+    setAiModelStatus('读取模型失败: ' + error, 'error');
+  }
+}
+
+async function activateAiModel(configId) {
+  try {
+    const settings = await invoke('activate_ai_model', { configId });
+    editingAiModelId = settings.config_id;
+    applyProviderSettings(settings, { includeGlobal: true });
+    await loadApiTokenProfiles(activeProviderId());
+    await refreshAiModels();
+    setAiModelEditorVisible(false);
+    updateView(!!settings.api_key);
+    setAiModelStatus(`已启用 ${settings.model_display_name || settings.model}`, 'success');
+    setTimeout(() => setAiModelStatus('', ''), 2500);
+    invoke('start_translation_pipeline').catch(() => {});
+  } catch (error) {
+    setAiModelStatus('启用失败: ' + error, 'error');
+  }
+}
+
+async function deleteAiModel(configId) {
+  const model = aiModels.find(item => item.id === configId);
+  if (!model || !window.confirm(`删除模型“${model.name}”？`)) return;
+  try {
+    renderAiModels(await invoke('delete_ai_model', { configId }));
+    setAiModelStatus('模型已删除', 'success');
+    setTimeout(() => setAiModelStatus('', ''), 2500);
+  } catch (error) {
+    setAiModelStatus('删除失败: ' + error, 'error');
+  }
 }
 
 function activeTokenProfile() {
@@ -793,12 +1068,13 @@ function renderToolbarApiProfiles(profileLists) {
     (total, list) => total + list.profiles.length,
     0
   );
-  const currentProvider = activeProviderId();
+  const visibleProvider = activeProviderId();
+  const currentProvider = providerStorageId(visibleProvider);
   const currentList = availableLists.find(list => list.provider === currentProvider);
   const currentProfile = currentList?.profiles.find(
     profile => profile.id === currentList.active_id
   );
-  const currentProviderLabel = AI_PROVIDER_META[currentProvider]?.label || currentProvider;
+  const currentProviderLabel = AI_PROVIDER_META[visibleProvider]?.label || visibleProvider;
 
   toolbarApiLabel.textContent = currentProfile
     ? `${currentProviderLabel} · ${currentProfile.name}`
@@ -866,7 +1142,7 @@ function renderToolbarApiProfiles(profileLists) {
 
 async function refreshToolbarApiProfiles() {
   const requestId = ++toolbarApiProfileRefreshId;
-  const providers = Object.keys(AI_PROVIDER_META);
+  const providers = Object.keys(AI_PROVIDER_META).filter(provider => provider !== 'sensenova');
   const results = await Promise.allSettled(
     providers.map(async provider => invoke('list_api_token_profiles', { provider }))
   );
@@ -890,7 +1166,7 @@ function renderApiTokenProfiles({ preserveDraft = false } = {}) {
   if (preserveDraft && apiTokenProfileSelect) {
     const option = document.createElement('option');
     option.value = '__new__';
-    option.textContent = '新 Token';
+    option.textContent = '新 API Key';
     apiTokenProfileSelect.appendChild(option);
     apiTokenProfileSelect.value = '__new__';
     return;
@@ -901,14 +1177,15 @@ function renderApiTokenProfiles({ preserveDraft = false } = {}) {
 }
 
 async function loadApiTokenProfiles(provider) {
+  const storedProvider = providerStorageId(provider);
   try {
-    const data = await invoke('list_api_token_profiles', { provider });
-    if (activeProviderId() !== provider) return;
+    const data = await invoke('list_api_token_profiles', { provider: storedProvider });
+    if (providerStorageId(activeProviderId()) !== storedProvider) return;
     apiTokenProfileData = data;
     renderApiTokenProfiles();
     await refreshToolbarApiProfiles();
   } catch (error) {
-    showSettingsStatus('加载 Token 档案失败: ' + error, 'error');
+    showSettingsStatus('加载 API Key 列表失败: ' + error, 'error');
   }
 }
 
@@ -918,23 +1195,26 @@ async function activateApiTokenProfile(
   { fromToolbar = false } = {}
 ) {
   if (!profileId || profileId === '__new__') return;
+  const storedProvider = providerStorageId(provider);
   try {
     apiTokenProfileData = await invoke('activate_api_token_profile', {
-      provider,
+      provider: storedProvider,
       profileId,
     });
-    const settings = await invoke('get_provider_settings', { provider });
+    const settings = await invoke('get_provider_settings', { provider: storedProvider });
     applyProviderSettings(settings);
     renderApiTokenProfiles();
     await refreshToolbarApiProfiles();
     updateView(!!settings.api_key);
-    const profileName = activeTokenProfile()?.name || '当前 Token';
+    const profileName = activeTokenProfile()?.name || '当前 API Key';
     const providerLabel = AI_PROVIDER_META[provider]?.label || provider;
     showSettingsStatus(`已切换到 ${profileName}`, 'success');
     if (fromToolbar) setGlobalStatus(`已切换到 ${providerLabel} · ${profileName}`, 'success');
     setTimeout(() => showSettingsStatus('', ''), 2200);
     invoke('start_translation_pipeline').catch(() => {});
-    if (provider === 'deepseek') refreshDeepSeekBalance({ silent: true });
+    if (supportsDeepSeekBalance(activeProviderId(), baseUrlInput?.value)) {
+      refreshDeepSeekBalance({ silent: true });
+    }
   } catch (error) {
     renderApiTokenProfiles();
     await refreshToolbarApiProfiles();
@@ -956,8 +1236,8 @@ function beginNewApiTokenProfile() {
 
 async function deleteCurrentApiTokenProfile() {
   const profile = activeTokenProfile();
-  if (!profile || !window.confirm(`删除 Token 档案“${profile.name}”？`)) return;
-  const provider = activeProviderId();
+  if (!profile || !window.confirm(`删除 API Key“${profile.name}”？`)) return;
+  const provider = providerStorageId();
   try {
     apiTokenProfileData = await invoke('delete_api_token_profile', {
       provider,
@@ -968,16 +1248,24 @@ async function deleteCurrentApiTokenProfile() {
     renderApiTokenProfiles();
     await refreshToolbarApiProfiles();
     updateView(!!settings.api_key);
-    showSettingsStatus('Token 已删除', 'success');
+    showSettingsStatus('API Key 已删除', 'success');
   } catch (error) {
     showSettingsStatus('删除失败: ' + error, 'error');
   }
 }
 
 async function loadProviderSettings(provider) {
+  const storedProvider = providerStorageId(provider);
   try {
-    const settings = await invoke('get_provider_settings', { provider });
+    const settings = await invoke('get_provider_settings', { provider: storedProvider });
     if (activeProviderId() !== provider) return;
+    if (provider === 'sensenova') {
+      settings.base_url = SENSENOVA_PRESET.baseUrl;
+      settings.model = SENSENOVA_PRESET.model;
+    } else if (provider === 'deepseek' && isSenseNovaUrl(settings.base_url)) {
+      settings.base_url = AI_PROVIDER_META.deepseek.baseUrl;
+      settings.model = AI_PROVIDER_META.deepseek.model;
+    }
     applyProviderSettings(settings);
     await loadApiTokenProfiles(provider);
     showSettingsStatus('', '');
@@ -988,10 +1276,16 @@ async function loadProviderSettings(provider) {
 
 function collectAiSettings() {
   return {
-    provider: activeProviderId(),
+    config_id: editingAiModelId,
+    api_token_profile_id: editingApiTokenProfileId,
+    provider: providerStorageId(),
     api_key: apiKeyInput.value.trim(),
     base_url: baseUrlInput.value.trim(),
     model: modelInput.value.trim(),
+    model_display_name: modelDisplayNameInput.value.trim(),
+    context_input_tokens: positiveIntegerValue(contextInputTokensInput, 1140000),
+    context_output_tokens: positiveIntegerValue(contextOutputTokensInput, 16000),
+    tool_call_rounds: positiveIntegerValue(toolCallRoundsInput, 500),
     system_prompt: systemPromptInput.value.trim(),
     read_retention_days: parseInt(retentionSelect?.value, 10) || 0,
   };
@@ -999,9 +1293,12 @@ function collectAiSettings() {
 
 async function loadSettings() {
   try {
+    await refreshAiModels();
     const s = await invoke('get_settings');
+    editingAiModelId = s.config_id || null;
     applyProviderSettings(s, { includeGlobal: true });
-    await loadApiTokenProfiles(s.provider || 'deepseek');
+    await loadApiTokenProfiles(activeProviderId());
+    setAiModelEditorVisible(!s.api_key, s.config_id ? '编辑模型' : '添加模型');
     updateView(!!s.api_key);
   } catch (e) {
     showSettingsStatus('加载设置失败: ' + e, 'error');
@@ -1105,27 +1402,35 @@ async function refreshDeepSeekBalance({ silent = false } = {}) {
 async function saveTranslationSettings() {
   const settings = collectAiSettings();
   try {
+    let savedSettings = await invoke('save_ai_model', { settings });
+    editingAiModelId = savedSettings.config_id;
     if (settings.api_key) {
       apiTokenProfileData = await invoke('upsert_api_token_profile', {
         provider: settings.provider,
         profileId: apiTokenProfileSelect?.value === '__new__'
           ? null
-          : (apiTokenProfileSelect?.value || apiTokenProfileData.active_id),
-        name: apiTokenProfileNameInput?.value.trim() || '默认 Token',
+          : (editingApiTokenProfileId || apiTokenProfileSelect?.value || apiTokenProfileData.active_id),
+        name: apiTokenProfileNameInput?.value.trim() || '默认 API Key',
         apiKey: settings.api_key,
       });
+      editingApiTokenProfileId = apiTokenProfileData.active_id;
+      savedSettings.api_token_profile_id = editingApiTokenProfileId;
+      savedSettings = await invoke('save_ai_model', { settings: savedSettings });
     }
-    await invoke('save_settings', { settings });
     renderApiTokenProfiles();
     await refreshToolbarApiProfiles();
-    showSettingsStatus('设置已保存', 'success');
-    updateView(!!settings.api_key);
+    await refreshAiModels();
+    setAiModelEditorVisible(false);
+    showSettingsStatus('模型已保存', 'success');
+    updateView(!!savedSettings.api_key);
     // If the user just configured (or updated) the API key, kick the pipeline so
     // any entries that were waiting for a key start translating immediately,
     // and refresh the balance card with the new credentials.
     if (settings.api_key && !pubmedPreviewSettingsReturnPending) {
       invoke('start_translation_pipeline').catch(() => {});
-      if (settings.provider === 'deepseek') refreshDeepSeekBalance({ silent: true });
+      if (supportsDeepSeekBalance(activeProviderId(), settings.base_url)) {
+        refreshDeepSeekBalance({ silent: true });
+      }
     }
     if (pubmedPreviewSettingsReturnPending) {
       showMain();
@@ -6528,7 +6833,7 @@ function showDetail(entry) {
 
   const aiFooter = document.getElementById('detail-ai-footer');
   const providerMeta = AI_PROVIDER_META[activeProviderId()] || AI_PROVIDER_META.deepseek;
-  const modelName = (modelInput?.value || providerMeta.model).trim() || providerMeta.label;
+  const modelName = activeModelDisplayName();
   document.getElementById('ai-model-name').textContent = `由 ${providerMeta.label} · ${modelName} 翻译`;
   if (entry.title_translated || entry.summary_translated) {
     aiFooter?.classList.remove('hidden');
@@ -8463,7 +8768,7 @@ function selectBriefing(id) {
   }
 
   const providerMeta = AI_PROVIDER_META[activeProviderId()] || AI_PROVIDER_META.deepseek;
-  const modelName = (modelInput?.value || providerMeta.model).trim() || providerMeta.label;
+  const modelName = activeModelDisplayName();
   document.getElementById('briefing-detail-footer-text').innerHTML =
     `<span class="ai-footer-strong">由 ${escapeHtml(providerMeta.label)} · ${escapeHtml(modelName)} 生成</span>，覆盖 ${(b.counts?.feeds || 0)} 个订阅源、${(b.counts?.articles || 0)} 篇文献。可在「AI 简报」设置调整频率与 Prompt。`;
 }
@@ -9854,12 +10159,30 @@ window.addEventListener('DOMContentLoaded', () => {
   apiKeyInput       = document.getElementById('api-key');
   baseUrlInput      = document.getElementById('base-url');
   modelInput        = document.getElementById('model');
+  modelPresetSelect = document.getElementById('api-model-preset');
+  customModelInput  = document.getElementById('custom-model');
+  modelDisplayNameInput = document.getElementById('model-display-name');
+  modelDisplayNameCount = document.getElementById('model-display-name-count');
+  contextInputTokensInput = document.getElementById('context-input-tokens');
+  contextOutputTokensInput = document.getElementById('context-output-tokens');
+  toolCallRoundsInput = document.getElementById('tool-call-rounds');
+  btnApiModeProvider = document.getElementById('api-mode-provider');
+  btnApiModeCustom = document.getElementById('api-mode-custom');
+  apiProviderPanel = document.getElementById('api-provider-panel');
+  apiCustomPanel = document.getElementById('api-custom-panel');
   systemPromptInput = document.getElementById('system-prompt');
   retentionSelect   = document.getElementById('read-retention');
   titleDisplaySelect = document.getElementById('title-display-mode');
   btnToggleApiKey   = document.getElementById('btn-toggle-api-key');
   btnTest           = document.getElementById('btn-test');
   btnSaveSettings   = document.getElementById('btn-save-settings');
+  aiModelList       = document.getElementById('ai-model-list');
+  aiModelEmpty      = document.getElementById('ai-model-empty');
+  aiModelEditor     = document.getElementById('ai-model-editor');
+  aiModelEditorTitle = document.getElementById('ai-model-editor-title');
+  aiModelStatus     = document.getElementById('ai-model-status');
+  btnAddAiModel     = document.getElementById('btn-add-ai-model');
+  btnCancelAiModel  = document.getElementById('btn-cancel-ai-model');
   apiTokenProfileSelect = document.getElementById('api-token-profile');
   apiTokenProfileNameInput = document.getElementById('api-token-profile-name');
   btnNewApiToken = document.getElementById('btn-new-api-token');
@@ -10028,8 +10351,35 @@ window.addEventListener('DOMContentLoaded', () => {
 
   btnRefresh.addEventListener('click', refreshAll);
   providerSelect?.addEventListener('change', () => {
+    lastPresetProvider = activeProviderId();
     syncProviderUi();
     loadProviderSettings(activeProviderId());
+  });
+  baseUrlInput?.addEventListener('input', syncProviderUi);
+  modelPresetSelect?.addEventListener('change', () => {
+    if (modelInput) modelInput.value = modelPresetSelect.value;
+    syncProviderUi();
+  });
+  customModelInput?.addEventListener('input', () => {
+    if (modelInput) modelInput.value = customModelInput.value;
+    syncProviderUi();
+  });
+  modelDisplayNameInput?.addEventListener('input', () => {
+    updateModelDisplayNameCount();
+    syncModelControls();
+    syncProviderUi();
+  });
+  btnApiModeProvider?.addEventListener('click', () => selectApiConfigMode('provider'));
+  btnApiModeCustom?.addEventListener('click', () => selectApiConfigMode('custom'));
+  btnAddAiModel?.addEventListener('click', beginAddAiModel);
+  btnCancelAiModel?.addEventListener('click', () => setAiModelEditorVisible(false));
+  aiModelList?.addEventListener('click', event => {
+    const button = event.target.closest('[data-action]');
+    const row = button?.closest('[data-model-id]');
+    if (!button || !row) return;
+    if (button.dataset.action === 'edit') editAiModel(row.dataset.modelId);
+    if (button.dataset.action === 'activate') activateAiModel(row.dataset.modelId);
+    if (button.dataset.action === 'delete') deleteAiModel(row.dataset.modelId);
   });
   apiTokenProfileSelect?.addEventListener('change', () => {
     activateApiTokenProfile(apiTokenProfileSelect.value);
@@ -10060,7 +10410,6 @@ window.addEventListener('DOMContentLoaded', () => {
   });
   btnNewApiToken?.addEventListener('click', beginNewApiTokenProfile);
   btnDeleteApiToken?.addEventListener('click', deleteCurrentApiTokenProfile);
-  modelInput?.addEventListener('input', syncProviderUi);
   btnToggleApiKey.addEventListener('click', toggleApiKeyVisibility);
   btnTest.addEventListener('click', testConnection);
   btnSaveSettings.addEventListener('click', saveTranslationSettings);

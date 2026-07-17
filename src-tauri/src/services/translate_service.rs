@@ -200,6 +200,10 @@ fn parse_provider_response(
     Ok(TranslationOutput { content, usage })
 }
 
+fn capped_max_tokens(requested: i64, configured_limit: i64) -> i64 {
+    requested.max(1).min(configured_limit.max(1))
+}
+
 pub async fn complete_with_messages(
     settings: &DeepSeekSettings,
     messages: Vec<(String, String)>,
@@ -207,6 +211,7 @@ pub async fn complete_with_messages(
     max_tokens: i64,
 ) -> Result<TranslationOutput, String> {
     let provider = settings_service::normalize_provider_id(&settings.provider);
+    let max_tokens = capped_max_tokens(max_tokens, settings.context_output_tokens);
     if settings.base_url.trim().is_empty() {
         return Err("请填写 Base URL".to_string());
     }
@@ -486,5 +491,12 @@ mod tests {
 
         assert!(message.contains("额度已用尽"));
         assert!(message.contains("AI 设置"));
+    }
+
+    #[test]
+    fn caps_requested_output_tokens_to_the_configured_context_limit() {
+        assert_eq!(capped_max_tokens(32_000, 16_000), 16_000);
+        assert_eq!(capped_max_tokens(1_000, 16_000), 1_000);
+        assert_eq!(capped_max_tokens(0, 16_000), 1);
     }
 }

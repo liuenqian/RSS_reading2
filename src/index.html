@@ -981,69 +981,132 @@
                             </p>
                         </div>
 
-                        <div class="settings-card">
-                            <div class="settings-card-header">API 凭据</div>
-                            <div class="settings-card-body">
-                                <div class="settings-row">
-                                    <label class="srow-label" for="ai-provider"
-                                        >服务商</label
-                                    >
-                                    <select
-                                        id="ai-provider"
-                                        class="settings-input"
-                                    >
-                                        <option value="deepseek">DeepSeek</option>
-                                        <option value="openai">OpenAI</option>
-                                        <option value="anthropic">Anthropic Claude</option>
-                                        <option value="gemini">Google Gemini</option>
-                                        <option value="openai_compatible">自定义 OpenAI-compatible</option>
-                                    </select>
+                        <div class="settings-card ai-model-manager-card">
+                            <div class="settings-card-header ai-model-manager-header">
+                                <div>
+                                    <div>模型管理</div>
+                                    <div class="settings-card-subtitle">集中管理翻译使用的模型，并选择当前模型。</div>
                                 </div>
+                                <button type="button" id="btn-add-ai-model" class="btn btn-secondary ai-model-add-btn">
+                                    <span aria-hidden="true">＋</span>
+                                    添加模型
+                                </button>
+                            </div>
+                            <div class="ai-model-table-wrap">
+                                <table class="ai-model-table">
+                                    <thead>
+                                        <tr>
+                                            <th>模型</th>
+                                            <th>服务商</th>
+                                            <th>状态</th>
+                                            <th class="ai-model-actions-heading">操作</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="ai-model-list"></tbody>
+                                </table>
+                                <div id="ai-model-empty" class="ai-model-empty hidden">尚未添加模型</div>
+                            </div>
+                            <p id="ai-model-status" class="settings-status ai-model-manager-status"></p>
+                        </div>
+
+                        <div class="settings-card hidden" id="ai-model-editor">
+                            <div class="settings-card-header" id="ai-model-editor-title">编辑模型</div>
+                            <div class="settings-card-body">
+                                <div class="api-config-mode" role="tablist" aria-label="API 配置方式">
+                                    <button
+                                        type="button"
+                                        id="api-mode-provider"
+                                        class="api-config-mode-btn active"
+                                        role="tab"
+                                        aria-selected="true"
+                                        aria-controls="api-provider-panel"
+                                    >
+                                        模型服务商
+                                    </button>
+                                    <button
+                                        type="button"
+                                        id="api-mode-custom"
+                                        class="api-config-mode-btn"
+                                        role="tab"
+                                        aria-selected="false"
+                                        aria-controls="api-custom-panel"
+                                    >
+                                        自定义配置
+                                    </button>
+                                </div>
+                                <div id="api-provider-panel" class="api-config-panel" role="tabpanel">
+                                    <div class="settings-row">
+                                        <label class="srow-label" for="ai-provider"
+                                            >服务商 <span class="required-label">必填</span></label
+                                        >
+                                        <select
+                                            id="ai-provider"
+                                            class="settings-input"
+                                        >
+                                            <option value="sensenova">SenseNova 免费 API（推荐）</option>
+                                            <option value="deepseek">DeepSeek</option>
+                                            <option value="openai">OpenAI</option>
+                                            <option value="anthropic">Anthropic Claude</option>
+                                            <option value="gemini">Google Gemini</option>
+                                            <option value="openai_compatible" hidden>自定义 OpenAI-compatible</option>
+                                        </select>
+                                        <div class="srow-hint provider-key-help">
+                                            <span id="api-key-source-text">没有 API Key？</span>
+                                            <a
+                                                id="api-key-source-link"
+                                                href="https://www.sensenova.cn/"
+                                                target="_blank"
+                                                rel="noreferrer"
+                                                >申请免费 API Key</a
+                                            >
+                                        </div>
+                                    </div>
+                                    <div class="settings-row">
+                                        <label class="srow-label" for="api-model-preset"
+                                            >模型 <span class="required-label">必填</span></label
+                                        >
+                                        <select
+                                            id="api-model-preset"
+                                            class="settings-input"
+                                        >
+                                            <option value="deepseek-v4-flash">deepseek-v4-flash</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div id="api-custom-panel" class="api-config-panel hidden" role="tabpanel">
+                                    <div class="settings-row">
+                                        <label class="srow-label" for="base-url"
+                                            >Base URL <span class="required-label">必填</span></label
+                                        >
+                                        <input
+                                            type="text"
+                                            id="base-url"
+                                            placeholder="https://example.com/v1"
+                                            class="settings-input"
+                                        />
+                                    </div>
+                                    <div class="settings-row">
+                                        <label class="srow-label" for="custom-model"
+                                            >Model ID <span class="required-label">必填</span></label
+                                        >
+                                        <input
+                                            type="text"
+                                            id="custom-model"
+                                            placeholder="model-name"
+                                            class="settings-input"
+                                        />
+                                    </div>
+                                </div>
+                                <input type="hidden" id="model" />
                                 <div class="settings-row">
                                     <label class="srow-label" for="api-key"
-                                        >API Key</label
+                                        >API Key <span class="required-label">必填</span></label
                                     >
-                                    <div class="api-token-profile-controls">
-                                        <select
-                                            id="api-token-profile"
-                                            class="settings-select"
-                                            aria-label="Token 档案"
-                                        ></select>
-                                        <button
-                                            type="button"
-                                            id="btn-new-api-token"
-                                            class="icon-btn"
-                                            title="新增 Token"
-                                            aria-label="新增 Token"
-                                        >
-                                            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
-                                                <path d="M8 3v10M3 8h10" />
-                                            </svg>
-                                        </button>
-                                        <button
-                                            type="button"
-                                            id="btn-delete-api-token"
-                                            class="icon-btn danger"
-                                            title="删除当前 Token"
-                                            aria-label="删除当前 Token"
-                                        >
-                                            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                                                <path d="M3.5 4.5h9M6 4.5V3h4v1.5M5 6.5l.5 6h5l.5-6" />
-                                            </svg>
-                                        </button>
-                                    </div>
-                                    <input
-                                        type="text"
-                                        id="api-token-profile-name"
-                                        placeholder="例如：主账号、备用账号"
-                                        autocomplete="off"
-                                        class="settings-input"
-                                    />
                                     <div class="password-field">
                                         <input
                                             type="password"
                                             id="api-key"
-                                            placeholder="sk-..."
+                                            placeholder="粘贴申请到的 API Key"
                                             autocomplete="off"
                                             class="settings-input"
                                         />
@@ -1070,57 +1133,165 @@
                                             </svg>
                                         </button>
                                     </div>
-                                    <div class="srow-hint">
-                                        当前服务商的凭据，仅保存在本地数据库；保存后可在顶部快速切换。
+                                    <div class="srow-hint api-key-links">
+                                        Key 仅保存在本机，不会上传。
                                     </div>
                                 </div>
-                                <div class="settings-row">
-                                    <label class="srow-label" for="base-url"
-                                        >Base URL</label
-                                    >
-                                    <input
-                                        type="text"
-                                        id="base-url"
-                                        placeholder="https://api.deepseek.com"
-                                        class="settings-input"
-                                    />
-                                </div>
-                                <div class="settings-row">
-                                    <label class="srow-label" for="model"
-                                        >Model</label
-                                    >
-                                    <input
-                                        type="text"
-                                        id="model"
-                                        placeholder="deepseek-v4-flash"
-                                        class="settings-input"
-                                    />
+                                <details id="api-advanced-settings" class="settings-disclosure settings-advanced-disclosure" open>
+                                    <summary class="settings-disclosure-summary">高级设置</summary>
+                                    <div class="settings-disclosure-body">
+                                        <div class="settings-row model-display-settings">
+                                            <label class="srow-label" for="model-display-name">模型显示名称</label>
+                                            <div class="srow-hint">在模型列表中展示的名称，未设置时默认显示 Model ID。</div>
+                                            <div class="input-with-counter">
+                                                <input
+                                                    type="text"
+                                                    id="model-display-name"
+                                                    maxlength="32"
+                                                    placeholder="例如：DeepSeek-V4-Flash-自定义"
+                                                    autocomplete="off"
+                                                    class="settings-input"
+                                                />
+                                                <span id="model-display-name-count" class="input-counter">0/32</span>
+                                            </div>
+                                        </div>
+                                        <div class="settings-row">
+                                            <span class="srow-label">上下文窗口</span>
+                                            <div class="context-window-grid">
+                                                <label class="context-window-field" for="context-input-tokens">
+                                                    <span>输入</span>
+                                                    <input
+                                                        type="number"
+                                                        id="context-input-tokens"
+                                                        min="1"
+                                                        step="1"
+                                                        value="1140000"
+                                                        inputmode="numeric"
+                                                        class="settings-input"
+                                                    />
+                                                </label>
+                                                <label class="context-window-field" for="context-output-tokens">
+                                                    <span>输出</span>
+                                                    <input
+                                                        type="number"
+                                                        id="context-output-tokens"
+                                                        min="1"
+                                                        step="1"
+                                                        value="16000"
+                                                        inputmode="numeric"
+                                                        class="settings-input"
+                                                    />
+                                                </label>
+                                            </div>
+                                        </div>
+                                        <div class="settings-row">
+                                            <label class="srow-label" for="tool-call-rounds">工具调用轮次</label>
+                                            <input
+                                                type="number"
+                                                id="tool-call-rounds"
+                                                min="1"
+                                                step="1"
+                                                value="500"
+                                                inputmode="numeric"
+                                                class="settings-input"
+                                            />
+                                        </div>
+                                        <div class="settings-row advanced-settings-section">
+                                            <label class="srow-label" for="api-token-profile">已保存的 API Key</label>
+                                            <div class="api-token-profile-controls">
+                                                <select
+                                                    id="api-token-profile"
+                                                    class="settings-select"
+                                                    aria-label="已保存的 API Key"
+                                                ></select>
+                                                <button
+                                                    type="button"
+                                                    id="btn-new-api-token"
+                                                    class="icon-btn"
+                                                    title="新增 API Key"
+                                                    aria-label="新增 API Key"
+                                                >
+                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+                                                        <path d="M8 3v10M3 8h10" />
+                                                    </svg>
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    id="btn-delete-api-token"
+                                                    class="icon-btn danger"
+                                                    title="删除当前 API Key"
+                                                    aria-label="删除当前 API Key"
+                                                >
+                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                                        <path d="M3.5 4.5h9M6 4.5V3h4v1.5M5 6.5l.5 6h5l.5-6" />
+                                                    </svg>
+                                                </button>
+                                            </div>
+                                            <label class="srow-sublabel" for="api-token-profile-name">API Key 名称</label>
+                                            <input
+                                                type="text"
+                                                id="api-token-profile-name"
+                                                placeholder="例如：主账号、备用账号"
+                                                autocomplete="off"
+                                                class="settings-input"
+                                            />
+                                            <div class="srow-hint">
+                                                为当前 API Key 起一个容易识别的名称，保存后可在左下角快速切换。
+                                            </div>
+                                        </div>
+                                    </div>
+                                </details>
+                                <div class="settings-action-bar settings-action-bar-inline api-settings-actions">
+                                    <p id="settings-status" class="settings-status"></p>
+                                    <div class="settings-action-btns">
+                                        <button
+                                            type="button"
+                                            id="btn-cancel-ai-model"
+                                            class="btn btn-secondary"
+                                        >
+                                            取消
+                                        </button>
+                                        <button
+                                            type="button"
+                                            id="btn-test"
+                                            class="btn btn-secondary"
+                                        >
+                                            测试连接
+                                        </button>
+                                        <button
+                                            type="button"
+                                            id="btn-save-settings"
+                                            class="btn btn-primary"
+                                        >
+                                            保存设置
+                                        </button>
+                                    </div>
                                 </div>
                             </div>
                         </div>
 
                         <div class="settings-card" id="deepseek-balance-card">
-                            <div class="settings-card-header">
-                                账户余额
-                                <div class="settings-card-subtitle">
-                                    仅 DeepSeek 官方兼容 `GET /user/balance`；第三方 OpenAI-compatible 接口可能不支持。
+                            <details class="settings-disclosure settings-card-disclosure">
+                                <summary class="settings-disclosure-summary">
+                                    <span>账户余额</span>
+                                    <span class="settings-disclosure-meta">仅 DeepSeek 官方接口</span>
+                                </summary>
+                                <div class="settings-card-body">
+                                    <div id="balance-display" class="balance-display balance-empty">
+                                        <div class="balance-empty-text">尚未查询。第三方接口可能不支持余额查询，但不影响翻译。</div>
+                                    </div>
+                                    <div class="settings-action-bar settings-action-bar-inline">
+                                        <p id="balance-status" class="settings-status"></p>
+                                        <button
+                                            type="button"
+                                            id="btn-refresh-balance"
+                                            class="btn btn-secondary"
+                                        >
+                                            刷新余额
+                                        </button>
+                                    </div>
                                 </div>
-                            </div>
-                            <div class="settings-card-body">
-                                <div id="balance-display" class="balance-display balance-empty">
-                                    <div class="balance-empty-text">尚未查询。若使用第三方 OpenAI-compatible 接口，余额查询可能不可用，但不影响翻译。</div>
-                                </div>
-                                <div class="settings-action-bar settings-action-bar-inline">
-                                    <p id="balance-status" class="settings-status"></p>
-                                    <button
-                                        type="button"
-                                        id="btn-refresh-balance"
-                                        class="btn btn-secondary"
-                                    >
-                                        刷新余额
-                                    </button>
-                                </div>
-                            </div>
+                            </details>
                         </div>
 
                         <div class="settings-card">
@@ -1142,25 +1313,6 @@
                             </div>
                         </div>
 
-                        <div class="settings-action-bar">
-                            <p id="settings-status" class="settings-status"></p>
-                            <div class="settings-action-btns">
-                                <button
-                                    type="button"
-                                    id="btn-test"
-                                    class="btn btn-secondary"
-                                >
-                                    测试连接
-                                </button>
-                                <button
-                                    type="button"
-                                    id="btn-save-settings"
-                                    class="btn btn-primary"
-                                >
-                                    保存设置
-                                </button>
-                            </div>
-                        </div>
                     </div>
 
                     <!-- Reading prompts section -->
