@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
+import { buildPubmedSearchUrl } from '../src/source_link.js';
+
 const html = await readFile(new URL('../src/index.html', import.meta.url), 'utf8');
 const source = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
 
@@ -22,7 +24,8 @@ test('PubMed query can be checked on the official search page before saving', ()
   assert.ok(queryIndex < openIndex);
   assert.ok(openIndex < retrievalIndex);
   assert.match(source, /function openPubmedQueryInBrowser\(\)/);
-  assert.match(source, /new URL\('https:\/\/pubmed\.ncbi\.nlm\.nih\.gov\/'\)/);
-  assert.match(source, /url\.searchParams\.set\('term', query\)/);
-  assert.match(source, /openUrl\(url\.toString\(\)\)/);
+  assert.match(source, /openUrl\(buildPubmedSearchUrl\(query\)\)/);
+  const url = new URL(buildPubmedSearchUrl('heart failure[Title/Abstract]'));
+  assert.equal(url.origin, 'https://pubmed.ncbi.nlm.nih.gov');
+  assert.equal(url.searchParams.get('term'), 'heart failure[Title/Abstract]');
 });

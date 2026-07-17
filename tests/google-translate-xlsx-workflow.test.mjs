@@ -3,13 +3,20 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 const main = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
+const html = await readFile(new URL('../src/index.html', import.meta.url), 'utf8');
 const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
 const commands = await readFile(new URL('../src-tauri/src/commands/pubmed_search_cmd.rs', import.meta.url), 'utf8');
 const app = await readFile(new URL('../src-tauri/src/lib.rs', import.meta.url), 'utf8');
 const service = await readFile(new URL('../src-tauri/src/services/google_translate_xlsx_service.rs', import.meta.url), 'utf8');
 
 test('merges Google translation into the existing PubMed export dialog', () => {
+  assert.doesNotMatch(html, /id="pubmed-export-format"/);
+  assert.match(html, /id="btn-export-pubmed"/);
   assert.match(main, /function choosePubmedExportFields/);
+  assert.match(main, /data-standard-format/);
+  assert.match(main, /value="xlsx"[\s\S]*Excel \(\.xlsx\)/);
+  assert.match(main, /value="txt"[\s\S]*PubMed TXT/);
+  assert.match(main, /cleanup\(\{ mode: 'standard', format, fields \}\)/);
   assert.match(main, /data-mode="standard"[\s\S]*普通导出/);
   assert.match(main, /data-mode="google"[\s\S]*Google 翻译/);
   assert.match(main, /value="all"[\s\S]*当前检索全部/);

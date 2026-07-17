@@ -4,6 +4,7 @@ import {
 } from './translation_queue.js';
 import { normalizeEntrySortMode, sortEntries } from './entry_sort.js';
 import { shortJournalDisplayName } from './journal_name.js';
+import { buildPubmedSearchUrl, feedSourceLink } from './source_link.js';
 import {
   createDefaultFilterScopeState,
   filterScopeKey,
@@ -136,7 +137,7 @@ let literatureSearchInput, btnClearLiteratureSearch, literatureSearchRow;
 let pubmedSearchListEl, pubmedBatchHeader, pubmedBatchMeta;
 let pubmedStatusFilter, pubmedSort, pubmedStarFilter, pubmedDateFilters, pubmedPublishedFrom, pubmedPublishedTo, pubmedAddedFrom, pubmedAddedTo;
 let pubmedProgressEl, pubmedProgressFill, pubmedProgressLabel, btnRunPubmedSearch, btnCancelPubmedRun;
-let pubmedExportFormat, btnExportPubmed;
+let btnExportPubmed;
 let pubmedSnapshotSelect, btnSavePubmedSnapshot, btnDeletePubmedSnapshot;
 let pubmedBulkStatus, btnPubmedAiScreen;
 let entryListEl, briefingListEl, briefingItemsEl, briefingSortSelect, briefingSortDirection;
@@ -1610,14 +1611,14 @@ function selectedPubmedExportFields() {
   }
 }
 
-function choosePubmedExportFields(format, context) {
+function choosePubmedExportFields(initialFormat, context) {
   return new Promise(resolve => {
     const counts = typeof context === 'number'
       ? { defaultCount: context, allEntries: [], filteredEntries: [], selectedEntries: [] }
       : context;
     const selected = new Set(selectedPubmedExportFields());
-    const required = new Set(format === 'xlsx' ? ['pmid'] : []);
-    required.forEach(field => selected.add(field));
+    let format = initialFormat === 'txt' ? 'txt' : 'xlsx';
+    if (format === 'xlsx') selected.add('pmid');
     const overlay = document.createElement('div');
     overlay.className = 'pubmed-modal';
     overlay.innerHTML = `
@@ -1628,13 +1629,18 @@ function choosePubmedExportFields(format, context) {
           <button class="pubmed-modal-close" data-close type="button" aria-label="关闭">×</button>
         </header>
         <div class="pubmed-modal-body">
-          ${format === 'xlsx' ? `
-            <div class="segmented-control pubmed-export-mode" data-export-mode>
-              <button class="seg-btn active" data-mode="standard" type="button">普通导出</button>
-              <button class="seg-btn" data-mode="google" type="button">Google 翻译</button>
-            </div>
-          ` : ''}
+          <div class="segmented-control pubmed-export-mode" data-export-mode>
+            <button class="seg-btn active" data-mode="standard" type="button">普通导出</button>
+            <button class="seg-btn" data-mode="google" type="button">Google 翻译</button>
+          </div>
           <div data-standard-panel>
+            <label class="pubmed-export-format-row">
+              <span>导出格式</span>
+              <select class="settings-select compact" data-standard-format>
+                <option value="xlsx" ${format === 'xlsx' ? 'selected' : ''}>Excel (.xlsx)</option>
+                <option value="txt" ${format === 'txt' ? 'selected' : ''}>PubMed TXT</option>
+              </select>
+            </label>
             <div class="pubmed-export-field-actions">
               <button class="btn btn-secondary btn-sm" data-all type="button">全选</button>
               <button class="btn btn-secondary btn-sm" data-default type="button">常用字段</button>
@@ -1643,7 +1649,7 @@ function choosePubmedExportFields(format, context) {
             <div class="pubmed-export-field-grid">
               ${PUBMED_EXPORT_FIELDS.map(([key, label]) => `
                 <label class="pubmed-export-field">
-                  <input type="checkbox" value="${key}" ${selected.has(key) ? 'checked' : ''} ${required.has(key) ? 'disabled' : ''} />
+                  <input type="checkbox" value="${key}" ${selected.has(key) ? 'checked' : ''} ${format === 'xlsx' && key === 'pmid' ? 'disabled' : ''} />
                   <span>${escapeHtml(label)}</span>
                 </label>
               `).join('')}
@@ -1695,6 +1701,17 @@ function choosePubmedExportFields(format, context) {
         input.checked = input.disabled || values.has(input.value);
       });
     };
+    const setFormat = nextFormat => {
+      format = nextFormat === 'txt' ? 'txt' : 'xlsx';
+      const pmid = overlay.querySelector('[data-standard-panel] input[value="pmid"]');
+      if (pmid) {
+        pmid.disabled = format === 'xlsx';
+        if (pmid.disabled) pmid.checked = true;
+      }
+      if (exportMode === 'standard') {
+        overlay.querySelector('[data-export-meta]').textContent = `${format.toUpperCase()} · ${counts.defaultCount} 篇文献`;
+      }
+    };
     const googleEntries = () => {
       const scope = overlay.querySelector('input[name="google-export-scope"]:checked')?.value || 'filtered';
       if (scope === 'all') return counts.allEntries;
@@ -1741,6 +1758,7 @@ function choosePubmedExportFields(format, context) {
     overlay.querySelector('[data-all]').addEventListener('click', () => setChecks(PUBMED_EXPORT_FIELDS.map(([key]) => key)));
     overlay.querySelector('[data-default]').addEventListener('click', () => setChecks(DEFAULT_PUBMED_EXPORT_FIELDS));
     overlay.querySelector('[data-none]').addEventListener('click', () => setChecks([]));
+    overlay.querySelector('[data-standard-format]').addEventListener('change', event => setFormat(event.target.value));
     overlay.querySelectorAll('[data-export-mode] .seg-btn').forEach(button => {
       button.addEventListener('click', () => setExportMode(button.dataset.mode));
     });
@@ -1784,7 +1802,7 @@ function choosePubmedExportFields(format, context) {
         return;
       }
       localStorage.setItem(PUBMED_EXPORT_FIELDS_STORAGE_KEY, JSON.stringify(fields));
-      cleanup({ mode: 'standard', fields });
+      cleanup({ mode: 'standard', format, fields });
     });
     document.body.appendChild(overlay);
   });
@@ -2091,14 +2109,14 @@ async function exportCurrentPubmedEntries(formatOverride = null, sourceButton = 
     setGlobalStatus('当前没有可导出的文献', 'error');
     return;
   }
-  const format = (formatOverride || pubmedExportFormat?.value) === 'txt' ? 'txt' : 'xlsx';
+  const initialFormat = formatOverride === 'txt' ? 'txt' : 'xlsx';
   const exportContext = {
     defaultCount: defaultEntries.length,
     allEntries: [...allEntries],
     filteredEntries: filtered,
     selectedEntries: selected,
   };
-  const choice = await choosePubmedExportFields(format, exportContext);
+  const choice = await choosePubmedExportFields(initialFormat, exportContext);
   if (!choice) return;
   const dialog = window.__TAURI__?.dialog;
   if (!dialog) {
@@ -2145,6 +2163,7 @@ async function exportCurrentPubmedEntries(formatOverride = null, sourceButton = 
   }
 
   const entries = defaultEntries;
+  const format = choice.format === 'txt' ? 'txt' : 'xlsx';
   const fields = format === 'xlsx' ? orderPubmedXlsxFields(choice.fields) : choice.fields;
   const path = await dialog.save({
     title: `导出 PubMed ${format.toUpperCase()}`,
@@ -2653,9 +2672,7 @@ function openPubmedQueryInBrowser() {
     return;
   }
 
-  const url = new URL('https://pubmed.ncbi.nlm.nih.gov/');
-  url.searchParams.set('term', query);
-  openUrl(url.toString());
+  openUrl(buildPubmedSearchUrl(query));
 }
 
 function pubmedPreviewEntryAssessmentMeta(status) {
@@ -3188,6 +3205,7 @@ function showPubmedSearchContextMenu(x, y, search) {
   menu.className = 'context-menu';
   menu.innerHTML = `
     <div class="context-item" data-action="refresh">更新检索批次</div>
+    <div class="context-item" data-action="open-source">在 PubMed 打开</div>
     <div class="context-separator"></div>
     <div class="context-item" data-action="translate-title">批量翻译标题</div>
     <div class="context-item" data-action="translate-summary">批量翻译摘要</div>
@@ -3206,6 +3224,10 @@ function showPubmedSearchContextMenu(x, y, search) {
     if (action === 'refresh') {
       await selectPubmedSearch(search.id);
       await runCurrentPubmedSearch();
+    } else if (action === 'open-source') {
+      const url = buildPubmedSearchUrl(search.query);
+      if (url) openUrl(url);
+      else setGlobalStatus('当前检索没有可打开的 PubMed 检索式', 'error');
     } else if (action === 'translate-title') {
       await translatePubmedSearchEntries(search, 'title');
     } else if (action === 'translate-summary') {
@@ -4061,10 +4083,12 @@ function mountContextMenu(menu, x, y) {
 
 function showContextMenu(x, y, feed) {
   hideContextMenu();
+  const sourceLink = feedSourceLink(feed);
   const menu = document.createElement('div');
   menu.className = 'context-menu';
   menu.innerHTML = `
     <div class="context-item" data-action="refresh">更新订阅源</div>
+    <div class="context-item" data-action="open-source">${sourceLink.label}</div>
     <div class="context-separator"></div>
     <div class="context-item" data-action="translate-title">翻译标题</div>
     <div class="context-item" data-action="translate-summary">翻译摘要</div>
@@ -4080,6 +4104,9 @@ function showContextMenu(x, y, feed) {
     hideContextMenu();
     if (action === 'refresh') {
       await refreshFeed(feed);
+    } else if (action === 'open-source') {
+      if (sourceLink.url) openUrl(sourceLink.url);
+      else setGlobalStatus('当前订阅源没有可打开的地址', 'error');
     } else if (action === 'translate-title') {
       await translateFeedEntries(feed, 'title');
     } else if (action === 'translate-summary') {
@@ -10343,7 +10370,6 @@ window.addEventListener('DOMContentLoaded', () => {
   pubmedProgressLabel = document.getElementById('pubmed-progress-label');
   btnRunPubmedSearch = document.getElementById('btn-run-pubmed-search');
   btnCancelPubmedRun = document.getElementById('btn-cancel-pubmed-run');
-  pubmedExportFormat = document.getElementById('pubmed-export-format');
   btnExportPubmed = document.getElementById('btn-export-pubmed');
   pubmedSnapshotSelect = document.getElementById('pubmed-snapshot-select');
   btnSavePubmedSnapshot = document.getElementById('btn-save-pubmed-snapshot');

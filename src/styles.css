@@ -2004,6 +2004,16 @@ body.pubmed-mode #btn-pubmed-ai-screen { display: inline-flex; }
 .pubmed-status-select.status-exclude { color: #8a4444; background-color: rgba(151,73,73,0.08); }
 
 .pubmed-export-panel { width: min(720px, 100%); }
+.pubmed-export-format-row {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 180px);
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 12px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 600;
+}
 .pubmed-export-field-actions { display: flex; gap: 6px; margin-bottom: 12px; }
 .pubmed-export-field-grid {
   display: grid;
