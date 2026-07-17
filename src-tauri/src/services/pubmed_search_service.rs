@@ -5,7 +5,10 @@ use crate::models::{
     PubmedScreeningSuggestion, PubmedSearch, PubmedSearchEntry, PubmedSearchMembershipLabel,
     PubmedSearchPage, PubmedSearchPreview, PubmedSearchProgress, PubmedSearchRunResult, TokenUsage,
 };
-use crate::services::{entry_identity_service, pubmed_service, reading_service, translate_service};
+use crate::services::{
+    article_service, entry_identity_service, google_translate_xlsx_service, pubmed_service,
+    reading_service, translate_service,
+};
 use roxmltree::{Document, Node, ParsingOptions};
 use rusqlite::{params, Connection, OptionalExtension};
 use rust_xlsxwriter::Workbook;
@@ -1884,28 +1887,7 @@ pub fn export_entries(
         export_field_label(field)?;
     }
 
-    let available = match search_id {
-        Some(search_id) => list_search_entries(conn, search_id)?,
-        None => list_kept_entries(conn)?
-            .into_iter()
-            .map(|item| item.entry)
-            .collect(),
-    };
-    let mut by_id = available
-        .into_iter()
-        .map(|entry| (entry.entry_id, entry))
-        .collect::<HashMap<_, _>>();
-    let mut ordered = Vec::with_capacity(entry_ids.len());
-    let mut seen = HashSet::new();
-    for entry_id in entry_ids {
-        if !seen.insert(*entry_id) {
-            continue;
-        }
-        let entry = by_id
-            .remove(entry_id)
-            .ok_or_else(|| format!("文献 {} 不属于当前导出范围", entry_id))?;
-        ordered.push(entry);
-    }
+    let ordered = selected_export_entries(conn, search_id, entry_ids)?;
 
     let metric_by_id = metrics
         .iter()
@@ -1940,6 +1922,119 @@ pub fn export_entries(
     }
     .map_err(|e| format!("写入导出文件失败: {}", e))?;
     Ok(ordered.len())
+}
+
+pub fn export_google_translate_entries(
+    conn: &Connection,
+    path: &Path,
+    search_id: Option<i64>,
+    entry_ids: &[i64],
+    include_title: bool,
+    include_summary: bool,
+    only_untranslated: bool,
+) -> Result<google_translate_xlsx_service::GoogleTranslateExportReport, String> {
+    if !include_title && !include_summary {
+        return Err("请至少选择标题或摘要".to_string());
+    }
+    let entries = selected_export_entries(conn, search_id, entry_ids)?;
+    let mut rows = Vec::new();
+    let mut title_count = 0;
+    let mut summary_count = 0;
+    let mut skipped_translated = 0;
+    let mut missing_summaries = 0;
+
+    for entry in &entries {
+        if include_title {
+            if only_untranslated
+                && entry
+                    .title_translated
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+            {
+                skipped_translated += 1;
+            } else if !entry.title.trim().is_empty() {
+                rows.push(google_translate_xlsx_service::GoogleTranslateXlsxRow {
+                    entry_id: entry.entry_id,
+                    field: "title".to_string(),
+                    original_hash: google_translate_xlsx_service::original_text_hash(&entry.title),
+                    text: entry.title.clone(),
+                });
+                title_count += 1;
+            }
+        }
+        if include_summary {
+            if only_untranslated
+                && entry
+                    .summary_translated
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+            {
+                skipped_translated += 1;
+                continue;
+            }
+            let summary = entry.summary.as_deref().filter(|value| {
+                !value.trim().is_empty()
+                    && !article_service::extract_rss_metadata(Some(value)).is_metadata_only
+            });
+            if let Some(summary) = summary {
+                rows.push(google_translate_xlsx_service::GoogleTranslateXlsxRow {
+                    entry_id: entry.entry_id,
+                    field: "summary".to_string(),
+                    original_hash: google_translate_xlsx_service::original_text_hash(summary),
+                    text: summary.to_string(),
+                });
+                summary_count += 1;
+            } else {
+                missing_summaries += 1;
+            }
+        }
+    }
+    let paths = google_translate_xlsx_service::write_workbook_chunks(path, &rows)?;
+    Ok(google_translate_xlsx_service::GoogleTranslateExportReport {
+        file_paths: paths
+            .into_iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect(),
+        article_count: entries.len(),
+        row_count: rows.len(),
+        title_count,
+        summary_count,
+        skipped_translated,
+        missing_summaries,
+    })
+}
+
+fn selected_export_entries(
+    conn: &Connection,
+    search_id: Option<i64>,
+    entry_ids: &[i64],
+) -> Result<Vec<PubmedSearchEntry>, String> {
+    if entry_ids.is_empty() {
+        return Err("没有可导出的文献".to_string());
+    }
+    let available = match search_id {
+        Some(search_id) => list_search_entries(conn, search_id)?,
+        None => list_kept_entries(conn)?
+            .into_iter()
+            .map(|item| item.entry)
+            .collect(),
+    };
+    let mut by_id = available
+        .into_iter()
+        .map(|entry| (entry.entry_id, entry))
+        .collect::<HashMap<_, _>>();
+    let mut ordered = Vec::with_capacity(entry_ids.len());
+    let mut seen = HashSet::new();
+    for entry_id in entry_ids {
+        if !seen.insert(*entry_id) {
+            continue;
+        }
+        let entry = by_id
+            .remove(entry_id)
+            .ok_or_else(|| format!("文献 {} 不属于当前导出范围", entry_id))?;
+        ordered.push(entry);
+    }
+    Ok(ordered)
 }
 
 fn render_export_csv(
@@ -3221,6 +3316,43 @@ mod tests {
         let xlsx = render_export_xlsx(&entries, &fields, &HashMap::new(), &HashMap::new()).unwrap();
         assert!(xlsx.starts_with(b"PK"));
         assert!(xlsx.len() > 1_000);
+    }
+
+    #[test]
+    fn google_translate_export_combines_fields_and_skips_existing_translations() {
+        let conn = search_db();
+        let search = create_search(&conn, "Google Translate", None, "sepsis").unwrap();
+        let run = begin_run(&conn, search.id).unwrap();
+        snapshot_run_items(&conn, run, &["1".to_string(), "2".to_string()]).unwrap();
+        let (first_entry, _) = finish_item(&conn, run, search.id, &record("1", "First title"));
+        let (second_entry, _) = finish_item(&conn, run, search.id, &record("2", "Second title"));
+        complete_run(&conn, search.id, run).unwrap();
+        conn.execute(
+            "INSERT INTO translations (entry_id, field, translated_text) VALUES (?1, 'title', '已有标题')",
+            [first_entry],
+        )
+        .unwrap();
+        let path =
+            std::env::temp_dir().join(format!("cento-google-export-{}.xlsx", std::process::id()));
+        let report = export_google_translate_entries(
+            &conn,
+            &path,
+            Some(search.id),
+            &[first_entry, second_entry],
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(report.article_count, 2);
+        assert_eq!(report.title_count, 1);
+        assert_eq!(report.summary_count, 2);
+        assert_eq!(report.skipped_translated, 1);
+        assert_eq!(report.row_count, 3);
+        assert_eq!(report.file_paths.len(), 1);
+        for path in report.file_paths {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]

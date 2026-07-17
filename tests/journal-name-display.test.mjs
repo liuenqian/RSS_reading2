@@ -13,6 +13,9 @@ test('shows only the primary journal name', () => {
   );
   assert.equal(shortJournalDisplayName('CA: a cancer journal for clinicians'), 'CA');
   assert.equal(shortJournalDisplayName('Russian chemical bulletin = Izvestiia Akademii nauk'), 'Russian chemical bulletin');
+  assert.equal(shortJournalDisplayName('Advanced materials (Deerfield Beach, Fla.)'), 'Advanced materials');
+  assert.equal(shortJournalDisplayName('测试期刊（网络版）'), '测试期刊');
+  assert.equal(shortJournalDisplayName('Journal name (Print) (London)'), 'Journal name');
   assert.equal(shortJournalDisplayName('Nature Medicine'), 'Nature Medicine');
   assert.equal(shortJournalDisplayName(null), '');
 });

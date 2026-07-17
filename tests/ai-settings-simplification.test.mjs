@@ -30,10 +30,6 @@ test('AI settings keep required fields visible and advanced controls grouped', (
   assert.match(html, /<details id="api-advanced-settings" class="settings-disclosure settings-advanced-disclosure" open>/);
 
   for (const id of [
-    'api-token-profile',
-    'api-token-profile-name',
-    'btn-new-api-token',
-    'btn-delete-api-token',
     'base-url',
     'model',
     'custom-model',
@@ -45,6 +41,8 @@ test('AI settings keep required fields visible and advanced controls grouped', (
   ]) {
     assert.match(html, new RegExp(`id="${id}"`));
   }
+  assert.doesNotMatch(html, /id="api-token-profile"/);
+  assert.doesNotMatch(html, /id="api-token-profile-name"/);
 });
 
 test('advanced model capability fields use the requested defaults and persist with settings', () => {

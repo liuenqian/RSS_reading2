@@ -6,6 +6,7 @@ pub mod entry_service;
 pub mod feed_service;
 pub mod fetch_service;
 pub mod fulltext_service;
+pub mod google_translate_xlsx_service;
 pub mod nature_download_service;
 pub mod notify;
 pub mod opml_service;

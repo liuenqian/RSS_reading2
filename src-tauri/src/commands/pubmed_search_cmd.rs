@@ -5,10 +5,11 @@ use crate::models::{
     PubmedSearchPreview, PubmedSearchRunResult,
 };
 use crate::services::{
-    cost_service, pubmed_search_service, settings_service, translation_pipeline,
+    cost_service, google_translate_xlsx_service, pubmed_search_service, settings_service,
+    translation_pipeline,
 };
 use std::path::PathBuf;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 #[tauri::command]
 pub async fn preview_pubmed_search(
@@ -215,6 +216,64 @@ pub fn export_pubmed_entries(
         &fields,
         &metrics,
     )
+}
+
+#[tauri::command]
+pub fn export_google_translate_xlsx(
+    state: State<DbState>,
+    path: String,
+    search_id: Option<i64>,
+    entry_ids: Vec<i64>,
+    include_title: bool,
+    include_summary: bool,
+    only_untranslated: bool,
+) -> Result<google_translate_xlsx_service::GoogleTranslateExportReport, String> {
+    let conn = state.conn.lock().map_err(|error| error.to_string())?;
+    pubmed_search_service::export_google_translate_entries(
+        &conn,
+        &PathBuf::from(path),
+        search_id,
+        &entry_ids,
+        include_title,
+        include_summary,
+        only_untranslated,
+    )
+}
+
+#[tauri::command]
+pub fn preview_google_translate_import(
+    state: State<DbState>,
+    paths: Vec<String>,
+) -> Result<google_translate_xlsx_service::GoogleTranslateImportPreview, String> {
+    let conn = state.conn.lock().map_err(|error| error.to_string())?;
+    let paths = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+    google_translate_xlsx_service::preview_import(&conn, &paths)
+}
+
+#[tauri::command]
+pub fn apply_google_translate_import(
+    app: AppHandle,
+    state: State<DbState>,
+    candidates: Vec<google_translate_xlsx_service::GoogleTranslateImportCandidate>,
+    overwrite: bool,
+) -> Result<google_translate_xlsx_service::GoogleTranslateImportReport, String> {
+    let report = {
+        let mut conn = state.conn.lock().map_err(|error| error.to_string())?;
+        google_translate_xlsx_service::apply_import(&mut conn, &candidates, overwrite)?
+    };
+    for item in &report.applied {
+        let _ = app.emit(
+            "translation-progress",
+            serde_json::json!({
+                "kind": "done",
+                "entry_id": item.entry_id,
+                "field": item.field,
+                "text": item.text,
+                "error": null,
+            }),
+        );
+    }
+    Ok(report)
 }
 
 #[tauri::command]

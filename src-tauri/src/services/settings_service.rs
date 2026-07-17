@@ -874,10 +874,6 @@ pub fn activate_ai_model(conn: &Connection, config_id: &str) -> Result<DeepSeekS
         "active_ai_provider",
         normalize_provider_id(&settings.provider),
     )?;
-    if let Some(profile_id) = settings.api_token_profile_id.as_deref() {
-        activate_api_token_profile(conn, &settings.provider, profile_id)?;
-        settings.api_key = stored_provider_api_key(conn, normalize_provider_id(&settings.provider));
-    }
     apply_global_settings(conn, &mut settings);
     Ok(settings)
 }
@@ -1203,6 +1199,32 @@ mod tests {
         let models = delete_ai_model(&conn, second.config_id.as_deref().unwrap()).unwrap();
         assert_eq!(models.len(), 1);
         assert!(models[0].active);
+    }
+
+    #[test]
+    fn activating_a_model_uses_its_own_key_instead_of_a_legacy_profile_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+
+        let profile = upsert_api_token_profile(
+            &conn,
+            "openai_compatible",
+            None,
+            "旧版 Key 档案",
+            "legacy-profile-key",
+        )
+        .unwrap();
+        let mut model = get_provider_settings(&conn, "openai_compatible");
+        model.api_key = "model-specific-key".to_string();
+        model.api_token_profile_id = profile.active_id;
+        model.base_url = "https://example.com/v1".to_string();
+        model.model = "model-with-own-key".to_string();
+        let model = save_ai_model(&conn, &model).unwrap();
+
+        activate_ai_model(&conn, model.config_id.as_deref().unwrap()).unwrap();
+
+        assert_eq!(get_settings(&conn).api_key, "model-specific-key");
     }
 
     #[test]

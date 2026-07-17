@@ -122,14 +122,13 @@ function decorateMarkdownHtml(html) {
 let settingsView, mainView, contentArea;
 let btnSettings, btnSidebar, btnRefresh, refreshIcon, btnTogglePaperChatToolbar;
 let toolbarSubtitle, toolbarApiPicker, toolbarApiButton, toolbarApiLabel;
-let toolbarApiMenu, toolbarApiList, btnManageApiTokens;
+let toolbarApiMenu, toolbarApiList, btnManageAiModels;
 let providerSelect, apiKeyInput, baseUrlInput, modelInput, modelPresetSelect, customModelInput, systemPromptInput;
 let modelDisplayNameInput, modelDisplayNameCount, contextInputTokensInput, contextOutputTokensInput, toolCallRoundsInput;
 let btnApiModeProvider, btnApiModeCustom, apiProviderPanel, apiCustomPanel;
 let btnToggleApiKey, btnTest, btnSaveSettings, btnSaveGeneral;
 let aiModelList, aiModelEmpty, aiModelEditor, aiModelEditorTitle, aiModelStatus;
 let btnAddAiModel, btnCancelAiModel;
-let apiTokenProfileSelect, apiTokenProfileNameInput, btnNewApiToken, btnDeleteApiToken;
 let settingsStatus, generalStatus;
 let retentionSelect, themeControl, accentSwatches, fontscaleControl, titleDisplaySelect;
 let feedUrlInput, btnAddFeed, addFeedRow, addFeedIcon, feedListEl, globalStatusEl;
@@ -217,12 +216,9 @@ let detailPdfUrl = '';
 let detailPdfRequestId = 0;
 let entrySelectionMode = false;
 let selectedEntryIds = new Set();
-let apiTokenProfileData = { provider: 'deepseek', active_id: null, profiles: [] };
-let toolbarApiProfileRefreshId = 0;
 let lastPresetProvider = 'sensenova';
 let aiModels = [];
 let editingAiModelId = null;
-let editingApiTokenProfileId = null;
 
 const SCI_HUB_BASE_URL = 'https://www.sci-hub.st/';
 const SCI_HUB_LAST_RELIABLE_PUBLICATION_YEAR = 2020;
@@ -875,7 +871,6 @@ function applyProviderSettings(settings, { includeGlobal = false } = {}) {
   contextInputTokensInput.value = String(settings.context_input_tokens || 1140000);
   contextOutputTokensInput.value = String(settings.context_output_tokens || 16000);
   toolCallRoundsInput.value = String(settings.tool_call_rounds || 500);
-  editingApiTokenProfileId = settings.api_token_profile_id || null;
   updateModelDisplayNameCount();
   syncApiConfigMode();
   if (includeGlobal) {
@@ -899,6 +894,7 @@ function setAiModelStatus(message = '', type = '') {
 
 function renderAiModels(models) {
   aiModels = Array.isArray(models) ? models : [];
+  renderToolbarModels(aiModels);
   if (!aiModelList) return;
   aiModelList.replaceChildren();
   aiModelEmpty?.classList.toggle('hidden', aiModels.length > 0);
@@ -965,7 +961,6 @@ async function refreshAiModels() {
 
 async function beginAddAiModel() {
   editingAiModelId = null;
-  editingApiTokenProfileId = null;
   providerSelect.value = 'sensenova';
   lastPresetProvider = 'sensenova';
   apiKeyInput.value = '';
@@ -978,8 +973,6 @@ async function beginAddAiModel() {
   updateModelDisplayNameCount();
   syncApiConfigMode();
   syncProviderUi();
-  await loadApiTokenProfiles('sensenova');
-  beginNewApiTokenProfile();
   showSettingsStatus('', '');
   setAiModelEditorVisible(true, '添加模型');
 }
@@ -989,10 +982,6 @@ async function editAiModel(configId) {
     const settings = await invoke('get_ai_model', { configId });
     editingAiModelId = settings.config_id;
     applyProviderSettings(settings);
-    await loadApiTokenProfiles(activeProviderId());
-    if (settings.api_token_profile_id && apiTokenProfileSelect) {
-      apiTokenProfileSelect.value = settings.api_token_profile_id;
-    }
     setAiModelEditorVisible(true, '编辑模型');
     showSettingsStatus('', '');
   } catch (error) {
@@ -1005,7 +994,6 @@ async function activateAiModel(configId) {
     const settings = await invoke('activate_ai_model', { configId });
     editingAiModelId = settings.config_id;
     applyProviderSettings(settings, { includeGlobal: true });
-    await loadApiTokenProfiles(activeProviderId());
     await refreshAiModels();
     setAiModelEditorVisible(false);
     updateView(!!settings.api_key);
@@ -1029,24 +1017,6 @@ async function deleteAiModel(configId) {
   }
 }
 
-function activeTokenProfile() {
-  return apiTokenProfileData.profiles.find(
-    profile => profile.id === apiTokenProfileData.active_id
-  ) || null;
-}
-
-function fillTokenProfileSelect(select, profiles, activeId) {
-  if (!select) return;
-  select.replaceChildren();
-  profiles.forEach(profile => {
-    const option = document.createElement('option');
-    option.value = profile.id;
-    option.textContent = `${profile.name} · ${profile.masked_key}`;
-    select.appendChild(option);
-  });
-  if (activeId) select.value = activeId;
-}
-
 function closeToolbarApiMenu() {
   if (!toolbarApiMenu || !toolbarApiButton) return;
   toolbarApiMenu.classList.add('hidden');
@@ -1060,198 +1030,55 @@ function toggleToolbarApiMenu() {
   toolbarApiButton.setAttribute('aria-expanded', String(shouldOpen));
 }
 
-function renderToolbarApiProfiles(profileLists) {
+function renderToolbarModels(models) {
   if (!toolbarApiPicker || !toolbarApiList || !toolbarApiLabel) return;
-
-  const availableLists = profileLists.filter(list => (list.profiles || []).length > 0);
-  const profileCount = availableLists.reduce(
-    (total, list) => total + list.profiles.length,
-    0
-  );
-  const visibleProvider = activeProviderId();
-  const currentProvider = providerStorageId(visibleProvider);
-  const currentList = availableLists.find(list => list.provider === currentProvider);
-  const currentProfile = currentList?.profiles.find(
-    profile => profile.id === currentList.active_id
-  );
-  const currentProviderLabel = AI_PROVIDER_META[visibleProvider]?.label || visibleProvider;
-
-  toolbarApiLabel.textContent = currentProfile
-    ? `${currentProviderLabel} · ${currentProfile.name}`
-    : '配置 API';
+  const activeModel = models.find(model => model.active);
+  const activeProviderLabel = activeModel
+    ? (AI_PROVIDER_META[activeModel.provider]?.label || activeModel.provider)
+    : '';
+  toolbarApiLabel.textContent = activeModel
+    ? `${activeProviderLabel} · ${activeModel.name}`
+    : '配置模型';
   toolbarApiPicker.classList.remove('hidden');
 
   toolbarApiList.replaceChildren();
-  if (profileCount === 0) {
+  if (models.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'toolbar-api-empty';
-    empty.textContent = '尚未保存 API 配置';
+    empty.textContent = '尚未添加模型';
     toolbarApiList.appendChild(empty);
   }
-  availableLists.forEach(list => {
-    const providerLabel = AI_PROVIDER_META[list.provider]?.label || list.provider;
-    const group = document.createElement('div');
-    group.className = 'toolbar-api-provider';
+  models.forEach(model => {
+    const providerLabel = AI_PROVIDER_META[model.provider]?.label || model.provider;
+    const option = document.createElement('button');
+    option.type = 'button';
+    option.className = 'toolbar-api-option' + (model.active ? ' active' : '');
+    option.dataset.modelId = model.id;
+    option.setAttribute('role', 'option');
+    option.setAttribute('aria-selected', String(model.active));
 
-    const heading = document.createElement('div');
-    heading.className = 'toolbar-api-provider-label';
-    heading.textContent = providerLabel;
-    group.appendChild(heading);
+    const providerMark = document.createElement('span');
+    providerMark.className = 'toolbar-api-provider-mark';
+    providerMark.textContent = providerLabel.slice(0, 3).toUpperCase();
 
-    list.profiles.forEach(profile => {
-      const isActive = list.provider === currentProvider
-        && profile.id === list.active_id;
-      const option = document.createElement('button');
-      option.type = 'button';
-      option.className = 'toolbar-api-option' + (isActive ? ' active' : '');
-      option.dataset.provider = list.provider;
-      option.dataset.profileId = profile.id;
-      option.setAttribute('role', 'option');
-      option.setAttribute('aria-selected', String(isActive));
+    const copy = document.createElement('span');
+    copy.className = 'toolbar-api-option-copy';
+    const name = document.createElement('span');
+    name.className = 'toolbar-api-option-name';
+    name.textContent = model.name;
+    const meta = document.createElement('span');
+    meta.className = 'toolbar-api-option-meta';
+    meta.textContent = `${providerLabel} · ${model.model}`;
+    copy.append(name, meta);
 
-      const providerMark = document.createElement('span');
-      providerMark.className = 'toolbar-api-provider-mark';
-      providerMark.textContent = providerLabel
-        .split(/\s+/)
-        .map(part => part[0])
-        .join('')
-        .slice(0, 3)
-        .toUpperCase();
+    const check = document.createElement('span');
+    check.className = 'toolbar-api-check';
+    check.textContent = model.active ? '✓' : '';
+    check.setAttribute('aria-hidden', 'true');
 
-      const copy = document.createElement('span');
-      copy.className = 'toolbar-api-option-copy';
-      const name = document.createElement('span');
-      name.className = 'toolbar-api-option-name';
-      name.textContent = profile.name;
-      const meta = document.createElement('span');
-      meta.className = 'toolbar-api-option-meta';
-      meta.textContent = profile.masked_key;
-      copy.append(name, meta);
-
-      const check = document.createElement('span');
-      check.className = 'toolbar-api-check';
-      check.textContent = isActive ? '✓' : '';
-      check.setAttribute('aria-hidden', 'true');
-
-      option.append(providerMark, copy, check);
-      group.appendChild(option);
-    });
-    toolbarApiList.appendChild(group);
+    option.append(providerMark, copy, check);
+    toolbarApiList.appendChild(option);
   });
-}
-
-async function refreshToolbarApiProfiles() {
-  const requestId = ++toolbarApiProfileRefreshId;
-  const providers = Object.keys(AI_PROVIDER_META).filter(provider => provider !== 'sensenova');
-  const results = await Promise.allSettled(
-    providers.map(async provider => invoke('list_api_token_profiles', { provider }))
-  );
-  if (requestId !== toolbarApiProfileRefreshId) return;
-
-  const profileLists = results
-    .filter(result => result.status === 'fulfilled')
-    .map(result => result.value);
-  renderToolbarApiProfiles(profileLists);
-}
-
-function renderApiTokenProfiles({ preserveDraft = false } = {}) {
-  const profiles = apiTokenProfileData.profiles || [];
-  fillTokenProfileSelect(
-    apiTokenProfileSelect,
-    profiles,
-    apiTokenProfileData.active_id
-  );
-  if (btnDeleteApiToken) btnDeleteApiToken.disabled = profiles.length === 0;
-
-  if (preserveDraft && apiTokenProfileSelect) {
-    const option = document.createElement('option');
-    option.value = '__new__';
-    option.textContent = '新 API Key';
-    apiTokenProfileSelect.appendChild(option);
-    apiTokenProfileSelect.value = '__new__';
-    return;
-  }
-
-  const active = activeTokenProfile();
-  if (apiTokenProfileNameInput) apiTokenProfileNameInput.value = active?.name || '';
-}
-
-async function loadApiTokenProfiles(provider) {
-  const storedProvider = providerStorageId(provider);
-  try {
-    const data = await invoke('list_api_token_profiles', { provider: storedProvider });
-    if (providerStorageId(activeProviderId()) !== storedProvider) return;
-    apiTokenProfileData = data;
-    renderApiTokenProfiles();
-    await refreshToolbarApiProfiles();
-  } catch (error) {
-    showSettingsStatus('加载 API Key 列表失败: ' + error, 'error');
-  }
-}
-
-async function activateApiTokenProfile(
-  profileId,
-  provider = activeProviderId(),
-  { fromToolbar = false } = {}
-) {
-  if (!profileId || profileId === '__new__') return;
-  const storedProvider = providerStorageId(provider);
-  try {
-    apiTokenProfileData = await invoke('activate_api_token_profile', {
-      provider: storedProvider,
-      profileId,
-    });
-    const settings = await invoke('get_provider_settings', { provider: storedProvider });
-    applyProviderSettings(settings);
-    renderApiTokenProfiles();
-    await refreshToolbarApiProfiles();
-    updateView(!!settings.api_key);
-    const profileName = activeTokenProfile()?.name || '当前 API Key';
-    const providerLabel = AI_PROVIDER_META[provider]?.label || provider;
-    showSettingsStatus(`已切换到 ${profileName}`, 'success');
-    if (fromToolbar) setGlobalStatus(`已切换到 ${providerLabel} · ${profileName}`, 'success');
-    setTimeout(() => showSettingsStatus('', ''), 2200);
-    invoke('start_translation_pipeline').catch(() => {});
-    if (supportsDeepSeekBalance(activeProviderId(), baseUrlInput?.value)) {
-      refreshDeepSeekBalance({ silent: true });
-    }
-  } catch (error) {
-    renderApiTokenProfiles();
-    await refreshToolbarApiProfiles();
-    showSettingsStatus('切换失败: ' + error, 'error');
-    if (fromToolbar) setGlobalStatus('API 切换失败: ' + error, 'error');
-  }
-}
-
-function beginNewApiTokenProfile() {
-  renderApiTokenProfiles({ preserveDraft: true });
-  if (apiTokenProfileNameInput) {
-    apiTokenProfileNameInput.value = '';
-    apiTokenProfileNameInput.focus();
-  }
-  if (apiKeyInput) apiKeyInput.value = '';
-  if (btnDeleteApiToken) btnDeleteApiToken.disabled = true;
-  showSettingsStatus('', '');
-}
-
-async function deleteCurrentApiTokenProfile() {
-  const profile = activeTokenProfile();
-  if (!profile || !window.confirm(`删除 API Key“${profile.name}”？`)) return;
-  const provider = providerStorageId();
-  try {
-    apiTokenProfileData = await invoke('delete_api_token_profile', {
-      provider,
-      profileId: profile.id,
-    });
-    const settings = await invoke('get_provider_settings', { provider });
-    applyProviderSettings(settings);
-    renderApiTokenProfiles();
-    await refreshToolbarApiProfiles();
-    updateView(!!settings.api_key);
-    showSettingsStatus('API Key 已删除', 'success');
-  } catch (error) {
-    showSettingsStatus('删除失败: ' + error, 'error');
-  }
 }
 
 async function loadProviderSettings(provider) {
@@ -1267,7 +1094,6 @@ async function loadProviderSettings(provider) {
       settings.model = AI_PROVIDER_META.deepseek.model;
     }
     applyProviderSettings(settings);
-    await loadApiTokenProfiles(provider);
     showSettingsStatus('', '');
   } catch (e) {
     showSettingsStatus('加载服务商配置失败: ' + e, 'error');
@@ -1277,7 +1103,6 @@ async function loadProviderSettings(provider) {
 function collectAiSettings() {
   return {
     config_id: editingAiModelId,
-    api_token_profile_id: editingApiTokenProfileId,
     provider: providerStorageId(),
     api_key: apiKeyInput.value.trim(),
     base_url: baseUrlInput.value.trim(),
@@ -1297,7 +1122,6 @@ async function loadSettings() {
     const s = await invoke('get_settings');
     editingAiModelId = s.config_id || null;
     applyProviderSettings(s, { includeGlobal: true });
-    await loadApiTokenProfiles(activeProviderId());
     setAiModelEditorVisible(!s.api_key, s.config_id ? '编辑模型' : '添加模型');
     updateView(!!s.api_key);
   } catch (e) {
@@ -1402,23 +1226,8 @@ async function refreshDeepSeekBalance({ silent = false } = {}) {
 async function saveTranslationSettings() {
   const settings = collectAiSettings();
   try {
-    let savedSettings = await invoke('save_ai_model', { settings });
+    const savedSettings = await invoke('save_ai_model', { settings });
     editingAiModelId = savedSettings.config_id;
-    if (settings.api_key) {
-      apiTokenProfileData = await invoke('upsert_api_token_profile', {
-        provider: settings.provider,
-        profileId: apiTokenProfileSelect?.value === '__new__'
-          ? null
-          : (editingApiTokenProfileId || apiTokenProfileSelect?.value || apiTokenProfileData.active_id),
-        name: apiTokenProfileNameInput?.value.trim() || '默认 API Key',
-        apiKey: settings.api_key,
-      });
-      editingApiTokenProfileId = apiTokenProfileData.active_id;
-      savedSettings.api_token_profile_id = editingApiTokenProfileId;
-      savedSettings = await invoke('save_ai_model', { settings: savedSettings });
-    }
-    renderApiTokenProfiles();
-    await refreshToolbarApiProfiles();
     await refreshAiModels();
     setAiModelEditorVisible(false);
     showSettingsStatus('模型已保存', 'success');
@@ -1801,8 +1610,11 @@ function selectedPubmedExportFields() {
   }
 }
 
-function choosePubmedExportFields(format, count) {
+function choosePubmedExportFields(format, context) {
   return new Promise(resolve => {
+    const counts = typeof context === 'number'
+      ? { defaultCount: context, allEntries: [], filteredEntries: [], selectedEntries: [] }
+      : context;
     const selected = new Set(selectedPubmedExportFields());
     const required = new Set(format === 'xlsx' ? ['pmid'] : []);
     required.forEach(field => selected.add(field));
@@ -1812,40 +1624,116 @@ function choosePubmedExportFields(format, count) {
       <div class="pubmed-modal-backdrop"></div>
       <section class="pubmed-modal-panel pubmed-export-panel">
         <header class="pubmed-modal-header">
-          <div><h2>选择导出字段</h2><p>${format.toUpperCase()} · ${count} 篇文献</p></div>
+          <div><h2>导出文献</h2><p data-export-meta>${format.toUpperCase()} · ${counts.defaultCount} 篇文献</p></div>
           <button class="pubmed-modal-close" data-close type="button" aria-label="关闭">×</button>
         </header>
         <div class="pubmed-modal-body">
-          <div class="pubmed-export-field-actions">
-            <button class="btn btn-secondary btn-sm" data-all type="button">全选</button>
-            <button class="btn btn-secondary btn-sm" data-default type="button">常用字段</button>
-            <button class="btn btn-secondary btn-sm" data-none type="button">清空</button>
+          ${format === 'xlsx' ? `
+            <div class="segmented-control pubmed-export-mode" data-export-mode>
+              <button class="seg-btn active" data-mode="standard" type="button">普通导出</button>
+              <button class="seg-btn" data-mode="google" type="button">Google 翻译</button>
+            </div>
+          ` : ''}
+          <div data-standard-panel>
+            <div class="pubmed-export-field-actions">
+              <button class="btn btn-secondary btn-sm" data-all type="button">全选</button>
+              <button class="btn btn-secondary btn-sm" data-default type="button">常用字段</button>
+              <button class="btn btn-secondary btn-sm" data-none type="button">清空</button>
+            </div>
+            <div class="pubmed-export-field-grid">
+              ${PUBMED_EXPORT_FIELDS.map(([key, label]) => `
+                <label class="pubmed-export-field">
+                  <input type="checkbox" value="${key}" ${selected.has(key) ? 'checked' : ''} ${required.has(key) ? 'disabled' : ''} />
+                  <span>${escapeHtml(label)}</span>
+                </label>
+              `).join('')}
+            </div>
           </div>
-          <div class="pubmed-export-field-grid">
-            ${PUBMED_EXPORT_FIELDS.map(([key, label]) => `
-              <label class="pubmed-export-field">
-                <input type="checkbox" value="${key}" ${selected.has(key) ? 'checked' : ''} ${required.has(key) ? 'disabled' : ''} />
-                <span>${escapeHtml(label)}</span>
-              </label>
-            `).join('')}
+          <div class="hidden" data-google-panel>
+            <div class="pubmed-google-export-section">
+              <span class="pubmed-google-export-label">翻译内容</span>
+              <div class="pubmed-google-export-options">
+                <label><input type="checkbox" data-google-title checked />标题</label>
+                <label><input type="checkbox" data-google-summary />摘要</label>
+              </div>
+            </div>
+            <div class="pubmed-google-export-section">
+              <span class="pubmed-google-export-label">文章范围</span>
+              <div class="pubmed-google-export-options pubmed-google-scope-options">
+                <label><input type="radio" name="google-export-scope" value="all" />当前检索全部</label>
+                <label><input type="radio" name="google-export-scope" value="filtered" ${counts.selectedEntries.length ? '' : 'checked'} />当前筛选结果</label>
+                <label class="${counts.selectedEntries.length ? '' : 'is-disabled'}"><input type="radio" name="google-export-scope" value="selected" ${counts.selectedEntries.length ? 'checked' : ''} ${counts.selectedEntries.length ? '' : 'disabled'} />当前勾选文章</label>
+              </div>
+            </div>
+            <div class="pubmed-google-export-section">
+              <span class="pubmed-google-export-label">处理选项</span>
+              <div class="pubmed-google-export-toggles">
+                <label><input type="checkbox" data-google-only-untranslated checked />仅导出未翻译内容</label>
+                <label class="hidden" data-google-fetch-row><input type="checkbox" data-google-fetch-missing />导出前补全缺失摘要</label>
+              </div>
+            </div>
+            <div class="pubmed-google-export-stats" data-google-stats></div>
           </div>
           <p class="pubmed-export-field-status"></p>
         </div>
         <footer class="pubmed-modal-footer">
+          <button class="btn btn-secondary hidden" data-open-google type="button">打开 Google 翻译</button>
+          <button class="btn btn-secondary hidden" data-import-google type="button">导入译文</button>
           <button class="btn btn-secondary" data-close type="button">取消</button>
           <button class="btn btn-primary" data-confirm type="button">继续选择保存位置</button>
         </footer>
       </section>
     `;
+    let exportMode = 'standard';
     const cleanup = value => {
       overlay.remove();
       resolve(value);
     };
     const setChecks = fields => {
       const values = new Set(fields);
-      overlay.querySelectorAll('input[type="checkbox"]').forEach(input => {
+      overlay.querySelectorAll('[data-standard-panel] input[type="checkbox"]').forEach(input => {
         input.checked = input.disabled || values.has(input.value);
       });
+    };
+    const googleEntries = () => {
+      const scope = overlay.querySelector('input[name="google-export-scope"]:checked')?.value || 'filtered';
+      if (scope === 'all') return counts.allEntries;
+      if (scope === 'selected') return counts.selectedEntries;
+      return counts.filteredEntries;
+    };
+    const updateGoogleStats = () => {
+      const entries = googleEntries();
+      const includeTitle = overlay.querySelector('[data-google-title]').checked;
+      const includeSummary = overlay.querySelector('[data-google-summary]').checked;
+      const onlyUntranslated = overlay.querySelector('[data-google-only-untranslated]').checked;
+      const titleCount = includeTitle
+        ? entries.filter(entry => !onlyUntranslated || !entry.title_translated).length
+        : 0;
+      const summaries = includeSummary
+        ? entries.filter(entry => !onlyUntranslated || !entry.summary_translated)
+        : [];
+      const summaryCount = summaries.filter(entry => String(entry.summary || '').trim()).length;
+      const missingCount = summaries.length - summaryCount;
+      overlay.querySelector('[data-google-stats]').textContent =
+        `${entries.length} 篇文献 · 待翻译标题 ${titleCount} · 摘要 ${summaryCount}${includeSummary ? ` · 缺失摘要 ${missingCount}` : ''}`;
+      overlay.querySelector('[data-export-meta]').textContent = `XLSX · ${entries.length} 篇文献`;
+      overlay.querySelector('[data-google-fetch-row]').classList.toggle('hidden', !includeSummary);
+    };
+    const setExportMode = nextMode => {
+      exportMode = nextMode;
+      overlay.querySelectorAll('[data-export-mode] .seg-btn').forEach(button => {
+        button.classList.toggle('active', button.dataset.mode === exportMode);
+      });
+      overlay.querySelector('[data-standard-panel]').classList.toggle('hidden', exportMode !== 'standard');
+      overlay.querySelector('[data-google-panel]').classList.toggle('hidden', exportMode !== 'google');
+      overlay.querySelector('[data-open-google]').classList.toggle('hidden', exportMode !== 'google');
+      overlay.querySelector('[data-import-google]').classList.toggle('hidden', exportMode !== 'google');
+      overlay.querySelector('[data-confirm]').textContent = exportMode === 'google'
+        ? '导出翻译 XLSX'
+        : '继续选择保存位置';
+      overlay.querySelector('.pubmed-export-field-status').textContent = '';
+      if (exportMode === 'google') updateGoogleStats();
+      else overlay.querySelector('[data-export-meta]').textContent = `${format.toUpperCase()} · ${counts.defaultCount} 篇文献`;
     };
     overlay.querySelectorAll('[data-close], .pubmed-modal-backdrop').forEach(el => {
       el.addEventListener('click', () => cleanup(null));
@@ -1853,14 +1741,50 @@ function choosePubmedExportFields(format, count) {
     overlay.querySelector('[data-all]').addEventListener('click', () => setChecks(PUBMED_EXPORT_FIELDS.map(([key]) => key)));
     overlay.querySelector('[data-default]').addEventListener('click', () => setChecks(DEFAULT_PUBMED_EXPORT_FIELDS));
     overlay.querySelector('[data-none]').addEventListener('click', () => setChecks([]));
+    overlay.querySelectorAll('[data-export-mode] .seg-btn').forEach(button => {
+      button.addEventListener('click', () => setExportMode(button.dataset.mode));
+    });
+    overlay.querySelectorAll('[data-google-panel] input').forEach(input => {
+      input.addEventListener('change', updateGoogleStats);
+    });
+    overlay.querySelector('[data-open-google]').addEventListener('click', () => {
+      openUrl('https://translate.google.com/?sl=en&tl=zh-CN&op=docs');
+    });
+    overlay.querySelector('[data-import-google]').addEventListener('click', () => {
+      cleanup(null);
+      importGoogleTranslateXlsx();
+    });
     overlay.querySelector('[data-confirm]').addEventListener('click', () => {
-      const fields = [...overlay.querySelectorAll('input[type="checkbox"]:checked')].map(input => input.value);
+      const status = overlay.querySelector('.pubmed-export-field-status');
+      if (exportMode === 'google') {
+        const includeTitle = overlay.querySelector('[data-google-title]').checked;
+        const includeSummary = overlay.querySelector('[data-google-summary]').checked;
+        if (!includeTitle && !includeSummary) {
+          status.textContent = '请至少选择标题或摘要';
+          return;
+        }
+        const scope = overlay.querySelector('input[name="google-export-scope"]:checked')?.value || 'filtered';
+        if (!googleEntries().length) {
+          status.textContent = '当前范围没有可导出的文献';
+          return;
+        }
+        cleanup({
+          mode: 'google',
+          scope,
+          includeTitle,
+          includeSummary,
+          onlyUntranslated: overlay.querySelector('[data-google-only-untranslated]').checked,
+          fetchMissingSummaries: overlay.querySelector('[data-google-fetch-missing]').checked,
+        });
+        return;
+      }
+      const fields = [...overlay.querySelectorAll('[data-standard-panel] input[type="checkbox"]:checked')].map(input => input.value);
       if (!fields.length) {
-        overlay.querySelector('.pubmed-export-field-status').textContent = '请至少选择一个字段';
+        status.textContent = '请至少选择一个字段';
         return;
       }
       localStorage.setItem(PUBMED_EXPORT_FIELDS_STORAGE_KEY, JSON.stringify(fields));
-      cleanup(fields);
+      cleanup({ mode: 'standard', fields });
     });
     document.body.appendChild(overlay);
   });
@@ -2028,18 +1952,154 @@ function safeExportFileName(value) {
   return String(value || 'pubmed').replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-').replace(/\s+/g, '-').slice(0, 60);
 }
 
+async function fetchMissingGoogleSummaries(entries) {
+  const missing = entries.filter(entry => !String(entry.summary || '').trim());
+  if (!missing.length) return { completed: 0, failed: 0 };
+  let completed = 0;
+  let failed = 0;
+  const updateProgress = () => {
+    setGlobalStatus(`正在补全摘要：${completed}/${missing.length}，处理中 ${Math.min(3, missing.length - completed)} 篇`, 'progress');
+  };
+  updateProgress();
+  await runConcurrentQueue(
+    missing,
+    async entry => {
+      const summary = await invoke('fetch_abstract', { entryId: entry.id });
+      if (summary) {
+        entry.summary = summary;
+        applyEntryUpdate(entry.id, item => { item.summary = summary; });
+      }
+      return summary;
+    },
+    {
+      concurrency: 3,
+      maxRetries: 1,
+      retryDelayMs: 600,
+      onSettled: result => {
+        completed += 1;
+        if (!result.ok || !result.value) failed += 1;
+        if (completed < missing.length) updateProgress();
+      },
+    },
+  );
+  return { completed, failed };
+}
+
+function googleExportEntriesForScope(choice, context) {
+  if (choice.scope === 'all') return context.allEntries;
+  if (choice.scope === 'selected') return context.selectedEntries;
+  return context.filteredEntries;
+}
+
+function chooseGoogleTranslateImportPreview(preview) {
+  return new Promise(resolve => {
+    const warningCount = preview.candidates.filter(candidate => candidate.warnings?.length).length;
+    const issueItems = preview.issues.slice(0, 6).map(issue => `
+      <li><strong>${escapeHtml(issue.code)}</strong><span>${escapeHtml(issue.message)}</span></li>
+    `).join('');
+    const overlay = document.createElement('div');
+    overlay.className = 'pubmed-modal';
+    overlay.innerHTML = `
+      <div class="pubmed-modal-backdrop"></div>
+      <section class="pubmed-modal-panel pubmed-google-import-panel">
+        <header class="pubmed-modal-header">
+          <div><h2>导入 Google 译文</h2><p>${preview.file_count} 个文件</p></div>
+          <button class="pubmed-modal-close" data-close type="button" aria-label="关闭">×</button>
+        </header>
+        <div class="pubmed-modal-body">
+          <div class="pubmed-google-import-summary">
+            <div><strong>${preview.candidates.length}</strong><span>可导入</span></div>
+            <div><strong>${warningCount}</strong><span>需留意</span></div>
+            <div><strong>${preview.issues.length}</strong><span>不可导入</span></div>
+            <div><strong>${preview.overwrite_count}</strong><span>已有译文</span></div>
+          </div>
+          ${preview.issues.length ? `
+            <div class="pubmed-google-import-issues">
+              <span class="pubmed-google-export-label">未导入记录</span>
+              <ul>${issueItems}</ul>
+              ${preview.issues.length > 6 ? `<p>另有 ${preview.issues.length - 6} 条未显示</p>` : ''}
+            </div>
+          ` : ''}
+          ${warningCount ? '<p class="pubmed-google-import-note">部分译文没有中文字符或与原文相同，请确认 Google 已完成翻译。</p>' : ''}
+          <label class="pubmed-google-overwrite ${preview.overwrite_count ? '' : 'is-disabled'}">
+            <input type="checkbox" data-overwrite ${preview.overwrite_count ? '' : 'disabled'} />
+            覆盖已有标题或摘要译文
+          </label>
+        </div>
+        <footer class="pubmed-modal-footer">
+          <button class="btn btn-secondary" data-close type="button">取消</button>
+          <button class="btn btn-primary" data-confirm type="button" ${preview.candidates.length ? '' : 'disabled'}>确认导入</button>
+        </footer>
+      </section>
+    `;
+    const cleanup = value => {
+      overlay.remove();
+      resolve(value);
+    };
+    overlay.querySelectorAll('[data-close], .pubmed-modal-backdrop').forEach(element => {
+      element.addEventListener('click', () => cleanup(null));
+    });
+    overlay.querySelector('[data-confirm]').addEventListener('click', () => {
+      cleanup({ overwrite: overlay.querySelector('[data-overwrite]').checked });
+    });
+    document.body.appendChild(overlay);
+  });
+}
+
+async function importGoogleTranslateXlsx() {
+  const dialog = window.__TAURI__?.dialog;
+  if (!dialog) {
+    setGlobalStatus('对话框插件不可用', 'error');
+    return;
+  }
+  const selectedPaths = await dialog.open({
+    title: '选择 Google 翻译后的 Excel',
+    multiple: true,
+    filters: [{ name: 'Excel', extensions: ['xlsx'] }],
+  });
+  if (!selectedPaths) return;
+  const paths = Array.isArray(selectedPaths) ? selectedPaths : [selectedPaths];
+  setGlobalStatus('正在检查 Google 译文…', 'progress');
+  try {
+    const preview = await invoke('preview_google_translate_import', { paths });
+    const choice = await chooseGoogleTranslateImportPreview(preview);
+    if (!choice) {
+      setGlobalStatus('', '');
+      return;
+    }
+    if (choice.overwrite && !window.confirm(`将覆盖 ${preview.overwrite_count} 条已有译文，是否继续？`)) return;
+    setGlobalStatus(`正在导入 ${preview.candidates.length} 条译文…`, 'progress');
+    const report = await invoke('apply_google_translate_import', {
+      candidates: preview.candidates,
+      overwrite: choice.overwrite,
+    });
+    setGlobalStatus(
+      `Google 译文导入完成：写入 ${report.applied.length} 条${report.skipped_existing ? `，跳过已有 ${report.skipped_existing} 条` : ''}`,
+      'success',
+    );
+  } catch (error) {
+    setGlobalStatus(`导入 Google 译文失败：${error}`, 'error');
+  }
+}
+
 async function exportCurrentPubmedEntries(formatOverride = null, sourceButton = btnExportPubmed) {
   if (!['pubmed', 'kept'].includes(mode)) return;
   const selected = getSelectedEntries();
-  const entries = selected.length ? selected : getFilteredPubmedEntries(allEntries);
-  if (!entries.length) {
+  const filtered = getFilteredPubmedEntries(allEntries);
+  const defaultEntries = selected.length ? selected : filtered;
+  if (!defaultEntries.length) {
     setGlobalStatus('当前没有可导出的文献', 'error');
     return;
   }
   const format = (formatOverride || pubmedExportFormat?.value) === 'txt' ? 'txt' : 'xlsx';
-  const selectedFields = await choosePubmedExportFields(format, entries.length);
-  if (!selectedFields) return;
-  const fields = format === 'xlsx' ? orderPubmedXlsxFields(selectedFields) : selectedFields;
+  const exportContext = {
+    defaultCount: defaultEntries.length,
+    allEntries: [...allEntries],
+    filteredEntries: filtered,
+    selectedEntries: selected,
+  };
+  const choice = await choosePubmedExportFields(format, exportContext);
+  if (!choice) return;
   const dialog = window.__TAURI__?.dialog;
   if (!dialog) {
     setGlobalStatus('对话框插件不可用', 'error');
@@ -2047,6 +2107,45 @@ async function exportCurrentPubmedEntries(formatOverride = null, sourceButton = 
   }
   const stamp = new Date().toISOString().slice(0, 10);
   const scopeName = mode === 'kept' ? '保留文献' : currentPubmedSearch?.name;
+  if (choice.mode === 'google') {
+    const entries = googleExportEntriesForScope(choice, exportContext);
+    if (choice.fetchMissingSummaries && choice.includeSummary) {
+      const result = await fetchMissingGoogleSummaries(entries);
+      if (result.failed && !window.confirm(`${result.failed} 篇摘要未能补全，是否继续导出其余内容？`)) {
+        setGlobalStatus('已取消 Google 翻译文件导出', '');
+        return;
+      }
+    }
+    const path = await dialog.save({
+      title: '导出 Google 翻译 Excel',
+      defaultPath: `${safeExportFileName(scopeName)}-google-translate-${stamp}.xlsx`,
+      filters: [{ name: 'Excel', extensions: ['xlsx'] }],
+    });
+    if (!path) return;
+    if (sourceButton) sourceButton.disabled = true;
+    try {
+      const report = await invoke('export_google_translate_xlsx', {
+        path,
+        searchId: mode === 'pubmed' ? currentPubmedSearch?.id : null,
+        entryIds: entries.map(entry => entry.id),
+        includeTitle: choice.includeTitle,
+        includeSummary: choice.includeSummary,
+        onlyUntranslated: choice.onlyUntranslated,
+      });
+      setGlobalStatus(
+        `已生成 ${report.file_paths.length} 个 Google 翻译文件：标题 ${report.title_count}，摘要 ${report.summary_count}${report.missing_summaries ? `，缺失摘要 ${report.missing_summaries}` : ''}`,
+        'success',
+      );
+    } catch (error) {
+      setGlobalStatus(`导出 Google 翻译文件失败：${error}`, 'error');
+    } finally {
+      if (sourceButton) sourceButton.disabled = false;
+    }
+    return;
+  }
+
+  const entries = defaultEntries;
+  const fields = format === 'xlsx' ? orderPubmedXlsxFields(choice.fields) : choice.fields;
   const path = await dialog.save({
     title: `导出 PubMed ${format.toUpperCase()}`,
     defaultPath: `${safeExportFileName(scopeName)}-${stamp}.${format}`,
@@ -10134,7 +10233,7 @@ window.addEventListener('DOMContentLoaded', () => {
   toolbarApiLabel = document.getElementById('toolbar-api-label');
   toolbarApiMenu = document.getElementById('toolbar-api-menu');
   toolbarApiList = document.getElementById('toolbar-api-list');
-  btnManageApiTokens = document.getElementById('btn-manage-api-tokens');
+  btnManageAiModels = document.getElementById('btn-manage-ai-models');
   const sidebarAiTools = document.getElementById('sidebar-ai-tools');
   const costMeter = document.getElementById('cost-meter');
   if (sidebarAiTools && toolbarApiPicker && costMeter) {
@@ -10183,10 +10282,6 @@ window.addEventListener('DOMContentLoaded', () => {
   aiModelStatus     = document.getElementById('ai-model-status');
   btnAddAiModel     = document.getElementById('btn-add-ai-model');
   btnCancelAiModel  = document.getElementById('btn-cancel-ai-model');
-  apiTokenProfileSelect = document.getElementById('api-token-profile');
-  apiTokenProfileNameInput = document.getElementById('api-token-profile-name');
-  btnNewApiToken = document.getElementById('btn-new-api-token');
-  btnDeleteApiToken = document.getElementById('btn-delete-api-token');
   btnSaveGeneral    = document.getElementById('btn-save-general');
   settingsStatus    = document.getElementById('settings-status');
   generalStatus     = document.getElementById('general-status');
@@ -10381,9 +10476,6 @@ window.addEventListener('DOMContentLoaded', () => {
     if (button.dataset.action === 'activate') activateAiModel(row.dataset.modelId);
     if (button.dataset.action === 'delete') deleteAiModel(row.dataset.modelId);
   });
-  apiTokenProfileSelect?.addEventListener('change', () => {
-    activateApiTokenProfile(apiTokenProfileSelect.value);
-  });
   toolbarApiButton?.addEventListener('click', (event) => {
     event.stopPropagation();
     toggleToolbarApiMenu();
@@ -10392,13 +10484,9 @@ window.addEventListener('DOMContentLoaded', () => {
     const option = event.target.closest('.toolbar-api-option');
     if (!option) return;
     closeToolbarApiMenu();
-    activateApiTokenProfile(
-      option.dataset.profileId,
-      option.dataset.provider,
-      { fromToolbar: true }
-    );
+    activateAiModel(option.dataset.modelId);
   });
-  btnManageApiTokens?.addEventListener('click', () => {
+  btnManageAiModels?.addEventListener('click', () => {
     closeToolbarApiMenu();
     showSettings('translation');
   });
@@ -10408,8 +10496,6 @@ window.addEventListener('DOMContentLoaded', () => {
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') closeToolbarApiMenu();
   });
-  btnNewApiToken?.addEventListener('click', beginNewApiTokenProfile);
-  btnDeleteApiToken?.addEventListener('click', deleteCurrentApiTokenProfile);
   btnToggleApiKey.addEventListener('click', toggleApiKeyVisibility);
   btnTest.addEventListener('click', testConnection);
   btnSaveSettings.addEventListener('click', saveTranslationSettings);
