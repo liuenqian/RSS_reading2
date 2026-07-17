@@ -42,6 +42,14 @@ test('wires export, import preview, apply, and the Google documents shortcut', (
   }
 });
 
+test('keeps the export dialog open for Google export and import actions', () => {
+  assert.match(main, /function choosePubmedExportFields\(initialFormat, context, onGoogleExport = null\)/);
+  assert.match(main, /const message = await onGoogleExport\(googleChoice\)/);
+  assert.doesNotMatch(main, /\[data-import-google\][\s\S]{0,180}cleanup\(null\)/);
+  assert.match(main, /已取消选择保存位置，窗口将继续保留/);
+  assert.match(main, /翻译完成后可直接点击“导入译文”/);
+});
+
 test('keeps ordinary PubMed export and excludes Google imports from cost accounting', () => {
   assert.match(main, /invoke\('export_pubmed_entries'/);
   assert.match(service, /google-translate-web-document/);

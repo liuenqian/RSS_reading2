@@ -1611,7 +1611,7 @@ function selectedPubmedExportFields() {
   }
 }
 
-function choosePubmedExportFields(initialFormat, context) {
+function choosePubmedExportFields(initialFormat, context, onGoogleExport = null) {
   return new Promise(resolve => {
     const counts = typeof context === 'number'
       ? { defaultCount: context, allEntries: [], filteredEntries: [], selectedEntries: [] }
@@ -1769,10 +1769,9 @@ function choosePubmedExportFields(initialFormat, context) {
       openUrl('https://translate.google.com/?sl=en&tl=zh-CN&op=docs');
     });
     overlay.querySelector('[data-import-google]').addEventListener('click', () => {
-      cleanup(null);
       importGoogleTranslateXlsx();
     });
-    overlay.querySelector('[data-confirm]').addEventListener('click', () => {
+    overlay.querySelector('[data-confirm]').addEventListener('click', async () => {
       const status = overlay.querySelector('.pubmed-export-field-status');
       if (exportMode === 'google') {
         const includeTitle = overlay.querySelector('[data-google-title]').checked;
@@ -1786,14 +1785,29 @@ function choosePubmedExportFields(initialFormat, context) {
           status.textContent = '当前范围没有可导出的文献';
           return;
         }
-        cleanup({
+        const googleChoice = {
           mode: 'google',
           scope,
           includeTitle,
           includeSummary,
           onlyUntranslated: overlay.querySelector('[data-google-only-untranslated]').checked,
           fetchMissingSummaries: overlay.querySelector('[data-google-fetch-missing]').checked,
-        });
+        };
+        if (!onGoogleExport) {
+          cleanup(googleChoice);
+          return;
+        }
+        const confirmButton = overlay.querySelector('[data-confirm]');
+        confirmButton.disabled = true;
+        status.textContent = '正在准备翻译文件…';
+        try {
+          const message = await onGoogleExport(googleChoice);
+          status.textContent = message || '';
+        } catch (error) {
+          status.textContent = `导出翻译文件失败：${error}`;
+        } finally {
+          confirmButton.disabled = false;
+        }
         return;
       }
       const fields = [...overlay.querySelectorAll('[data-standard-panel] input[type="checkbox"]:checked')].map(input => input.value);
@@ -2116,8 +2130,6 @@ async function exportCurrentPubmedEntries(formatOverride = null, sourceButton = 
     filteredEntries: filtered,
     selectedEntries: selected,
   };
-  const choice = await choosePubmedExportFields(initialFormat, exportContext);
-  if (!choice) return;
   const dialog = window.__TAURI__?.dialog;
   if (!dialog) {
     setGlobalStatus('对话框插件不可用', 'error');
@@ -2125,13 +2137,13 @@ async function exportCurrentPubmedEntries(formatOverride = null, sourceButton = 
   }
   const stamp = new Date().toISOString().slice(0, 10);
   const scopeName = mode === 'kept' ? '保留文献' : currentPubmedSearch?.name;
-  if (choice.mode === 'google') {
+  const exportGoogleTranslation = async choice => {
     const entries = googleExportEntriesForScope(choice, exportContext);
     if (choice.fetchMissingSummaries && choice.includeSummary) {
       const result = await fetchMissingGoogleSummaries(entries);
       if (result.failed && !window.confirm(`${result.failed} 篇摘要未能补全，是否继续导出其余内容？`)) {
         setGlobalStatus('已取消 Google 翻译文件导出', '');
-        return;
+        return '已取消导出，窗口将继续保留';
       }
     }
     const path = await dialog.save({
@@ -2139,7 +2151,7 @@ async function exportCurrentPubmedEntries(formatOverride = null, sourceButton = 
       defaultPath: `${safeExportFileName(scopeName)}-google-translate-${stamp}.xlsx`,
       filters: [{ name: 'Excel', extensions: ['xlsx'] }],
     });
-    if (!path) return;
+    if (!path) return '已取消选择保存位置，窗口将继续保留';
     if (sourceButton) sourceButton.disabled = true;
     try {
       const report = await invoke('export_google_translate_xlsx', {
@@ -2150,17 +2162,22 @@ async function exportCurrentPubmedEntries(formatOverride = null, sourceButton = 
         includeSummary: choice.includeSummary,
         onlyUntranslated: choice.onlyUntranslated,
       });
+      const message =
+        `已生成 ${report.file_paths.length} 个 Google 翻译文件：标题 ${report.title_count}，摘要 ${report.summary_count}${report.missing_summaries ? `，缺失摘要 ${report.missing_summaries}` : ''}`;
       setGlobalStatus(
-        `已生成 ${report.file_paths.length} 个 Google 翻译文件：标题 ${report.title_count}，摘要 ${report.summary_count}${report.missing_summaries ? `，缺失摘要 ${report.missing_summaries}` : ''}`,
+        message,
         'success',
       );
+      return `${message}。翻译完成后可直接点击“导入译文”`;
     } catch (error) {
       setGlobalStatus(`导出 Google 翻译文件失败：${error}`, 'error');
+      throw error;
     } finally {
       if (sourceButton) sourceButton.disabled = false;
     }
-    return;
-  }
+  };
+  const choice = await choosePubmedExportFields(initialFormat, exportContext, exportGoogleTranslation);
+  if (!choice) return;
 
   const entries = defaultEntries;
   const format = choice.format === 'txt' ? 'txt' : 'xlsx';
@@ -3547,6 +3564,8 @@ function selectFeed(feedId) {
   const feed = allFeeds.find(f => f.id === feedId);
   if (feed) updateToolbarFeedInfo(feed);
   if (query) {
+    literatureSearchRestoreState = null;
+    captureLiteratureSearchRestoreState();
     runLiteratureSearch(query);
     return;
   }
@@ -3556,11 +3575,14 @@ function selectFeed(feedId) {
 
 function captureLiteratureSearchRestoreState() {
   if (literatureSearchRestoreState) return;
+  const pubmedScope = mode === 'pubmed' ? currentPubmedSearch : null;
   literatureSearchRestoreState = {
     mode,
     selectedFeedId,
     entryFilterValue,
-    pubmedSearchId: currentPubmedSearch?.id || null,
+    pubmedSearchId: pubmedScope?.id || null,
+    pubmedSearchName: pubmedScope?.name || '',
+    pubmedEntries: pubmedScope ? [...allEntries] : null,
     selectedBriefingId,
   };
 }
@@ -3572,12 +3594,12 @@ function syncLiteratureSearchUi() {
   btnClearLiteratureSearch.classList.toggle('hidden', !hasQuery);
 }
 
-function enterLiteratureSearchMode() {
+function enterLiteratureSearchMode({ preservePubmedSearch = false } = {}) {
   clearEntrySelection({ render: false, syncPaperChat: false });
   mode = 'search';
-  currentPubmedSearch = null;
-  document.body.classList.remove('pubmed-mode');
-  pubmedBatchHeader?.classList.add('hidden');
+  if (!preservePubmedSearch) currentPubmedSearch = null;
+  document.body.classList.toggle('pubmed-mode', preservePubmedSearch);
+  pubmedBatchHeader?.classList.toggle('hidden', !preservePubmedSearch);
   briefingListEl.classList.add('hidden');
   briefingDetailEl.classList.add('hidden');
   entryListEl.classList.remove('hidden');
@@ -3593,18 +3615,30 @@ function enterLiteratureSearchMode() {
 
 async function runLiteratureSearch(query) {
   const requestId = ++literatureSearchRequestId;
-  const searchFeedId = selectedFeedId || null;
-  enterLiteratureSearchMode();
+  const restore = literatureSearchRestoreState;
+  const searchPubmedId = restore?.mode === 'pubmed' ? restore.pubmedSearchId : null;
+  const searchPubmedEntries = searchPubmedId && Array.isArray(restore?.pubmedEntries)
+    ? restore.pubmedEntries
+    : null;
+  const searchFeedId = searchPubmedId ? null : (selectedFeedId || null);
+  enterLiteratureSearchMode({ preservePubmedSearch: !!searchPubmedId });
   entryItemsEl.innerHTML = '<li class="entry-empty">正在检索…</li>';
   const feed = searchFeedId ? allFeeds.find(f => f.id === searchFeedId) : null;
-  const scopeLabel = feed ? (feed.title || feed.url || '当前订阅源') : entryFilterLabel(entryFilterValue);
+  const scopeLabel = searchPubmedId
+    ? (restore?.pubmedSearchName || currentPubmedSearch?.name || '当前 PubMed 检索')
+    : (feed ? (feed.title || feed.url || '当前订阅源') : entryFilterLabel(entryFilterValue));
   toolbarSubtitle.innerHTML = `<span>检索</span><span class="ts-meta">·</span><span class="ts-tertiary">${escapeHtml(scopeLabel)} · ${escapeHtml(query)}</span>`;
   try {
-    const entries = await invoke('search_entries', { query, feedId: searchFeedId });
+    const entries = searchPubmedEntries
+      ? searchPubmedEntries.filter(entry => entryMatchesLiteratureSearchQuery(entry, query))
+      : await invoke('search_entries', { query, feedId: searchFeedId });
+    const activeRestore = literatureSearchRestoreState;
     if (
       requestId !== literatureSearchRequestId ||
       literatureSearchInput.value.trim() !== query ||
-      (selectedFeedId || null) !== searchFeedId
+      (searchPubmedId
+        ? activeRestore?.pubmedSearchId !== searchPubmedId
+        : (selectedFeedId || null) !== searchFeedId)
     ) return;
     allEntries = entries;
     refreshEntryTagFilterOptions(allEntries);
@@ -3673,9 +3707,13 @@ function clearLiteratureSearch() {
     return;
   }
   if (wasSearchMode) {
-    entryFilterValue = currentSearchFilterValue;
-    if (currentSearchFeedId) {
-      selectFeed(currentSearchFeedId);
+    entryFilterValue = restore?.entryFilterValue || currentSearchFilterValue;
+    if (restore?.mode === 'pubmed' && restore.pubmedSearchId) {
+      selectPubmedSearch(restore.pubmedSearchId);
+    } else if (restore?.mode === 'kept') {
+      enterKeptMode();
+    } else if (restore?.selectedFeedId || currentSearchFeedId) {
+      selectFeed(restore?.selectedFeedId || currentSearchFeedId);
     } else {
       enterFeedMode();
       selectedFeedId = null;
@@ -4297,7 +4335,8 @@ function hideContextMenu() {
 }
 
 function getFilteredEntries(entries = allEntries) {
-  if (mode === 'pubmed' || mode === 'kept') return getFilteredPubmedEntries(entries);
+  const isScopedPubmedSearch = mode === 'search' && literatureSearchRestoreState?.mode === 'pubmed';
+  if (mode === 'pubmed' || mode === 'kept' || isScopedPubmedSearch) return getFilteredPubmedEntries(entries);
   let filtered = entries;
   const stars = starredIds();
   if (entryFilterValue === 'unread') filtered = filtered.filter(e => !e.is_read);
