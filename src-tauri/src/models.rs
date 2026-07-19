@@ -69,6 +69,26 @@ pub struct Entry {
     pub has_free_fulltext: Option<bool>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WordFrequencyItem {
+    pub term: String,
+    pub count: usize,
+    pub document_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WordFrequencyResult {
+    pub items: Vec<WordFrequencyItem>,
+    pub document_count: usize,
+    pub pdf_document_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WordFrequencyTranslation {
+    pub term: String,
+    pub translated: String,
+}
+
 fn default_screening_status() -> String {
     "unreviewed".to_string()
 }
@@ -109,6 +129,18 @@ pub struct PaperGraph {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PubmedAuthorRecord {
+    pub author_order: usize,
+    pub last_name: Option<String>,
+    pub fore_name: Option<String>,
+    pub initials: Option<String>,
+    pub collective_name: Option<String>,
+    pub display_name: String,
+    pub orcid: Option<String>,
+    pub affiliations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PubmedArticleRecord {
     pub pmid: String,
     pub pmcid: Option<String>,
@@ -116,6 +148,8 @@ pub struct PubmedArticleRecord {
     pub title: String,
     pub abstract_text: Option<String>,
     pub authors: Option<String>,
+    #[serde(default)]
+    pub structured_authors: Vec<PubmedAuthorRecord>,
     pub journal: Option<String>,
     pub affiliation: Option<String>,
     pub publication_date: Option<String>,
@@ -131,6 +165,21 @@ pub struct PubmedSearchPreview {
     pub total_count: usize,
     pub pmids: Vec<String>,
     pub entries: Vec<PubmedArticleRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PubmedAuthorQueryCandidate {
+    pub label: String,
+    pub query: String,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PubmedAuthorQueryResult {
+    pub query: String,
+    pub candidates: Vec<PubmedAuthorQueryCandidate>,
+    pub author_name: String,
+    pub affiliation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,6 +239,33 @@ pub struct PubmedSearch {
     pub exclude_count: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PmcGallerySearch {
+    pub id: i64,
+    pub name: String,
+    pub mode: String,
+    pub question: Option<String>,
+    pub author_name: Option<String>,
+    pub affiliation: Option<String>,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub query: String,
+    pub article_limit: i64,
+    pub journal_filter: String,
+    pub impact_factor_filter: String,
+    pub jcr_quartile_filter: String,
+    pub cas_partition_filter: String,
+    pub top_filter: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_success_at: Option<String>,
+    pub last_result_count: i64,
+    pub last_scanned_articles: i64,
+    pub last_figure_count: i64,
+    pub last_next_offset: i64,
+    pub last_has_more: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PubmedRetrievalOptions {
     #[serde(default = "default_pubmed_retrieval_scope")]
@@ -247,11 +323,14 @@ pub struct PubmedSearchEntry {
     pub summary: Option<String>,
     pub summary_translated: Option<String>,
     pub authors: Option<String>,
+    #[serde(default)]
+    pub structured_authors: Vec<PubmedAuthorRecord>,
     pub journal: Option<String>,
     pub publication_date: Option<String>,
     pub publication_date_raw: Option<String>,
     pub publication_date_precision: Option<String>,
     pub publication_sort_key: Option<i64>,
+    pub published_at: Option<String>,
     pub pmid: Option<String>,
     pub pmcid: Option<String>,
     pub doi: Option<String>,

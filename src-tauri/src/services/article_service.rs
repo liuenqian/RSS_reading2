@@ -391,7 +391,11 @@ fn extract_authors(xml: &str) -> Option<String> {
             let last = direct_child_text(author, "LastName").unwrap_or_default();
             let fore_name = direct_child_text(author, "ForeName").unwrap_or_default();
             let initials = direct_child_text(author, "Initials").unwrap_or_default();
-            let given_name = if fore_name.is_empty() { initials } else { fore_name };
+            let given_name = if fore_name.is_empty() {
+                initials
+            } else {
+                fore_name
+            };
             let name = format!("{} {}", given_name, last).trim().to_string();
             (!name.is_empty()).then_some(name)
         })
@@ -661,8 +665,7 @@ fn normalize_doi(value: &str) -> Option<String> {
         let candidate: String = value[idx..]
             .chars()
             .take_while(|c| {
-                c.is_ascii_alphanumeric()
-                    || matches!(c, '/' | '.' | '-' | '_' | ';' | '(' | ')')
+                c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_' | ';' | '(' | ')')
             })
             .collect();
         let trimmed = candidate

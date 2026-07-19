@@ -106,6 +106,14 @@ fn schema_sql() -> &'static str {
     CREATE INDEX IF NOT EXISTS idx_reading_notes_entry
         ON reading_notes(entry_id);
 
+    CREATE TABLE IF NOT EXISTS entry_pdf_fulltexts (
+        entry_id    INTEGER PRIMARY KEY,
+        content     TEXT NOT NULL,
+        source_url  TEXT,
+        indexed_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS paper_chat_sessions (
         scope_key      TEXT PRIMARY KEY,
         entry_ids_json TEXT NOT NULL,
@@ -137,6 +145,106 @@ fn schema_sql() -> &'static str {
         ON entry_tags(tag);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_entry_tags_entry_tag_nocase
         ON entry_tags(entry_id, lower(tag));
+
+    CREATE TABLE IF NOT EXISTS entry_user_state (
+        entry_id    INTEGER PRIMARY KEY,
+        is_starred  INTEGER NOT NULL DEFAULT 0,
+        starred_at  TEXT,
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS feed_entry_screening_status (
+        feed_id            INTEGER NOT NULL,
+        entry_id           INTEGER NOT NULL,
+        screening_status   TEXT NOT NULL DEFAULT 'unreviewed'
+            CHECK(screening_status IN ('unreviewed', 'keep', 'maybe', 'exclude')),
+        exclusion_reason   TEXT,
+        screening_note     TEXT,
+        screened_at        TEXT,
+        updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (feed_id, entry_id),
+        FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE,
+        FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_feed_entry_screening_status
+        ON feed_entry_screening_status(feed_id, screening_status);
+
+    CREATE TABLE IF NOT EXISTS screening_table_preferences (
+        scope_kind    TEXT NOT NULL CHECK(scope_kind IN ('pubmed', 'feed', 'project')),
+        scope_id      INTEGER NOT NULL,
+        schema_version INTEGER NOT NULL DEFAULT 1,
+        config_json   TEXT NOT NULL,
+        updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (scope_kind, scope_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS pubmed_author_identity_states (
+        search_id      INTEGER PRIMARY KEY,
+        schema_version INTEGER NOT NULL DEFAULT 1,
+        state_json     TEXT NOT NULL,
+        updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (search_id) REFERENCES pubmed_searches(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS pubmed_entry_authors (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        entry_id        INTEGER NOT NULL,
+        author_order    INTEGER NOT NULL,
+        last_name       TEXT,
+        fore_name       TEXT,
+        initials        TEXT,
+        collective_name TEXT,
+        display_name    TEXT NOT NULL,
+        orcid           TEXT,
+        UNIQUE(entry_id, author_order),
+        FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_pubmed_entry_authors_entry
+        ON pubmed_entry_authors(entry_id, author_order);
+    CREATE INDEX IF NOT EXISTS idx_pubmed_entry_authors_orcid
+        ON pubmed_entry_authors(orcid) WHERE orcid IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS pubmed_entry_author_affiliations (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        entry_author_id   INTEGER NOT NULL,
+        affiliation_order INTEGER NOT NULL,
+        raw_text          TEXT NOT NULL,
+        UNIQUE(entry_author_id, affiliation_order),
+        FOREIGN KEY (entry_author_id) REFERENCES pubmed_entry_authors(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_pubmed_author_affiliations_author
+        ON pubmed_entry_author_affiliations(entry_author_id, affiliation_order);
+
+    CREATE TABLE IF NOT EXISTS pubmed_search_run_queries (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id          INTEGER NOT NULL,
+        query_kind      TEXT NOT NULL CHECK(query_kind IN ('base', 'expansion')),
+        query           TEXT NOT NULL,
+        profile_version INTEGER,
+        status          TEXT NOT NULL DEFAULT 'pending'
+            CHECK(status IN ('pending', 'completed', 'failed')),
+        result_count    INTEGER NOT NULL DEFAULT 0,
+        error_message   TEXT,
+        UNIQUE(run_id, query_kind),
+        FOREIGN KEY (run_id) REFERENCES pubmed_search_runs(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_pubmed_search_run_queries_run
+        ON pubmed_search_run_queries(run_id, id);
+
+    CREATE TABLE IF NOT EXISTS pubmed_search_run_item_sources (
+        run_id       INTEGER NOT NULL,
+        pmid         TEXT NOT NULL,
+        run_query_id INTEGER NOT NULL,
+        rank         INTEGER NOT NULL,
+        PRIMARY KEY (run_query_id, pmid),
+        FOREIGN KEY (run_id, pmid)
+            REFERENCES pubmed_search_run_items(run_id, pmid) ON DELETE CASCADE,
+        FOREIGN KEY (run_query_id)
+            REFERENCES pubmed_search_run_queries(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_pubmed_run_item_sources_item
+        ON pubmed_search_run_item_sources(run_id, pmid);
 
     -- Immutable append-only log driving reading stats. Deliberately NOT
     -- foreign-keyed to feeds/entries: deleting a feed (or pruning entries via

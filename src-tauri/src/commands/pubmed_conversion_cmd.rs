@@ -1,8 +1,6 @@
 use crate::db::DbState;
 use crate::models::{Feed, PubmedSearch};
-use crate::services::{
-    pubmed_conversion_service, pubmed_search_service, pubmed_service, translation_pipeline,
-};
+use crate::services::{pubmed_conversion_service, pubmed_search_service, pubmed_service};
 use tauri::{AppHandle, State};
 
 const CONVERTED_RSS_LIMIT: u32 = 100;
@@ -26,7 +24,6 @@ pub async fn convert_pubmed_feed_to_search(
                 pubmed_conversion_service::finish_feed_to_search(&conn, feed_id, search.id)?;
                 pubmed_search_service::get_search(&conn, search.id)?
             };
-            translation_pipeline::spawn(app);
             Ok(converted)
         }
         Ok(result) => {

@@ -10,12 +10,12 @@
             href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Noto+Serif+SC:wght@400;500;600;700&display=swap"
             rel="stylesheet"
         />
-        <link rel="stylesheet" href="styles.css?v=20260717-export-dialog-format" />
+        <link rel="stylesheet" href="styles.css?v=20260719-pmc-full-preview" />
         <script src="/vendor/markdown-it.js"></script>
         <script src="/vendor/markdown-it-task-lists.js"></script>
         <script src="/vendor/markdown-it-footnote.js"></script>
         <script src="/vendor/purify.js"></script>
-        <script type="module" src="/main.js?v=20260717-export-dialog-format" defer></script>
+        <script type="module" src="/main.js?v=20260719-pmc-full-preview" defer></script>
     </head>
 
     <body data-theme="light" data-accent="coral" data-font-scale="md">
@@ -168,6 +168,17 @@
 
         <!-- ── App shell ───────────────────────────── -->
         <div id="app">
+            <section id="screening-window-view" class="screening-window-view hidden" aria-label="初筛工作台">
+                <div class="screening-window-heading">
+                    <div>
+                        <div class="screening-window-eyebrow">Cento · Literature Screening</div>
+                        <h1 id="screening-window-title">初筛工作台</h1>
+                        <p id="screening-window-subtitle">当前检索范围</p>
+                    </div>
+                    <button id="btn-screening-window-close" class="btn btn-secondary" type="button">关闭窗口</button>
+                </div>
+                <div id="screening-window-table" class="screening-table-shell" aria-label="独立初筛表格"></div>
+            </section>
             <!-- ── Settings view ─────────────────────── -->
             <div id="settings-view" class="settings-view hidden">
                 <nav class="settings-rail">
@@ -937,12 +948,12 @@
                             <div class="onboarding-icon">✨</div>
                             <div class="onboarding-body">
                                 <div class="onboarding-title">
-                                    开启自动翻译（可选）
+                                    配置按需翻译（可选）
                                 </div>
                                 <div class="onboarding-text">
                                     RSS Reading 不配置也能直接阅读英文
-                                    RSS。如果想让标题和摘要自动翻译成中文，在下方填入
-                                    AI 服务 API Key 并保存即可。
+                                    RSS。需要翻译标题或摘要时，可在下方配置
+                                    AI 服务 API Key，再通过文章菜单主动翻译。
                                 </div>
                                 <div class="onboarding-hint">
                                     可选择 DeepSeek、OpenAI、Anthropic、Gemini
@@ -971,8 +982,8 @@
                             </div>
                             <h1 class="section-title">AI 服务配置</h1>
                             <p class="section-subtitle">
-                                配置翻译服务后即可使用 RSS Reading 自动翻译 PubMed
-                                文献的标题和摘要。API Key
+                                配置翻译服务后，可按需翻译 PubMed
+                                文献的标题和摘要。不会在抓取后自动消耗 token。API Key
                                 仅存储在本地数据库中，不会上传到云端。
                             </p>
                         </div>
@@ -2272,45 +2283,69 @@
                         </div>
                     </div>
 
-                    <div class="feed-section-label pubmed-section-label">
-                        <button
-                            class="sidebar-section-toggle"
-                            type="button"
-                            data-sidebar-section-toggle="pubmed"
-                            aria-expanded="true"
-                            aria-controls="pubmed-search-list"
-                            title="折叠 PubMed 检索"
-                        >
-                            <svg class="sidebar-section-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
-                            <span>PubMed 检索</span>
-                        </button>
-                        <button id="btn-new-pubmed-search" class="sidebar-section-action" type="button" title="新建 PubMed 检索" aria-label="新建 PubMed 检索">
-                            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
-                        </button>
-                    </div>
-                    <ul id="pubmed-search-list" class="pubmed-search-list sidebar-section-list"></ul>
+                    <div class="sidebar-source-sections">
+                        <section class="sidebar-source-section" data-sidebar-source-section="pmc-gallery">
+                            <div class="feed-section-label">
+                                <button
+                                    class="sidebar-section-toggle"
+                                    type="button"
+                                    data-sidebar-section-toggle="pmc-gallery"
+                                    aria-expanded="true"
+                                    aria-controls="pmc-gallery-search-list"
+                                    title="折叠 PMC 图库"
+                                >
+                                    <svg class="sidebar-section-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
+                                    <span>PMC 图库</span>
+                                </button>
+                                <button id="btn-new-pmc-gallery-search" class="sidebar-section-action" type="button" title="新建 PMC 图库检索" aria-label="新建 PMC 图库检索">
+                                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                                </button>
+                            </div>
+                            <ul id="pmc-gallery-search-list" class="pubmed-search-list sidebar-section-list"></ul>
+                        </section>
+                        <section class="sidebar-source-section" data-sidebar-source-section="pubmed">
+                            <div class="feed-section-label pubmed-section-label">
+                                <button
+                                    class="sidebar-section-toggle"
+                                    type="button"
+                                    data-sidebar-section-toggle="pubmed"
+                                    aria-expanded="true"
+                                    aria-controls="pubmed-search-list"
+                                    title="折叠 PubMed 检索"
+                                >
+                                    <svg class="sidebar-section-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
+                                    <span>PubMed 检索</span>
+                                </button>
+                                <button id="btn-new-pubmed-search" class="sidebar-section-action" type="button" title="新建 PubMed 检索" aria-label="新建 PubMed 检索">
+                                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                                </button>
+                            </div>
+                            <ul id="pubmed-search-list" class="pubmed-search-list sidebar-section-list"></ul>
+                        </section>
 
-                    <div class="feed-section-label">
-                        <button
-                            class="sidebar-section-toggle"
-                            type="button"
-                            data-sidebar-section-toggle="feeds"
-                            aria-expanded="true"
-                            aria-controls="feed-list"
-                            title="折叠订阅源"
-                        >
-                            <svg class="sidebar-section-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
-                            <span>订阅源</span>
-                        </button>
-                        <button id="btn-new-feed" class="sidebar-section-action" type="button" title="添加 RSS 订阅" aria-label="添加 RSS 订阅">
-                            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
-                        </button>
+                        <section class="sidebar-source-section" data-sidebar-source-section="feeds">
+                            <div class="feed-section-label">
+                                <button
+                                    class="sidebar-section-toggle"
+                                    type="button"
+                                    data-sidebar-section-toggle="feeds"
+                                    aria-expanded="true"
+                                    aria-controls="feed-list"
+                                    title="折叠订阅源"
+                                >
+                                    <svg class="sidebar-section-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
+                                    <span>订阅源</span>
+                                </button>
+                                <button id="btn-new-feed" class="sidebar-section-action" type="button" title="添加 RSS 订阅" aria-label="添加 RSS 订阅">
+                                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                                </button>
+                            </div>
+                            <ul id="feed-list" class="feed-list sidebar-section-list"></ul>
+                        </section>
                     </div>
-                    <ul id="feed-list" class="feed-list sidebar-section-list"></ul>
-
-                    <div id="sidebar-ai-tools" class="sidebar-ai-tools"></div>
 
                     <div id="global-status" class="global-status"></div>
+                    <div id="sidebar-ai-tools" class="sidebar-ai-tools"></div>
                 </aside>
 
                 <div
@@ -2510,6 +2545,17 @@
                                     </div>
                                     </div>
                                 </details>
+                                <button
+                                    id="btn-word-frequency"
+                                    class="btn btn-secondary btn-sm word-frequency-trigger"
+                                    type="button"
+                                    title="查看当前结果的词云与词频"
+                                >
+                                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+                                        <path d="M3 12.5V8.5M8 12.5V3.5M13 12.5V6" />
+                                    </svg>
+                                    <span>词频</span>
+                                </button>
                             </div>
                             <div
                                 id="entry-bulk-actions"
@@ -2636,6 +2682,10 @@
                                     </svg>
                                     <span class="entry-sort-direction-label">↓</span>
                                 </button>
+                                <button id="btn-screening-table-toggle" class="btn btn-secondary btn-sm" type="button" title="在独立窗口打开初筛工作台">
+                                    <span aria-hidden="true">▦</span>
+                                    <span>初筛工作台</span>
+                                </button>
                             </div>
                         </div>
                         <ul id="entry-items" class="entry-items">
@@ -2643,6 +2693,7 @@
                                 添加订阅源后点击刷新按钮获取文章
                             </li>
                         </ul>
+                        <div id="screening-table" class="screening-table-shell hidden" aria-label="表格初筛视图"></div>
                     </section>
 
                     <!-- Briefing list (briefing mode) -->
@@ -2756,7 +2807,7 @@
                                 选择一篇文章查看详情
                             </div>
                             <div class="detail-empty-hint">
-                                标题、摘要会被自动翻译为中文。点击右上角设置可配置翻译模型。
+                                需要时可在文章菜单中翻译标题或摘要。
                             </div>
                         </div>
 
@@ -3516,6 +3567,194 @@
         </div>
         <!-- /#app -->
 
+        <div id="pmc-gallery-modal" class="pubmed-modal pmc-gallery-modal hidden" role="dialog" aria-modal="true" aria-labelledby="pmc-gallery-title">
+            <div class="pubmed-modal-backdrop" data-pmc-gallery-close></div>
+            <section class="pubmed-modal-panel pmc-gallery-panel">
+                <header class="pubmed-modal-header">
+                    <div>
+                        <h2 id="pmc-gallery-title">PMC 图库检索</h2>
+                        <p>使用 PubMed 检索式匹配 PMC Open Access 文献，再分别浏览图形摘要和正文图。</p>
+                    </div>
+                    <button class="pubmed-modal-close" type="button" data-pmc-gallery-close title="关闭" aria-label="关闭">×</button>
+                </header>
+                <div class="pubmed-modal-body pmc-gallery-body">
+                    <div class="segmented-control pubmed-search-mode" role="group" aria-label="PMC 检索模式">
+                        <button class="seg-btn active" type="button" data-pmc-search-mode="topic">主题检索</button>
+                        <button class="seg-btn" type="button" data-pmc-search-mode="author">作者检索</button>
+                    </div>
+                    <label class="pubmed-field">
+                        <span>检索名称</span>
+                        <input id="pmc-gallery-name" type="text" maxlength="100" list="pmc-gallery-name-history" autocomplete="off" placeholder="用于在左侧 PMC 图库列表中显示" />
+                        <datalist id="pmc-gallery-name-history"></datalist>
+                    </label>
+                    <div id="pmc-topic-builder" class="pmc-gallery-builder-row">
+                        <label class="pubmed-field">
+                            <span>研究问题</span>
+                            <input id="pmc-gallery-question" type="text" maxlength="500" placeholder="例如：心肌梗死后线粒体损伤的治疗研究" />
+                        </label>
+                        <button id="btn-generate-pmc-query" class="btn btn-secondary" type="button">AI 生成检索式</button>
+                    </div>
+                    <div id="pmc-author-builder" class="pmc-gallery-author-builder hidden">
+                        <div class="pmc-gallery-author-fields">
+                            <label class="pubmed-field">
+                                <span>作者姓名或描述</span>
+                                <input id="pmc-gallery-author-name" type="text" maxlength="200" />
+                            </label>
+                            <label class="pubmed-field">
+                                <span>机构（可选）</span>
+                                <input id="pmc-gallery-author-affiliation" type="text" maxlength="200" />
+                            </label>
+                        </div>
+                        <div class="pubmed-author-date-grid">
+                            <label class="pubmed-field">
+                                <span>起始日期（可选）</span>
+                                <input id="pmc-gallery-author-start-date" type="date" />
+                            </label>
+                            <label class="pubmed-field">
+                                <span>结束日期（可选）</span>
+                                <input id="pmc-gallery-author-end-date" type="date" />
+                            </label>
+                        </div>
+                        <button id="btn-build-pmc-author-query" class="btn btn-secondary" type="button">AI 构建作者检索式</button>
+                    </div>
+                    <div class="pmc-gallery-searchbar">
+                        <label class="pmc-gallery-query-field">
+                            <span>PubMed 检索式</span>
+                            <textarea id="pmc-gallery-query" rows="3" maxlength="2000" aria-label="PubMed 检索式" placeholder="可直接输入或通过 AI 生成 PubMed 检索式"></textarea>
+                        </label>
+                        <label class="pmc-gallery-limit-label">
+                            <span>扫描</span>
+                            <select id="pmc-gallery-limit" aria-label="扫描文献篇数">
+                                <option value="4">4 篇</option>
+                                <option value="8" selected>8 篇</option>
+                                <option value="12">12 篇</option>
+                                <option value="20">20 篇</option>
+                            </select>
+                        </label>
+                        <button id="btn-search-pmc-gallery" class="btn btn-primary" type="button" disabled>抓取图库</button>
+                    </div>
+                    <div class="pmc-gallery-preview-actions">
+                        <button id="btn-preview-pmc-gallery" class="btn btn-secondary" type="button">预览结果</button>
+                        <button id="btn-save-pmc-gallery-search" class="btn btn-primary" type="button" disabled>保存检索</button>
+                        <span id="pmc-gallery-preview-status" class="pubmed-preview-status" role="status"></span>
+                    </div>
+                    <div id="pmc-gallery-preview-results" class="pmc-gallery-preview-results hidden"></div>
+                    <div class="pmc-gallery-metric-filters" aria-label="抓取前期刊筛选">
+                        <input id="pmc-gallery-journal-filter" type="text" maxlength="160" list="pmc-gallery-journal-options" aria-label="检索结果期刊筛选" placeholder="全部期刊或输入期刊" disabled />
+                        <datalist id="pmc-gallery-journal-options"></datalist>
+                        <select id="pmc-gallery-if-filter" aria-label="影响因子筛选">
+                            <option value="all">全部 IF</option>
+                            <option value="ge5">IF ≥ 5</option>
+                            <option value="ge10">IF ≥ 10</option>
+                            <option value="ge20">IF ≥ 20</option>
+                            <option value="na">无 IF</option>
+                        </select>
+                        <select id="pmc-gallery-q-filter" aria-label="JCR 分区筛选">
+                            <option value="all">全部 JCR</option>
+                            <option value="Q1">JCR Q1</option>
+                            <option value="Q2">JCR Q2</option>
+                            <option value="Q3">JCR Q3</option>
+                            <option value="Q4">JCR Q4</option>
+                            <option value="na">无 JCR</option>
+                        </select>
+                        <select id="pmc-gallery-b-filter" aria-label="中科院分区筛选">
+                            <option value="all">全部中科院</option>
+                            <option value="B1">中科院 B1</option>
+                            <option value="B2">中科院 B2</option>
+                            <option value="B3">中科院 B3</option>
+                            <option value="B4">中科院 B4</option>
+                            <option value="na">无中科院</option>
+                        </select>
+                        <select id="pmc-gallery-top-filter" aria-label="TOP 筛选">
+                            <option value="all">全部 Top</option>
+                            <option value="top">仅 Top</option>
+                            <option value="non-top">非 Top</option>
+                            <option value="na">无 Top 数据</option>
+                        </select>
+                    </div>
+                    <div class="pmc-gallery-toolbar">
+                        <div class="segmented-control" role="group" aria-label="图库提取模式">
+                            <button class="seg-btn active" type="button" data-pmc-gallery-view="all">全部图片</button>
+                            <button class="seg-btn" type="button" data-pmc-gallery-view="figure-number">按图号提取</button>
+                        </div>
+                        <label id="pmc-gallery-figure-number-control" class="pmc-gallery-figure-number-control hidden">
+                            <span>Figure</span>
+                            <input id="pmc-gallery-figure-number" type="number" min="1" max="99" step="1" value="1" inputmode="numeric" aria-label="批量提取的 Figure 编号" />
+                        </label>
+                        <div id="pmc-gallery-status" class="pmc-gallery-status" role="status"></div>
+                    </div>
+                    <div id="pmc-gallery-results" class="pmc-gallery-results hidden">
+                        <section id="pmc-gallery-graphical-section" class="pmc-gallery-section" aria-labelledby="pmc-gallery-graphical-title">
+                            <header class="pmc-gallery-section-header">
+                                <h3 id="pmc-gallery-graphical-title">图形摘要</h3>
+                                <span id="pmc-gallery-graphical-count" class="pmc-gallery-section-count"></span>
+                            </header>
+                            <div id="pmc-gallery-graphical-grid" class="pmc-gallery-article-list"></div>
+                            <div id="pmc-gallery-graphical-empty" class="pmc-gallery-section-empty">未找到图形摘要</div>
+                        </section>
+                        <section id="pmc-gallery-figure-section" class="pmc-gallery-section" aria-labelledby="pmc-gallery-figure-title">
+                            <header class="pmc-gallery-section-header">
+                                <h3 id="pmc-gallery-figure-title">正文图</h3>
+                                <span id="pmc-gallery-figure-count" class="pmc-gallery-section-count"></span>
+                            </header>
+                            <div id="pmc-gallery-figure-grid" class="pmc-gallery-article-list"></div>
+                            <div id="pmc-gallery-figure-empty" class="pmc-gallery-section-empty">未找到正文图</div>
+                        </section>
+                    </div>
+                    <div id="pmc-gallery-load-more-row" class="pmc-gallery-load-more-row hidden">
+                        <button id="btn-load-more-pmc-gallery" class="btn btn-secondary" type="button">继续加载 20 篇</button>
+                    </div>
+                    <div id="pmc-gallery-empty" class="pmc-gallery-empty">输入检索词开始浏览 PMC 开放文献图片</div>
+                </div>
+            </section>
+        </div>
+
+        <div id="word-frequency-modal" class="pubmed-modal hidden" role="dialog" aria-modal="true" aria-labelledby="word-frequency-title">
+            <div class="pubmed-modal-backdrop" data-word-frequency-close></div>
+            <section class="pubmed-modal-panel word-frequency-panel">
+                <header class="pubmed-modal-header">
+                    <div>
+                        <h2 id="word-frequency-title">词云与词频</h2>
+                        <p id="word-frequency-scope"></p>
+                    </div>
+                    <button class="pubmed-modal-close" type="button" data-word-frequency-close title="关闭" aria-label="关闭">×</button>
+                </header>
+                <div class="pubmed-modal-body word-frequency-body">
+                    <div class="word-frequency-controls">
+                        <div class="segmented-control" role="tablist" aria-label="词频视图">
+                            <button class="seg-btn active" type="button" data-word-frequency-view="cloud">词云</button>
+                            <button class="seg-btn" type="button" data-word-frequency-view="list">词频排行</button>
+                        </div>
+                        <div class="word-frequency-language-controls">
+                            <div class="segmented-control" role="group" aria-label="关键词语言">
+                                <button class="seg-btn active" type="button" data-word-frequency-language="en">英文</button>
+                                <button class="seg-btn" type="button" data-word-frequency-language="zh" disabled>中文</button>
+                            </div>
+                            <button id="btn-translate-word-frequency" class="btn btn-secondary btn-sm" type="button" disabled>翻译关键词</button>
+                        </div>
+                    </div>
+                    <div id="word-frequency-status" class="word-frequency-status"></div>
+                    <div id="word-frequency-cloud" class="word-frequency-cloud" role="list"></div>
+                    <div id="word-frequency-list" class="word-frequency-list hidden">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>关键词</th>
+                                    <th>出现次数</th>
+                                    <th>文献数</th>
+                                </tr>
+                            </thead>
+                            <tbody id="word-frequency-table-body"></tbody>
+                        </table>
+                    </div>
+                    <div id="word-frequency-empty" class="word-frequency-empty hidden"></div>
+                </div>
+                <footer class="pubmed-modal-footer word-frequency-footer">
+                    <button class="btn btn-secondary" type="button" data-word-frequency-close>关闭</button>
+                </footer>
+            </section>
+        </div>
+
         <div id="feed-add-modal" class="pubmed-modal hidden" role="dialog" aria-modal="true" aria-labelledby="feed-add-modal-title">
             <div class="pubmed-modal-backdrop" data-feed-add-modal-close></div>
             <section class="pubmed-modal-panel feed-add-modal-panel">
@@ -3529,50 +3768,13 @@
                 <div class="pubmed-modal-body">
                     <div id="feed-add-mode" class="segmented-control pubmed-search-mode" role="group" aria-label="RSS 添加方式">
                         <button class="seg-btn active" type="button" data-feed-add-mode="url">RSS 地址</button>
-                        <button class="seg-btn" type="button" data-feed-add-mode="author">作者检索</button>
+                        <button class="seg-btn" type="button" data-feed-add-mode="pubmed">PubMed 检索</button>
                     </div>
                     <div id="feed-add-url-builder">
                         <label class="pubmed-field">
                             <span>RSS 地址</span>
                             <input id="feed-add-url" type="url" placeholder="https://example.com/feed.xml" autocomplete="off" />
                         </label>
-                    </div>
-                    <div id="feed-add-author-builder" class="pubmed-author-builder hidden">
-                        <label class="pubmed-field">
-                            <span>作者姓名或描述</span>
-                            <input id="feed-author-name" type="text" maxlength="200" placeholder="例如：梁瑞政，或北京安贞医院的梁瑞政医生" />
-                        </label>
-                        <label class="pubmed-field">
-                            <span>机构（可选）</span>
-                            <input id="feed-author-affiliation" type="text" maxlength="200" placeholder="例如：首都医科大学附属北京安贞医院" />
-                        </label>
-                        <div class="pubmed-author-date-grid">
-                            <label class="pubmed-field">
-                                <span>起始日期（可选）</span>
-                                <input id="feed-author-start-date" type="date" />
-                            </label>
-                            <label class="pubmed-field">
-                                <span>结束日期（可选）</span>
-                                <input id="feed-author-end-date" type="date" />
-                            </label>
-                        </div>
-                        <div class="feed-add-options-grid">
-                            <label class="pubmed-field">
-                                <span>每次抓取</span>
-                                <select id="feed-author-limit" class="settings-select">
-                                    <option value="5">5 篇</option>
-                                    <option value="10">10 篇</option>
-                                    <option value="15" selected>15 篇</option>
-                                    <option value="20">20 篇</option>
-                                    <option value="50">50 篇</option>
-                                    <option value="100">100 篇</option>
-                                </select>
-                            </label>
-                            <label class="pubmed-field">
-                                <span>订阅源名称（可选）</span>
-                                <input id="feed-author-title" type="text" maxlength="80" placeholder="默认使用作者姓名" />
-                            </label>
-                        </div>
                     </div>
                     <div id="feed-add-status" class="pubmed-preview-status" role="status"></div>
                 </div>
@@ -3610,7 +3812,7 @@
                     <div id="pubmed-author-builder" class="pubmed-author-builder hidden">
                         <label class="pubmed-field">
                             <span>作者姓名或描述</span>
-                            <input id="pubmed-author-name" type="text" maxlength="200" placeholder="例如：梁瑞政，或北京安贞医院的梁瑞政医生" />
+                            <input id="pubmed-author-name" type="text" maxlength="200" />
                         </label>
                         <label class="pubmed-field">
                             <span>机构（可选）</span>
@@ -3629,6 +3831,7 @@
                         <div class="pubmed-field-action">
                             <button id="btn-build-pubmed-author-query" class="btn btn-secondary" type="button">AI 构建作者检索式</button>
                         </div>
+                        <div id="pubmed-author-query-candidates" class="pubmed-author-query-candidates hidden" aria-live="polite"></div>
                     </div>
                     <label class="pubmed-field">
                         <span>PubMed 检索式</span>
@@ -3636,8 +3839,22 @@
                     </label>
                     <label class="pubmed-field">
                         <span>检索名称</span>
-                        <input id="pubmed-search-name" type="text" maxlength="80" placeholder="例如：脓毒症免疫重编程" />
+                        <input id="pubmed-search-name" type="text" maxlength="80" list="pubmed-search-name-history" autocomplete="off" placeholder="例如：脓毒症免疫重编程" />
+                        <datalist id="pubmed-search-name-history"></datalist>
                     </label>
+                    <div id="pubmed-rss-options" class="pubmed-retrieval-panel hidden">
+                        <label class="pubmed-field pubmed-retrieval-sort-field">
+                            <span>RSS 每次抓取</span>
+                            <select id="pubmed-rss-limit" class="settings-select">
+                                <option value="5">5 篇</option>
+                                <option value="10">10 篇</option>
+                                <option value="15" selected>15 篇</option>
+                                <option value="20">20 篇</option>
+                                <option value="50">50 篇</option>
+                                <option value="100">100 篇</option>
+                            </select>
+                        </label>
+                    </div>
                     <div class="pubmed-preview-actions">
                         <button id="btn-open-pubmed-query" class="btn btn-secondary" type="button">
                             <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -3649,8 +3866,8 @@
                         </button>
                         <button id="btn-preview-pubmed-search" class="btn btn-secondary" type="button">预览结果</button>
                         <label class="pubmed-preview-ai-option">
-                            <input id="pubmed-preview-ai-enabled" type="checkbox" checked />
-                            <span>AI 评估</span>
+                            <input id="pubmed-preview-ai-enabled" type="checkbox" />
+                            <span>复杂 AI 评估</span>
                         </label>
                         <span id="pubmed-preview-status" class="pubmed-preview-status"></span>
                     </div>

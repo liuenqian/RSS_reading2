@@ -1,7 +1,10 @@
-use crate::models::{DeepSeekSettings, Entry, LiteratureGrowthSource, ReadingStats, TokenUsage};
+use crate::models::{
+    DeepSeekSettings, Entry, LiteratureGrowthSource, ReadingStats, TokenUsage, WordFrequencyItem,
+    WordFrequencyResult,
+};
 use crate::services::{article_service, pubmed_search_service, translate_service};
 use rusqlite::{params, types::Value, Connection};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub fn list_entries(conn: &Connection, feed_id: Option<i64>) -> Result<Vec<Entry>, String> {
     let retention_days: i64 = conn
@@ -77,7 +80,11 @@ pub fn search_entries(
     conn: &Connection,
     query: &str,
     feed_id: Option<i64>,
+    pubmed_search_id: Option<i64>,
 ) -> Result<Vec<Entry>, String> {
+    if feed_id.is_some() && pubmed_search_id.is_some() {
+        return Err("检索范围不能同时指定订阅源和 PubMed 检索".to_string());
+    }
     let terms = normalize_search_terms(query);
     if terms.is_empty() {
         return Ok(Vec::new());
@@ -92,6 +99,10 @@ pub fn search_entries(
         "e.pmcid",
         "e.doi",
         "e.affiliation",
+        "e.publication_date",
+        "e.publication_date_raw",
+        "e.published_at",
+        "e.link",
         "t_title.translated_text",
         "t_summary.translated_text",
     ];
@@ -100,6 +111,15 @@ pub fn search_entries(
             SELECT 1 FROM entry_tags search_tag
             WHERE search_tag.entry_id = e.id
               AND lower(search_tag.tag) LIKE ? ESCAPE '\\'
+        ) OR EXISTS (
+            SELECT 1 FROM reading_notes search_note
+            WHERE search_note.entry_id = e.id
+              AND (lower(search_note.profile_name) LIKE ? ESCAPE '\\'
+                   OR lower(search_note.content) LIKE ? ESCAPE '\\')
+        ) OR EXISTS (
+            SELECT 1 FROM entry_pdf_fulltexts search_pdf
+            WHERE search_pdf.entry_id = e.id
+              AND lower(search_pdf.content) LIKE ? ESCAPE '\\'
         ))",
         searchable_fields
             .iter()
@@ -111,15 +131,35 @@ pub fn search_entries(
         .collect::<Vec<_>>()
         .join(" AND ");
     if feed_id.is_some() {
-        conditions = format!("e.feed_id = ? AND ({})", conditions);
+        conditions = format!(
+            "EXISTS (
+                SELECT 1 FROM entry_feed_memberships search_membership
+                WHERE search_membership.entry_id = e.id
+                  AND search_membership.feed_id = ?
+             ) AND ({})",
+            conditions
+        );
     }
 
-    let select = "SELECT e.id, e.feed_id, e.guid, e.title, e.link, e.summary, e.summary_source, e.author,
+    let scope_join = if pubmed_search_id.is_some() {
+        "JOIN pubmed_search_entries scope_pse
+           ON scope_pse.entry_id = e.id
+          AND scope_pse.search_id = ?
+          AND scope_pse.is_current_match = 1"
+    } else {
+        ""
+    };
+    let screening_field = if pubmed_search_id.is_some() {
+        "scope_pse.screening_status"
+    } else {
+        "COALESCE(ess.screening_status, 'unreviewed')"
+    };
+    let select = format!("SELECT e.id, e.feed_id, e.guid, e.title, e.link, e.summary, e.summary_source, e.author,
             e.published_at, e.publication_date, e.source, e.pmid, e.pmcid, e.doi, e.fetched_at, e.is_read, e.read_at,
             t_title.translated_text,
             t_summary.translated_text,
             e.affiliation,
-            COALESCE(ess.screening_status, 'unreviewed'),
+            {},
             EXISTS(SELECT 1 FROM reading_notes rn WHERE rn.entry_id = e.id),
             (SELECT GROUP_CONCAT(tag, char(31))
                FROM (SELECT tag
@@ -128,23 +168,31 @@ pub fn search_entries(
                       ORDER BY lower(tag), tag)),
             e.has_free_fulltext
      FROM entries e
+     {}
      LEFT JOIN translations t_title ON t_title.entry_id = e.id AND t_title.field = 'title' AND length(trim(t_title.translated_text)) > 0
      LEFT JOIN translations t_summary ON t_summary.entry_id = e.id AND t_summary.field = 'summary' AND length(trim(t_summary.translated_text)) > 0
-     LEFT JOIN entry_screening_status ess ON ess.entry_id = e.id";
+     LEFT JOIN entry_screening_status ess ON ess.entry_id = e.id", screening_field, scope_join);
+    let limit = if feed_id.is_some() || pubmed_search_id.is_some() {
+        ""
+    } else {
+        "LIMIT 200"
+    };
     let sql = format!(
-        "{} WHERE {} ORDER BY e.published_at DESC, e.fetched_at DESC LIMIT 200",
-        select, conditions
+        "{} WHERE {} ORDER BY e.published_at DESC, e.fetched_at DESC {}",
+        select, conditions, limit
     );
 
-    let mut params = Vec::with_capacity(terms.len() * (searchable_fields.len() + 1) + 1);
-    if let Some(fid) = feed_id {
+    let mut params = Vec::with_capacity(terms.len() * (searchable_fields.len() + 4) + 1);
+    if let Some(search_id) = pubmed_search_id {
+        params.push(Value::Integer(search_id));
+    } else if let Some(fid) = feed_id {
         params.push(Value::Integer(fid));
     }
     for term in terms {
         let pattern = format!("%{}%", escape_like_pattern(&term));
         params.extend(std::iter::repeat_n(
             Value::Text(pattern),
-            searchable_fields.len() + 1,
+            searchable_fields.len() + 4,
         ));
     }
 
@@ -155,6 +203,311 @@ pub fn search_entries(
         .filter_map(|row| row.ok())
         .collect();
     Ok(entries)
+}
+
+pub fn upsert_pdf_fulltext(
+    conn: &Connection,
+    entry_id: i64,
+    source_url: &str,
+    content: &str,
+) -> Result<(), String> {
+    let cleaned = content.replace('\0', "").trim().to_string();
+    if cleaned.is_empty() {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO entry_pdf_fulltexts (entry_id, content, source_url, indexed_at)
+         VALUES (?1, ?2, ?3, datetime('now'))
+         ON CONFLICT(entry_id) DO UPDATE SET
+            content = excluded.content,
+            source_url = excluded.source_url,
+            indexed_at = excluded.indexed_at",
+        params![entry_id, cleaned, source_url],
+    )
+    .map_err(|e| format!("保存 PDF 全文索引失败: {}", e))?;
+    Ok(())
+}
+
+pub fn analyze_word_frequency(
+    conn: &Connection,
+    entry_ids: &[i64],
+    limit: usize,
+) -> Result<WordFrequencyResult, String> {
+    let entry_ids = entry_ids.iter().copied().collect::<HashSet<_>>();
+    if entry_ids.is_empty() {
+        return Ok(WordFrequencyResult {
+            items: Vec::new(),
+            document_count: 0,
+            pdf_document_count: 0,
+        });
+    }
+
+    let mut counts = HashMap::<String, usize>::new();
+    let mut document_counts = HashMap::<String, usize>::new();
+    let mut document_count = 0usize;
+    let mut pdf_document_count = 0usize;
+
+    for chunk in entry_ids.iter().copied().collect::<Vec<_>>().chunks(400) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT e.id, e.title, COALESCE(e.summary, ''),
+                    COALESCE((SELECT GROUP_CONCAT(rn.content, ' ') FROM reading_notes rn WHERE rn.entry_id = e.id), ''),
+                    COALESCE((SELECT pf.content FROM entry_pdf_fulltexts pf WHERE pf.entry_id = e.id), '')
+             FROM entries e
+             WHERE e.id IN ({})",
+            placeholders
+        );
+        let params = chunk
+            .iter()
+            .copied()
+            .map(Value::Integer)
+            .collect::<Vec<_>>();
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|error| format!("准备词频统计失败: {}", error))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| format!("读取词频文本失败: {}", error))?;
+
+        for row in rows {
+            let (title, summary, notes, pdf) =
+                row.map_err(|error| format!("读取词频文本失败: {}", error))?;
+            document_count += 1;
+            if !pdf.trim().is_empty() {
+                pdf_document_count += 1;
+            }
+            let mut document_terms = HashSet::new();
+            for term in
+                english_word_frequency_terms(&format!("{}\n{}\n{}\n{}", title, summary, notes, pdf))
+            {
+                *counts.entry(term.clone()).or_default() += 1;
+                document_terms.insert(term);
+            }
+            for term in document_terms {
+                *document_counts.entry(term).or_default() += 1;
+            }
+        }
+    }
+
+    let mut items = counts
+        .into_iter()
+        .map(|(term, count)| WordFrequencyItem {
+            document_count: document_counts.get(&term).copied().unwrap_or(0),
+            term,
+            count,
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| right.document_count.cmp(&left.document_count))
+            .then_with(|| left.term.cmp(&right.term))
+    });
+    items.truncate(limit.clamp(1, 200));
+
+    Ok(WordFrequencyResult {
+        items,
+        document_count,
+        pdf_document_count,
+    })
+}
+
+fn english_word_frequency_terms(text: &str) -> Vec<String> {
+    text.split(|character: char| !(character.is_ascii_alphanumeric() || character == '-'))
+        .map(|term| term.trim_matches('-').to_ascii_lowercase())
+        .filter(|term| {
+            let length = term.len();
+            (2..=48).contains(&length)
+                && term
+                    .chars()
+                    .any(|character| character.is_ascii_alphabetic())
+                && !is_english_stop_word(term)
+        })
+        .collect()
+}
+
+fn is_english_stop_word(term: &str) -> bool {
+    matches!(
+        term,
+        "a" | "about"
+            | "above"
+            | "after"
+            | "again"
+            | "against"
+            | "all"
+            | "also"
+            | "am"
+            | "an"
+            | "and"
+            | "any"
+            | "are"
+            | "as"
+            | "at"
+            | "be"
+            | "because"
+            | "been"
+            | "before"
+            | "being"
+            | "below"
+            | "between"
+            | "both"
+            | "but"
+            | "by"
+            | "can"
+            | "could"
+            | "did"
+            | "do"
+            | "does"
+            | "doing"
+            | "down"
+            | "during"
+            | "each"
+            | "et"
+            | "few"
+            | "for"
+            | "from"
+            | "further"
+            | "had"
+            | "has"
+            | "have"
+            | "having"
+            | "he"
+            | "her"
+            | "here"
+            | "hers"
+            | "herself"
+            | "him"
+            | "himself"
+            | "his"
+            | "how"
+            | "however"
+            | "if"
+            | "in"
+            | "into"
+            | "is"
+            | "it"
+            | "its"
+            | "itself"
+            | "may"
+            | "might"
+            | "more"
+            | "most"
+            | "much"
+            | "must"
+            | "my"
+            | "myself"
+            | "no"
+            | "nor"
+            | "not"
+            | "of"
+            | "off"
+            | "on"
+            | "once"
+            | "only"
+            | "or"
+            | "other"
+            | "our"
+            | "ours"
+            | "ourselves"
+            | "out"
+            | "over"
+            | "own"
+            | "same"
+            | "she"
+            | "should"
+            | "show"
+            | "shown"
+            | "such"
+            | "than"
+            | "that"
+            | "the"
+            | "their"
+            | "theirs"
+            | "them"
+            | "themselves"
+            | "then"
+            | "there"
+            | "these"
+            | "they"
+            | "this"
+            | "those"
+            | "through"
+            | "to"
+            | "too"
+            | "under"
+            | "until"
+            | "up"
+            | "use"
+            | "used"
+            | "using"
+            | "very"
+            | "was"
+            | "we"
+            | "were"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "while"
+            | "who"
+            | "whom"
+            | "why"
+            | "will"
+            | "with"
+            | "within"
+            | "without"
+            | "would"
+            | "you"
+            | "your"
+            | "yours"
+            | "yourself"
+            | "yourselves"
+            | "abstract"
+            | "article"
+            | "background"
+            | "conclusion"
+            | "conclusions"
+            | "copyright"
+            | "doi"
+            | "figure"
+            | "introduction"
+            | "method"
+            | "methods"
+            | "objective"
+            | "objectives"
+            | "pmid"
+            | "result"
+            | "results"
+            | "study"
+            | "studies"
+            | "amp"
+            | "body"
+            | "class"
+            | "com"
+            | "div"
+            | "href"
+            | "html"
+            | "http"
+            | "https"
+            | "img"
+            | "nbsp"
+            | "org"
+            | "span"
+            | "src"
+            | "strong"
+            | "style"
+            | "www"
+    )
 }
 
 fn normalize_search_terms(query: &str) -> Vec<String> {
@@ -626,8 +979,9 @@ pub async fn generate_flavor_pool(
 #[cfg(test)]
 mod tests {
     use super::{
-        escape_like_pattern, literature_growth_sources, normalize_entry_tag,
-        normalize_search_terms, parse_entry_tags, search_entries,
+        analyze_word_frequency, english_word_frequency_terms, escape_like_pattern,
+        literature_growth_sources, normalize_entry_tag, normalize_search_terms, parse_entry_tags,
+        search_entries,
     };
     use rusqlite::Connection;
 
@@ -656,6 +1010,43 @@ mod tests {
     }
 
     #[test]
+    fn word_frequency_defaults_to_english_biomedical_terms() {
+        assert_eq!(
+            english_word_frequency_terms("The SLC6A6 study used SARS-CoV-2 and p53."),
+            vec!["slc6a6", "sars-cov-2", "p53"]
+        );
+    }
+
+    #[test]
+    fn word_frequency_uses_only_requested_entries_and_all_indexed_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE entries (id INTEGER PRIMARY KEY, title TEXT NOT NULL, summary TEXT);
+             CREATE TABLE reading_notes (entry_id INTEGER, content TEXT NOT NULL);
+             CREATE TABLE entry_pdf_fulltexts (entry_id INTEGER PRIMARY KEY, content TEXT NOT NULL);
+             INSERT INTO entries VALUES
+                (1, 'Sepsis immune response', 'Sepsis sepsis study'),
+                (2, 'Excluded fibrosis paper', 'Excluded abstract');
+             INSERT INTO reading_notes VALUES (1, 'Mitochondrial remodeling 线粒体重塑');
+             INSERT INTO entry_pdf_fulltexts VALUES (1, 'Mitochondrial fibrosis evidence');",
+        )
+        .unwrap();
+
+        let result = analyze_word_frequency(&conn, &[1], 100).unwrap();
+        assert_eq!(result.document_count, 1);
+        assert_eq!(result.pdf_document_count, 1);
+        assert_eq!(result.items[0].term, "sepsis");
+        assert_eq!(result.items[0].count, 3);
+        assert_eq!(result.items[0].document_count, 1);
+        assert!(result
+            .items
+            .iter()
+            .any(|item| item.term == "mitochondrial" && item.count == 2));
+        assert!(!result.items.iter().any(|item| item.term == "study"));
+        assert!(!result.items.iter().any(|item| item.term == "excluded"));
+    }
+
+    #[test]
     fn search_entries_matches_english_source_and_chinese_translation() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -670,6 +1061,7 @@ mod tests {
                 author TEXT,
                 published_at TEXT,
                 publication_date TEXT,
+                publication_date_raw TEXT,
                 source TEXT,
                 pmid TEXT,
                 pmcid TEXT,
@@ -681,9 +1073,26 @@ mod tests {
                 has_free_fulltext INTEGER
             );
             CREATE TABLE translations (entry_id INTEGER, field TEXT, translated_text TEXT);
-            CREATE TABLE reading_notes (entry_id INTEGER);
+            CREATE TABLE reading_notes (
+                entry_id INTEGER,
+                profile_name TEXT NOT NULL,
+                content TEXT NOT NULL
+            );
+            CREATE TABLE entry_pdf_fulltexts (
+                entry_id INTEGER PRIMARY KEY,
+                content TEXT NOT NULL,
+                source_url TEXT,
+                indexed_at TEXT
+            );
             CREATE TABLE entry_tags (entry_id INTEGER, tag TEXT);
             CREATE TABLE entry_screening_status (entry_id INTEGER, screening_status TEXT);
+            CREATE TABLE entry_feed_memberships (entry_id INTEGER, feed_id INTEGER);
+            CREATE TABLE pubmed_search_entries (
+                search_id INTEGER,
+                entry_id INTEGER,
+                screening_status TEXT,
+                is_current_match INTEGER
+            );
             INSERT INTO entries (
                 id, feed_id, guid, title, link, summary, author, published_at,
                 source, fetched_at, is_read
@@ -695,27 +1104,58 @@ mod tests {
                 (3, 2, 'three', 'Sepsis cohort validation', 'https://example.com/3',
                  'English abstract', 'C. Author', '2026-01-03', 'JAMA', '2026-01-03', 0);
             INSERT INTO translations (entry_id, field, translated_text)
-                VALUES (2, 'title', '肿瘤免疫微环境');",
+                VALUES (2, 'title', '肿瘤免疫微环境');
+            INSERT INTO reading_notes (entry_id, profile_name, content)
+                VALUES (1, '缺血再灌注模板', '重点关注心肌损伤与线粒体稳态');
+            INSERT INTO entry_pdf_fulltexts (entry_id, content, source_url)
+                VALUES (2, 'Full PDF evidence about vertical mitochondrial networks', 'https://example.com/2.pdf');
+            INSERT INTO entry_feed_memberships (entry_id, feed_id)
+                VALUES (1, 1), (2, 1), (3, 2);
+            INSERT INTO pubmed_search_entries (search_id, entry_id, screening_status, is_current_match)
+                VALUES (6, 1, 'keep', 1), (7, 2, 'unreviewed', 1), (6, 3, 'exclude', 0);",
         )
         .unwrap();
 
-        let english = search_entries(&conn, "SEPSIS", None).unwrap();
+        let english = search_entries(&conn, "SEPSIS", None, None).unwrap();
         assert_eq!(
             english.iter().map(|entry| entry.id).collect::<Vec<_>>(),
             vec![3, 1]
         );
 
-        let chinese = search_entries(&conn, "肿瘤免疫", None).unwrap();
+        let chinese = search_entries(&conn, "肿瘤免疫", None, None).unwrap();
         assert_eq!(
             chinese.iter().map(|entry| entry.id).collect::<Vec<_>>(),
             vec![2]
         );
 
-        let feed_scoped = search_entries(&conn, "SEPSIS", Some(1)).unwrap();
+        let note = search_entries(&conn, "线粒体稳态", None, None).unwrap();
+        assert_eq!(
+            note.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        let pdf = search_entries(&conn, "vertical mitochondrial", None, None).unwrap();
+        assert_eq!(
+            pdf.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        let feed_scoped = search_entries(&conn, "SEPSIS", Some(1), None).unwrap();
         assert_eq!(
             feed_scoped.iter().map(|entry| entry.id).collect::<Vec<_>>(),
             vec![1]
         );
+
+        let pubmed_scoped = search_entries(&conn, "SEPSIS", None, Some(6)).unwrap();
+        assert_eq!(
+            pubmed_scoped
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(pubmed_scoped[0].screening_status, "keep");
+        assert!(search_entries(&conn, "SEPSIS", Some(1), Some(6)).is_err());
     }
 
     #[test]

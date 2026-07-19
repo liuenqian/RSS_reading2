@@ -57,17 +57,15 @@ pub async fn resolve_pdf_url(
     }
 
     match resolve_europe_pmc_pmcid(&client, doi, pmid).await {
-        Ok(Some(value)) => {
-            match resolve_ncbi_pmc_pdf(&client, &value).await {
-                Ok(Some(url)) => {
-                    if let Some(url) = verify_pdf_candidate(&client, url).await {
-                        return Ok(Some(url));
-                    }
+        Ok(Some(value)) => match resolve_ncbi_pmc_pdf(&client, &value).await {
+            Ok(Some(url)) => {
+                if let Some(url) = verify_pdf_candidate(&client, url).await {
+                    return Ok(Some(url));
                 }
-                Ok(None) => {}
-                Err(error) => warn!(%error, "NCBI PMC PDF 解析失败"),
             }
-        }
+            Ok(None) => {}
+            Err(error) => warn!(%error, "NCBI PMC PDF 解析失败"),
+        },
         Ok(None) => {}
         Err(error) => warn!(%error, "Europe PMC 全文解析失败"),
     }
@@ -131,8 +129,8 @@ async fn resolve_ncbi_pmc_pdf(client: &Client, pmcid: &str) -> Result<Option<Str
 }
 
 fn parse_ncbi_pmc_pdf(xml: &str) -> Result<Option<String>, String> {
-    let document = roxmltree::Document::parse(xml)
-        .map_err(|e| format!("解析 PMC OA 响应失败: {}", e))?;
+    let document =
+        roxmltree::Document::parse(xml).map_err(|e| format!("解析 PMC OA 响应失败: {}", e))?;
     let href = document
         .descendants()
         .find(|node| node.has_tag_name("link") && node.attribute("format") == Some("pdf"))

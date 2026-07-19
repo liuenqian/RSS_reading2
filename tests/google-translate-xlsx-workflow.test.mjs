@@ -27,6 +27,23 @@ test('merges Google translation into the existing PubMed export dialog', () => {
   assert.match(styles, /\.pubmed-google-export-section/);
 });
 
+test('orders Google translation actions by workflow', () => {
+  const dialogStart = main.indexOf('function choosePubmedExportFields');
+  const footerStart = main.indexOf('<footer class="pubmed-modal-footer">', dialogStart);
+  const footerEnd = main.indexOf('</footer>', footerStart);
+  const footer = main.slice(footerStart, footerEnd);
+
+  const exportIndex = footer.indexOf('data-confirm');
+  const openGoogleIndex = footer.indexOf('data-open-google');
+  const importIndex = footer.indexOf('data-import-google');
+  const cancelIndex = footer.indexOf('data-close');
+
+  assert.ok([exportIndex, openGoogleIndex, importIndex, cancelIndex].every(index => index >= 0));
+  assert.ok(exportIndex < openGoogleIndex);
+  assert.ok(openGoogleIndex < importIndex);
+  assert.ok(importIndex < cancelIndex);
+});
+
 test('wires export, import preview, apply, and the Google documents shortcut', () => {
   assert.match(main, /export_google_translate_xlsx/);
   assert.match(main, /preview_google_translate_import/);

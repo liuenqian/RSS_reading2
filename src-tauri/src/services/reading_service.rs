@@ -281,7 +281,11 @@ fn create_paper_chat_note(
     entry_id: i64,
     excerpt: &str,
 ) -> Result<ReadingNote, String> {
-    let content = format!("## 对话摘录\n\n### {}\n\n{}", timestamp_label(conn), excerpt);
+    let content = format!(
+        "## 对话摘录\n\n### {}\n\n{}",
+        timestamp_label(conn),
+        excerpt
+    );
     let profile_id = format!("{}-{}", PAPER_CHAT_NOTE_PROFILE_ID, unique_note_suffix());
 
     conn.execute(
@@ -307,7 +311,12 @@ fn build_appended_note_content(conn: &Connection, existing_content: &str, excerp
     if base.is_empty() {
         return format!("### {}\n\n{}", timestamp_label(conn), excerpt);
     }
-    format!("{}\n\n---\n\n### {}\n\n{}", base, timestamp_label(conn), excerpt)
+    format!(
+        "{}\n\n---\n\n### {}\n\n{}",
+        base,
+        timestamp_label(conn),
+        excerpt
+    )
 }
 
 fn unique_note_suffix() -> u128 {

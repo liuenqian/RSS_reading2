@@ -12,7 +12,12 @@
 //      `X-CSRFToken`, and the session cookies → receive JSON
 //      `{"rss_feed_url": "https://pubmed.ncbi.nlm.nih.gov/rss/search/<token>/?…"}`.
 
-use crate::models::{DeepSeekSettings, TokenUsage};
+use crate::models::{
+    DeepSeekSettings, PubmedAuthorQueryCandidate, PubmedAuthorQueryResult, TokenUsage,
+};
+use crate::services::pubmed_author_query_service::{
+    validate_author_query, AuthorQueryEvidence, AuthorQueryPhase,
+};
 use crate::services::translate_service;
 use reqwest::Client;
 use serde::Deserialize;
@@ -166,19 +171,70 @@ const NL_QUERY_MAX_TOKENS: u32 = 1500;
 const AUTHOR_QUERY_PROMPT: &str = "\
 You are a PubMed author-search expert. Convert the supplied author identity and optional \
 affiliation, which may be written in Chinese or English natural language, into a valid \
-PubMed advanced-search query.
+set of 1 to 3 complete PubMed advanced-search query candidates.
 
 Rules:
 - Treat the author input as a person identity, never as a biomedical topic.
-- Translate natural-language descriptions and Chinese affiliation names into useful English PubMed terms.
-- For a Chinese personal name, use reasonable romanized author-name variants and group alternatives with OR when name order or initials may vary.
-- Every author-name alternative must use [Author].
-- If an affiliation is supplied, add a focused affiliation clause using [Affiliation] or [Affiliation:~50]. Translate the institution name, but do not invent a different institution.
+- If the author input contains both an institution and a person name, separate them even when the explicit affiliation field says it was not provided.
+- An explicitly supplied affiliation takes priority over an institution inferred from the author description.
+- Translate Chinese institution names into likely English PubMed affiliation variants. Do not use Chinese text in [Affiliation].
+- Return all reasonable romanized name forms in name_variants and all usable English institution forms in affiliation_variants.
+- Each item in queries must be a complete query that can be submitted to PubMed unchanged.
+- Every OR path in every query must include one target name from name_variants tagged [Full Author Name] or [Author].
+- A surname-and-initial [Author] form is ambiguous. In the initial-search candidates it must be joined with a known English affiliation in the same AND path. Never emit a standalone initial-only OR path.
+- Prefer candidates with different precision/recall trade-offs: exact full names first, then full-name variants, then initials constrained by affiliation when useful.
+- Use standard PubMed syntax, uppercase AND/OR/NOT, explicit field tags, and parentheses around grouped alternatives.
 - Do not add topic, journal, publication-type, or date filters that the user did not supply.
 - Do not add a date clause; the application appends the exact selected dates separately.
-- Use uppercase AND/OR/NOT and parentheses for grouped alternatives.
+- Do not exclude any supplied or inferred target name or institution with NOT.
 
-Output only one valid PubMed query string. No markdown, explanation, or surrounding code fence.";
+Return strict JSON only, without markdown or a code fence:
+{
+  \"author\": \"the detected person name, preferably in the original language\",
+  \"affiliation\": \"the detected institution in the original language, or null\",
+  \"name_variants\": [\"each exact name value used in a query, without a field tag\"],
+  \"affiliation_variants\": [\"each English institution value used in a query, without a field tag\"],
+  \"queries\": [
+    {
+      \"label\": \"short Chinese label such as 精确姓名 or 姓名变体+单位\",
+      \"query\": \"one complete PubMed author query\",
+      \"rationale\": \"one short Chinese explanation of its precision/recall trade-off\"
+    }
+  ]
+}";
+
+const AUTHOR_EXPANSION_QUERY_PROMPT: &str = "\
+You are a PubMed author-disambiguation expert. Generate 1 to 3 complete PubMed query \
+candidates using only the confirmed identity evidence supplied by the application.
+
+Rules:
+- Every OR path must contain one confirmed target name tagged [Full Author Name] or [Author].
+- A target surname-and-initial [Author] path must also contain a confirmed affiliation or confirmed stable coauthor in the same AND path.
+- Use stable coauthors only when the request says full expansion is allowed.
+- Do not invent, translate, broaden, or add names, affiliations, coauthors, topics, dates, journals, or exclusions.
+- Each query must be complete standard PubMed syntax and must be returned unchanged by the application.
+- Use uppercase AND/OR/NOT and explicit field tags.
+
+Return the same strict JSON shape as the initial author-query request: author, affiliation, \
+name_variants, affiliation_variants, and 1 to 3 queries with label, query, and rationale.";
+
+#[derive(Deserialize)]
+struct AuthorQueryAiResponse {
+    author: String,
+    affiliation: Option<String>,
+    #[serde(default)]
+    name_variants: Vec<String>,
+    #[serde(default)]
+    affiliation_variants: Vec<String>,
+    queries: Vec<AuthorQueryAiCandidate>,
+}
+
+#[derive(Deserialize)]
+struct AuthorQueryAiCandidate {
+    label: String,
+    query: String,
+    rationale: String,
+}
 
 #[cfg(test)]
 fn build_author_query(
@@ -245,7 +301,7 @@ pub async fn natural_language_to_author_query(
     affiliation: Option<&str>,
     start_date: Option<&str>,
     end_date: Option<&str>,
-) -> Result<(String, TokenUsage), String> {
+) -> Result<(PubmedAuthorQueryResult, TokenUsage), String> {
     let request = build_author_ai_request(author_name, affiliation)?;
     let date_clause = build_author_date_clause(start_date, end_date)?;
     let output = translate_service::complete_with_prompts(
@@ -257,14 +313,181 @@ pub async fn natural_language_to_author_query(
     )
     .await?;
 
-    let author_query = validate_query_syntax(&output.content)
-        .map_err(|error| format!("AI 生成的作者检索式不完整：{}。请重新生成", error))?;
-    let query = match date_clause {
-        Some(date_clause) => format!("({}) AND {}", author_query, date_clause),
-        None => author_query,
+    let mut result = parse_author_ai_response(&output.content, author_name, affiliation)?;
+    if let Some(date_clause) = date_clause {
+        for candidate in &mut result.candidates {
+            candidate.query =
+                validate_query_syntax(&format!("({}) AND {}", candidate.query, date_clause))?;
+        }
+    }
+    result.query = result
+        .candidates
+        .first()
+        .map(|candidate| candidate.query.clone())
+        .ok_or_else(|| "AI 没有返回作者检索候选".to_string())?;
+    Ok((result, output.usage))
+}
+
+pub async fn natural_language_to_author_expansion_queries(
+    settings: &DeepSeekSettings,
+    author_name: &str,
+    confirmed_names: &[String],
+    confirmed_affiliations: &[String],
+    stable_coauthors: &[String],
+    seed_count: usize,
+) -> Result<(PubmedAuthorQueryResult, TokenUsage), String> {
+    let author_name = normalize_author_query_value(author_name, "作者姓名")?;
+    if confirmed_names.is_empty() {
+        return Err("作者指纹中没有已确认的姓名变体".to_string());
+    }
+    let allow_coauthors = seed_count >= 3;
+    let coauthors = if allow_coauthors {
+        stable_coauthors
+    } else {
+        &[]
     };
-    let query = validate_query_syntax(&query)?;
-    Ok((query, output.usage))
+    let request = format!(
+        "目标作者：{}\n确认种子数：{}\n扩展级别：{}\nconfirmed 姓名：{}\nconfirmed 目标作者单位：{}\nconfirmed 稳定共同作者：{}",
+        author_name,
+        seed_count,
+        if allow_coauthors { "完整扩展" } else { "有限扩展，禁止共同作者分支" },
+        confirmed_names.join(" | "),
+        confirmed_affiliations.join(" | "),
+        if coauthors.is_empty() { "无".to_string() } else { coauthors.join(" | ") },
+    );
+    let output = translate_service::complete_with_prompts(
+        settings,
+        AUTHOR_EXPANSION_QUERY_PROMPT,
+        &request,
+        0.1,
+        i64::from(NL_QUERY_MAX_TOKENS),
+    )
+    .await?;
+    let result = parse_author_expansion_ai_response(
+        &output.content,
+        &author_name,
+        confirmed_names,
+        confirmed_affiliations,
+        coauthors,
+    )?;
+    Ok((result, output.usage))
+}
+
+fn parse_author_ai_response(
+    raw: &str,
+    fallback_author: &str,
+    explicit_affiliation: Option<&str>,
+) -> Result<PubmedAuthorQueryResult, String> {
+    parse_author_ai_response_for_phase(
+        raw,
+        fallback_author,
+        explicit_affiliation,
+        AuthorQueryPhase::Initial,
+        None,
+    )
+}
+
+fn parse_author_expansion_ai_response(
+    raw: &str,
+    author_name: &str,
+    confirmed_names: &[String],
+    confirmed_affiliations: &[String],
+    stable_coauthors: &[String],
+) -> Result<PubmedAuthorQueryResult, String> {
+    let evidence = AuthorQueryEvidence {
+        target_names: normalize_evidence_terms(confirmed_names, "已确认姓名")?,
+        affiliations: normalize_evidence_terms(confirmed_affiliations, "已确认单位")?,
+        coauthors: normalize_evidence_terms(stable_coauthors, "稳定共同作者")?,
+    };
+    parse_author_ai_response_for_phase(
+        raw,
+        author_name,
+        None,
+        AuthorQueryPhase::Expansion,
+        Some(evidence),
+    )
+}
+
+fn parse_author_ai_response_for_phase(
+    raw: &str,
+    fallback_author: &str,
+    explicit_affiliation: Option<&str>,
+    phase: AuthorQueryPhase,
+    confirmed_evidence: Option<AuthorQueryEvidence>,
+) -> Result<PubmedAuthorQueryResult, String> {
+    let cleaned = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let parsed: AuthorQueryAiResponse = serde_json::from_str(cleaned)
+        .map_err(|error| format!("AI 作者识别结果不是有效 JSON：{}。请重新生成", error))?;
+
+    let author_name = normalize_optional_query_value(Some(parsed.author.as_str()), "识别作者")?
+        .unwrap_or_else(|| fallback_author.trim().to_string());
+    let explicit_affiliation = normalize_optional_query_value(explicit_affiliation, "机构描述")?;
+    let detected_affiliation =
+        normalize_optional_query_value(parsed.affiliation.as_deref(), "识别机构")?;
+    let affiliation = explicit_affiliation.or(detected_affiliation);
+
+    if parsed.queries.is_empty() || parsed.queries.len() > 3 {
+        return Err("AI 必须返回 1–3 个完整的作者检索候选，请重新生成".to_string());
+    }
+    if confirmed_evidence.is_none()
+        && (parsed.name_variants.is_empty() || parsed.name_variants.len() > 16)
+    {
+        return Err("AI 返回的作者姓名变体数量无效，请重新生成".to_string());
+    }
+    if parsed.affiliation_variants.len() > 16 {
+        return Err("AI 返回的机构变体数量过多，请重新生成".to_string());
+    }
+
+    let evidence = match confirmed_evidence {
+        Some(evidence) => evidence,
+        None => AuthorQueryEvidence {
+            target_names: normalize_evidence_terms(&parsed.name_variants, "作者姓名变体")?,
+            affiliations: normalize_evidence_terms(&parsed.affiliation_variants, "英文机构变体")?,
+            coauthors: Default::default(),
+        },
+    };
+    let mut seen_queries = std::collections::HashSet::new();
+    let mut candidates = Vec::with_capacity(parsed.queries.len());
+    for candidate in parsed.queries {
+        let query = validate_query_syntax(&candidate.query)
+            .map_err(|error| format!("AI 生成的作者检索式不完整：{}。请重新生成", error))?;
+        validate_author_query(&query, phase, &evidence)
+            .map_err(|error| format!("AI 生成的作者检索式不安全：{}。请重新生成", error))?;
+        if !seen_queries.insert(query.clone()) {
+            continue;
+        }
+        candidates.push(PubmedAuthorQueryCandidate {
+            label: normalize_author_query_value(&candidate.label, "候选名称")?,
+            query,
+            rationale: normalize_author_query_value(&candidate.rationale, "候选说明")?,
+        });
+    }
+    if candidates.is_empty() {
+        return Err("AI 返回的作者检索候选全部重复或无效，请重新生成".to_string());
+    }
+    let query = candidates[0].query.clone();
+
+    Ok(PubmedAuthorQueryResult {
+        query,
+        candidates,
+        author_name,
+        affiliation,
+    })
+}
+
+fn normalize_evidence_terms(
+    values: &[String],
+    label: &str,
+) -> Result<std::collections::HashSet<String>, String> {
+    values
+        .iter()
+        .map(|value| normalize_author_query_value(value, label).map(|value| value.to_lowercase()))
+        .collect()
 }
 
 fn normalize_author_query_value(value: &str, label: &str) -> Result<String, String> {
@@ -323,7 +546,6 @@ fn normalize_optional_date(value: Option<&str>, label: &str) -> Result<Option<St
     Ok(Some(parts.join("/")))
 }
 
-#[cfg(test)]
 fn escape_pubmed_phrase(value: &str) -> String {
     value.replace('"', "")
 }
@@ -491,7 +713,7 @@ mod urlencoding {
 mod tests {
     use super::{
         build_author_ai_request, build_author_date_clause, build_author_query,
-        validate_query_syntax,
+        parse_author_ai_response, parse_author_expansion_ai_response, validate_query_syntax,
     };
 
     #[test]
@@ -546,6 +768,130 @@ mod tests {
             build_author_date_clause(Some("2020-01-02"), Some("2025-12-31")).unwrap(),
             Some("2020/01/02:2025/12/31[Date - Publication]".to_string())
         );
+    }
+
+    #[test]
+    fn preserves_complete_ai_candidates_after_safety_validation() {
+        let raw = r#"{
+            "author": "吕玲春",
+            "affiliation": "丽水市中心医院",
+            "name_variants": ["Lyu Lingchun", "Lv Lingchun", "Lyu L", "Lv L"],
+            "affiliation_variants": ["Lishui Central Hospital", "Lishui City Central Hospital"],
+            "queries": [
+                {
+                    "label": "精确姓名",
+                    "query": "(\"Lyu Lingchun\"[Full Author Name] OR \"Lv Lingchun\"[Full Author Name])",
+                    "rationale": "优先使用完整姓名，精度较高"
+                },
+                {
+                    "label": "姓名缩写加单位",
+                    "query": "((Lyu L[Author] OR Lv L[Author]) AND (\"Lishui Central Hospital\"[Affiliation] OR \"Lishui City Central Hospital\"[Affiliation]))",
+                    "rationale": "补充姓名缩写，但用英文单位限制同名结果"
+                }
+            ]
+        }"#;
+
+        let result = parse_author_ai_response(raw, "丽水市中心医院吕玲春", None).unwrap();
+
+        assert_eq!(result.author_name, "吕玲春");
+        assert_eq!(result.affiliation.as_deref(), Some("丽水市中心医院"));
+        assert_eq!(result.candidates.len(), 2);
+        assert_eq!(
+            result.query,
+            "(\"Lyu Lingchun\"[Full Author Name] OR \"Lv Lingchun\"[Full Author Name])"
+        );
+        assert_eq!(result.query, result.candidates[0].query);
+        assert!(result.candidates[1]
+            .query
+            .contains("Lishui Central Hospital"));
+    }
+
+    #[test]
+    fn rejects_ambiguous_initials_without_an_english_affiliation() {
+        let raw = r#"{
+            "author": "吕玲春",
+            "affiliation": null,
+            "name_variants": ["Lyu L"],
+            "affiliation_variants": [],
+            "queries": [{
+                "label": "姓名缩写",
+                "query": "Lyu L[Author]",
+                "rationale": "扩大召回"
+            }]
+        }"#;
+
+        assert!(parse_author_ai_response(raw, "吕玲春", None)
+            .unwrap_err()
+            .contains("首字母"));
+    }
+
+    #[test]
+    fn deduplicates_identical_complete_candidates() {
+        let raw = r#"{
+            "author": "纪建松",
+            "affiliation": null,
+            "name_variants": ["Ji Jiansong"],
+            "affiliation_variants": [],
+            "queries": [
+                {
+                    "label": "完整姓名",
+                    "query": "\"Ji Jiansong\"[Full Author Name]",
+                    "rationale": "完整姓名"
+                },
+                {
+                    "label": "重复候选",
+                    "query": "\"Ji Jiansong\"[Full Author Name]",
+                    "rationale": "相同完整姓名"
+                }
+            ]
+        }"#;
+
+        let result = parse_author_ai_response(raw, "纪建松", None).unwrap();
+
+        assert_eq!(result.author_name, "纪建松");
+        assert_eq!(result.affiliation, None);
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.query, "\"Ji Jiansong\"[Full Author Name]");
+    }
+
+    #[test]
+    fn expansion_only_accepts_confirmed_stable_coauthors() {
+        let response = |coauthor: &str| {
+            format!(
+                r#"{{
+                    "author": "纪建松",
+                    "affiliation": "丽水市中心医院",
+                    "name_variants": ["Ji Jiansong", "Ji J"],
+                    "affiliation_variants": ["Lishui Central Hospital"],
+                    "queries": [{{
+                        "label": "共同作者扩展",
+                        "query": "Ji J[Author] AND {coauthor}[Author]",
+                        "rationale": "用稳定共同作者限制姓名缩写"
+                    }}]
+                }}"#
+            )
+        };
+        let names = vec!["Ji Jiansong".to_string(), "Ji J".to_string()];
+        let affiliations = vec!["Lishui Central Hospital".to_string()];
+        let coauthors = vec!["Zhang W".to_string()];
+
+        let accepted = parse_author_expansion_ai_response(
+            &response("Zhang W"),
+            "纪建松",
+            &names,
+            &affiliations,
+            &coauthors,
+        )
+        .unwrap();
+        assert_eq!(accepted.candidates.len(), 1);
+        assert!(parse_author_expansion_ai_response(
+            &response("Smith J"),
+            "纪建松",
+            &names,
+            &affiliations,
+            &coauthors,
+        )
+        .is_err());
     }
 
     #[test]

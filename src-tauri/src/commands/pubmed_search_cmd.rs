@@ -6,7 +6,6 @@ use crate::models::{
 };
 use crate::services::{
     cost_service, google_translate_xlsx_service, pubmed_search_service, settings_service,
-    translation_pipeline,
 };
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, State};
@@ -36,6 +35,35 @@ pub async fn assess_pubmed_search_preview(
 
     let (assessment, usage) =
         pubmed_search_service::assess_preview(&settings, &question, &query, &entries).await?;
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    let _ = cost_service::record_usage(&conn, &settings.provider, &settings.model, &usage);
+    Ok(assessment)
+}
+
+#[tauri::command]
+pub async fn assess_pubmed_author_preview(
+    state: State<'_, DbState>,
+    author_name: String,
+    affiliation: Option<String>,
+    query: String,
+    entries: Vec<PubmedArticleRecord>,
+) -> Result<PubmedPreviewAssessment, String> {
+    let settings = {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        settings_service::get_settings(&conn)
+    };
+    if settings.api_key.trim().is_empty() {
+        return Err("请先在设置里配置当前 AI 服务的 API Key，再进行作者归属评估".to_string());
+    }
+
+    let (assessment, usage) = pubmed_search_service::assess_author_preview(
+        &settings,
+        &author_name,
+        affiliation.as_deref(),
+        &query,
+        &entries,
+    )
+    .await?;
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
     let _ = cost_service::record_usage(&conn, &settings.provider, &settings.model, &usage);
     Ok(assessment)
@@ -119,9 +147,7 @@ pub async fn run_pubmed_search(
     state: State<'_, DbState>,
     search_id: i64,
 ) -> Result<PubmedSearchRunResult, String> {
-    let result = pubmed_search_service::run_search(&app, state.inner(), search_id, None).await?;
-    translation_pipeline::spawn(app);
-    Ok(result)
+    pubmed_search_service::run_search(&app, state.inner(), search_id, None).await
 }
 
 #[tauri::command]
@@ -134,10 +160,7 @@ pub async fn resume_pubmed_search_run(
         let conn = state.conn.lock().map_err(|e| e.to_string())?;
         pubmed_search_service::search_id_for_run(&conn, run_id)?
     };
-    let result =
-        pubmed_search_service::run_search(&app, state.inner(), search_id, Some(run_id)).await?;
-    translation_pipeline::spawn(app);
-    Ok(result)
+    pubmed_search_service::run_search(&app, state.inner(), search_id, Some(run_id)).await
 }
 
 #[tauri::command]
@@ -156,38 +179,43 @@ pub fn list_pubmed_search_entries(
 
 #[tauri::command]
 pub fn set_pubmed_screening_status(
-    app: AppHandle,
     state: State<DbState>,
     search_id: i64,
     entry_id: i64,
     status: String,
 ) -> Result<Vec<PubmedSearchEntry>, String> {
-    let entries = {
-        let conn = state.conn.lock().map_err(|e| e.to_string())?;
-        pubmed_search_service::set_screening_status(&conn, search_id, &[entry_id], &status)?
-    };
-    if status == "keep" {
-        translation_pipeline::spawn(app);
-    }
-    Ok(entries)
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    pubmed_search_service::set_screening_status(&conn, search_id, &[entry_id], &status)
 }
 
 #[tauri::command]
 pub fn bulk_set_pubmed_screening_status(
-    app: AppHandle,
     state: State<DbState>,
     search_id: i64,
     entry_ids: Vec<i64>,
     status: String,
 ) -> Result<Vec<PubmedSearchEntry>, String> {
-    let entries = {
-        let conn = state.conn.lock().map_err(|e| e.to_string())?;
-        pubmed_search_service::set_screening_status(&conn, search_id, &entry_ids, &status)?
-    };
-    if status == "keep" {
-        translation_pipeline::spawn(app);
-    }
-    Ok(entries)
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    pubmed_search_service::set_screening_status(&conn, search_id, &entry_ids, &status)
+}
+
+#[tauri::command]
+pub fn get_pubmed_author_identity_state(
+    state: State<DbState>,
+    search_id: i64,
+) -> Result<Option<String>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    pubmed_search_service::get_author_identity_state(&conn, search_id)
+}
+
+#[tauri::command]
+pub fn save_pubmed_author_identity_state(
+    state: State<DbState>,
+    search_id: i64,
+    state_json: String,
+) -> Result<(), String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    pubmed_search_service::save_author_identity_state(&conn, search_id, &state_json)
 }
 
 #[tauri::command]
@@ -278,20 +306,10 @@ pub fn apply_google_translate_import(
 
 #[tauri::command]
 pub fn apply_pubmed_screening_suggestions(
-    app: AppHandle,
     state: State<DbState>,
     search_id: i64,
     suggestions: Vec<PubmedScreeningSuggestion>,
 ) -> Result<Vec<PubmedSearchEntry>, String> {
-    let has_keep = suggestions
-        .iter()
-        .any(|suggestion| suggestion.status == "keep");
-    let entries = {
-        let conn = state.conn.lock().map_err(|e| e.to_string())?;
-        pubmed_search_service::apply_screening_suggestions(&conn, search_id, &suggestions)?
-    };
-    if has_keep {
-        translation_pipeline::spawn(app);
-    }
-    Ok(entries)
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    pubmed_search_service::apply_screening_suggestions(&conn, search_id, &suggestions)
 }

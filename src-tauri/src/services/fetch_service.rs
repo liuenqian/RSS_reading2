@@ -4,6 +4,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Mutex;
 use tracing::{info, warn};
 
+#[derive(Debug, Default)]
+struct ProcessFeedOutcome {
+    new_entries: usize,
+    errors: Vec<String>,
+}
+
 pub async fn fetch_all_feeds(conn_mutex: &Mutex<Connection>) -> Result<FetchResult, String> {
     let (feeds, settings) = {
         let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
@@ -36,18 +42,28 @@ pub async fn fetch_all_feeds(conn_mutex: &Mutex<Connection>) -> Result<FetchResu
     for feed in &feeds {
         info!(feed_id = feed.id, url = %feed.url, "开始刷新订阅源");
         match process_feed(conn_mutex, &client, feed).await {
-            Ok(entries) => {
-                result.new_entries += entries;
+            Ok(outcome) => {
+                result.new_entries += outcome.new_entries;
+                result.errors.extend(
+                    outcome
+                        .errors
+                        .into_iter()
+                        .map(|error| format!("{}: {}", feed.url, error)),
+                );
                 result.feeds.push(FeedFetchResult {
                     feed_id: feed.id,
                     feed_title: feed.title.clone().unwrap_or_else(|| feed.url.clone()),
-                    new_entries: entries,
+                    new_entries: outcome.new_entries,
                 });
                 {
                     let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
                     let _ = feed_service::mark_feed_fetched(&conn, feed.id);
                 }
-                info!(feed_id = feed.id, new_entries = entries, "订阅源刷新完成");
+                info!(
+                    feed_id = feed.id,
+                    new_entries = outcome.new_entries,
+                    "订阅源刷新完成"
+                );
             }
             Err(e) => {
                 warn!(feed_id = feed.id, error = %e, "订阅源刷新失败");
@@ -87,18 +103,24 @@ pub async fn fetch_feed(
     };
 
     match process_feed(conn_mutex, &client, &feed).await {
-        Ok(entries) => {
-            result.new_entries = entries;
+        Ok(outcome) => {
+            result.new_entries = outcome.new_entries;
+            result.errors.extend(
+                outcome
+                    .errors
+                    .into_iter()
+                    .map(|error| format!("{}: {}", feed.url, error)),
+            );
             result.feeds.push(FeedFetchResult {
                 feed_id: feed.id,
                 feed_title: feed.title.clone().unwrap_or_else(|| feed.url.clone()),
-                new_entries: entries,
+                new_entries: outcome.new_entries,
             });
             let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
             let _ = feed_service::mark_feed_fetched(&conn, feed.id);
             info!(
                 feed_id = feed.id,
-                new_entries = entries,
+                new_entries = outcome.new_entries,
                 "单个订阅源刷新完成"
             );
         }
@@ -144,18 +166,28 @@ pub async fn fetch_due_feeds(conn_mutex: &Mutex<Connection>) -> Result<FetchResu
     for feed in &due {
         info!(feed_id = feed.id, url = %feed.url, "调度刷新订阅源");
         match process_feed(conn_mutex, &client, feed).await {
-            Ok(entries) => {
-                result.new_entries += entries;
+            Ok(outcome) => {
+                result.new_entries += outcome.new_entries;
+                result.errors.extend(
+                    outcome
+                        .errors
+                        .into_iter()
+                        .map(|error| format!("{}: {}", feed.url, error)),
+                );
                 result.feeds.push(FeedFetchResult {
                     feed_id: feed.id,
                     feed_title: feed.title.clone().unwrap_or_else(|| feed.url.clone()),
-                    new_entries: entries,
+                    new_entries: outcome.new_entries,
                 });
                 {
                     let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
                     let _ = feed_service::mark_feed_fetched(&conn, feed.id);
                 }
-                info!(feed_id = feed.id, new_entries = entries, "订阅源刷新完成");
+                info!(
+                    feed_id = feed.id,
+                    new_entries = outcome.new_entries,
+                    "订阅源刷新完成"
+                );
             }
             Err(e) => {
                 warn!(feed_id = feed.id, error = %e, "订阅源刷新失败");
@@ -235,7 +267,7 @@ async fn process_feed(
     conn_mutex: &Mutex<Connection>,
     client: &reqwest::Client,
     feed: &Feed,
-) -> Result<usize, String> {
+) -> Result<ProcessFeedOutcome, String> {
     let response = client
         .get(&feed.url)
         .send()
@@ -258,7 +290,16 @@ async fn process_feed(
         "RSS 解析完成"
     );
 
-    let feed_title = parsed.title.map(|t| t.content);
+    process_parsed_feed(conn_mutex, client, feed, &parsed).await
+}
+
+async fn process_parsed_feed(
+    conn_mutex: &Mutex<Connection>,
+    client: &reqwest::Client,
+    feed: &Feed,
+    parsed: &feed_rs::model::Feed,
+) -> Result<ProcessFeedOutcome, String> {
+    let feed_title = parsed.title.as_ref().map(|t| t.content.clone());
 
     {
         let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
@@ -272,7 +313,7 @@ async fn process_feed(
         }
     }
 
-    let mut new_entries = 0usize;
+    let mut outcome = ProcessFeedOutcome::default();
 
     for entry in &parsed.entries {
         let guid = entry.id.clone();
@@ -317,7 +358,7 @@ async fn process_feed(
         let published_at = entry.published.or(entry.updated).map(|d| d.to_rfc3339());
 
         let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
-        let (entry_id, added_to_feed) = upsert_feed_entry(
+        let upsert_result = upsert_feed_entry(
             &conn,
             feed.id,
             &guid,
@@ -329,10 +370,25 @@ async fn process_feed(
             metadata.publication_date.as_deref(),
             metadata.source.as_deref(),
             &identifiers,
-        )?;
+        );
+
+        let (entry_id, added_to_feed) = match upsert_result {
+            Ok(value) => value,
+            Err(error) => {
+                let label = entry_label(&title, &guid, &link);
+                warn!(
+                    feed_id = feed.id,
+                    entry = %label,
+                    error = %error,
+                    "跳过失败的 RSS 条目"
+                );
+                outcome.errors.push(format!("{}: {}", label, error));
+                continue;
+            }
+        };
 
         if added_to_feed {
-            new_entries += 1;
+            outcome.new_entries += 1;
             // Log an immutable "fetched" event so the stats survive feed deletion
             // or retention-based entry pruning. feed_title may be None on the very
             // first fetch of a brand-new feed (UPDATE above runs in a sibling lock
@@ -346,7 +402,17 @@ async fn process_feed(
         }
     }
 
-    Ok(new_entries)
+    Ok(outcome)
+}
+
+fn entry_label(title: &str, guid: &str, link: &str) -> String {
+    for value in [title, guid, link] {
+        let value = value.trim();
+        if !value.is_empty() {
+            return value.chars().take(80).collect();
+        }
+    }
+    "(无法识别的条目)".to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -599,6 +665,86 @@ mod tests {
             })
             .unwrap(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn parsed_feed_continues_after_one_entry_write_failure() {
+        let conn = membership_db();
+        conn.execute_batch(
+            "
+            CREATE TRIGGER reject_bad_entry
+            BEFORE INSERT ON entries
+            WHEN NEW.title = 'Bad entry'
+            BEGIN
+                SELECT RAISE(FAIL, 'forced entry failure');
+            END;
+            ",
+        )
+        .expect("create failure trigger");
+
+        let rss = br#"
+            <rss version="2.0">
+              <channel>
+                <title>Failure tolerant feed</title>
+                <item>
+                  <guid>good-1</guid>
+                  <title>Good entry one</title>
+                  <link>https://example.test/good-1</link>
+                </item>
+                <item>
+                  <guid>bad-1</guid>
+                  <title>Bad entry</title>
+                  <link>https://example.test/bad-1</link>
+                </item>
+                <item>
+                  <guid>good-2</guid>
+                  <title>Good entry two</title>
+                  <link>https://example.test/good-2</link>
+                </item>
+              </channel>
+            </rss>
+        "#;
+        let parsed = feed_rs::parser::parse(&rss[..]).expect("parse rss");
+        let feed = Feed {
+            id: 1,
+            url: "https://one.test/rss".to_string(),
+            title: None,
+            description: None,
+            created_at: "2026-07-19 00:00:00".to_string(),
+            refresh_interval: "1d".to_string(),
+            notify: false,
+            last_fetched_at: None,
+            pubmed_query: None,
+            pubmed_limit: None,
+        };
+        let client = reqwest::Client::builder().build().expect("client");
+        let conn_mutex = Mutex::new(conn);
+
+        let outcome = process_parsed_feed(&conn_mutex, &client, &feed, &parsed)
+            .await
+            .expect("process parsed feed");
+
+        assert_eq!(outcome.new_entries, 2);
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(outcome.errors[0].contains("Bad entry"));
+        assert!(outcome.errors[0].contains("forced entry failure"));
+
+        let conn = conn_mutex.lock().expect("lock database");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM entries WHERE title = 'Bad entry'",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+            0
         );
     }
 }

@@ -1,4 +1,5 @@
 use crate::db::DbState;
+use crate::models::PubmedAuthorQueryResult;
 use crate::services::{cost_service, pubmed_service, settings_service};
 use tauri::State;
 
@@ -14,7 +15,7 @@ pub async fn build_pubmed_author_query(
     affiliation: Option<String>,
     start_date: Option<String>,
     end_date: Option<String>,
-) -> Result<String, String> {
+) -> Result<PubmedAuthorQueryResult, String> {
     let settings = {
         let conn = state.conn.lock().map_err(|e| e.to_string())?;
         settings_service::get_settings(&conn)
@@ -23,7 +24,7 @@ pub async fn build_pubmed_author_query(
         return Err("请先在设置中配置当前 AI 服务的 API Key".to_string());
     }
 
-    let (query, usage) = pubmed_service::natural_language_to_author_query(
+    let (result, usage) = pubmed_service::natural_language_to_author_query(
         &settings,
         &author_name,
         affiliation.as_deref(),
@@ -33,7 +34,37 @@ pub async fn build_pubmed_author_query(
     .await?;
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
     let _ = cost_service::record_usage(&conn, &settings.provider, &settings.model, &usage);
-    Ok(query)
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn build_pubmed_author_expansion_queries(
+    state: State<'_, DbState>,
+    author_name: String,
+    confirmed_names: Vec<String>,
+    confirmed_affiliations: Vec<String>,
+    stable_coauthors: Vec<String>,
+    seed_count: usize,
+) -> Result<PubmedAuthorQueryResult, String> {
+    let settings = {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        settings_service::get_settings(&conn)
+    };
+    if settings.api_key.is_empty() {
+        return Err("请先在设置中配置当前 AI 服务的 API Key".to_string());
+    }
+    let (result, usage) = pubmed_service::natural_language_to_author_expansion_queries(
+        &settings,
+        &author_name,
+        &confirmed_names,
+        &confirmed_affiliations,
+        &stable_coauthors,
+        seed_count,
+    )
+    .await?;
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    let _ = cost_service::record_usage(&conn, &settings.provider, &settings.model, &usage);
+    Ok(result)
 }
 
 #[tauri::command]

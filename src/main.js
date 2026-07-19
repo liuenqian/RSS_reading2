@@ -6,11 +6,31 @@ import { normalizeEntrySortMode, sortEntries } from './entry_sort.js';
 import { shortJournalDisplayName } from './journal_name.js';
 import { buildPubmedSearchUrl, feedSourceLink } from './source_link.js';
 import {
+  groupPmcFiguresByArticle,
+  isPmcFigureNumber,
+  mergePmcGalleryResults,
+} from './pmc_gallery.js';
+import {
+  AUTHOR_IDENTITY_META,
+  assessAuthorFingerprintStability,
+  buildAuthorFingerprint,
+  buildAuthorIdentityClusters,
+  recommendAuthorSeedCandidates,
+} from './author_identity.js';
+import {
   createDefaultFilterScopeState,
   filterScopeKey,
   normalizeFilterScopeState,
   writeFilterScopeState,
 } from './filter_scope.js';
+import {
+  SCREENING_TABLE_SCHEMA_VERSION,
+  defaultScreeningTableConfig,
+  normalizeScreeningTableConfig,
+  screeningScopeKey,
+  toggleScreeningTableSort,
+} from './screening_table_state.js';
+import { renderScreeningTable } from './screening_table_view.js';
 const { invoke } = window.__TAURI__.core;
 const markdownitFactory = globalThis.markdownit;
 const markdownitTaskLists = globalThis.markdownitTaskLists;
@@ -139,9 +159,10 @@ let pubmedStatusFilter, pubmedSort, pubmedStarFilter, pubmedDateFilters, pubmedP
 let pubmedProgressEl, pubmedProgressFill, pubmedProgressLabel, btnRunPubmedSearch, btnCancelPubmedRun;
 let btnExportPubmed;
 let pubmedSnapshotSelect, btnSavePubmedSnapshot, btnDeletePubmedSnapshot;
-let pubmedBulkStatus, btnPubmedAiScreen;
+let pubmedBulkStatus, btnPubmedAiScreen, btnPubmedAuthorIdentity;
 let entryListEl, briefingListEl, briefingItemsEl, briefingSortSelect, briefingSortDirection;
-let entryItemsEl, entryFilter;
+let entryItemsEl, entryFilter, screeningTableEl, btnScreeningTableToggle;
+let screeningWindowView, screeningWindowTitle, screeningWindowSubtitle, btnScreeningWindowClose;
 let entrySortSelect, entrySortDirection, entryMetricIfFilter, entryMetricQFilter, entryMetricBFilter, entryMetricTopFilter, entryTagFilter;
 let entryMetricFilterSummaryCount;
 let entryBulkActions, entryBulkCount, btnEntrySelectMode, btnEntryBulkSelectAll, btnEntryBulkSelectUnnoted, btnEntryBulkSelectNoted, btnEntryBulkInvert, btnEntryBulkDeselect, entryBulkExportFormat, btnEntryBulkExport, entryBulkExistingMode, btnEntryBulkGenerate, btnEntryBulkClear;
@@ -180,6 +201,7 @@ let pubmedRenderLimit = 200;
 let pubmedPreview = null;
 let pubmedPreviewAssessment = null;
 let pubmedPreviewSettingsReturnPending = false;
+let pubmedAuthorQueryCandidates = [];
 let contextMenu = null;
 let renamingFeedId = null;
 let renamingPubmedSearchId = null;
@@ -215,14 +237,48 @@ const entryPdfLinkCheckInFlight = new Map();
 let detailPdfReader = null;
 let detailPdfUrl = '';
 let detailPdfRequestId = 0;
+let wordFrequencyResult = null;
+let wordFrequencyView = 'cloud';
+let wordFrequencyLanguage = 'en';
+let wordFrequencyBusy = false;
+let wordFrequencyRequestId = 0;
+let wordFrequencyTranslations = {};
+let pmcGalleryResult = null;
+let pmcGalleryView = 'all';
+let pmcGalleryFigureNumber = 1;
+let pmcGalleryRequestId = 0;
+let pmcGalleryBusy = false;
+let pmcGalleryNextOffset = 0;
+let pmcGalleryHasMore = false;
+let pmcGalleryActiveMetricFilters = null;
+let pmcGallerySearchMode = 'topic';
+let pmcGalleryPreview = null;
+let pmcGalleryPreviewQuery = '';
+let pmcGalleryHistory = [];
+let pmcGalleryActiveHistoryId = '';
+const pmcGalleryFigureIndexes = new Map();
 let entrySelectionMode = false;
 let selectedEntryIds = new Set();
 let lastPresetProvider = 'sensenova';
 let aiModels = [];
 let editingAiModelId = null;
+let starredEntryIds = new Set();
+let starredStateReady = false;
+let screeningTableMode = false;
+const screeningTableConfigs = new Map();
+const screeningTableOffsets = new Map();
+const screeningTableSearchQueries = new Map();
+let screeningTableRequestId = 0;
+let screeningTableSearchTimer = null;
+let standaloneScreeningLaunchFilters = null;
 
 const SCI_HUB_BASE_URL = 'https://www.sci-hub.st/';
 const SCI_HUB_LAST_RELIABLE_PUBLICATION_YEAR = 2020;
+const WORD_FREQUENCY_TRANSLATION_CACHE_KEY = 'word-frequency-translations-v1';
+const PMC_GALLERY_HISTORY_KEY = 'pmc-gallery-search-history-v1';
+const AUTHOR_IDENTITY_STORAGE_PREFIX = 'pubmed-author-identity-v1';
+const authorIdentityStateCache = new Map();
+wordFrequencyTranslations = loadWordFrequencyTranslations();
 
 const AI_PROVIDER_META = {
   sensenova: {
@@ -454,14 +510,53 @@ function parsePubmedFeedConfig(feed) {
   };
 }
 
-function starredIds() {
-  try { return new Set(JSON.parse(localStorage.getItem('starred-ids') || '[]')); }
-  catch { return new Set(); }
+function legacyStarredIds() {
+  try {
+    const value = JSON.parse(localStorage.getItem('starred-ids') || '[]');
+    return new Set(Array.isArray(value) ? value.map(Number).filter(Number.isFinite) : []);
+  } catch {
+    return new Set();
+  }
 }
+
+function starredIds() {
+  return starredStateReady ? new Set(starredEntryIds) : legacyStarredIds();
+}
+
+async function loadStarredState() {
+  const legacyIds = legacyStarredIds();
+  try {
+    await invoke('migrate_legacy_starred_ids', { entryIds: [...legacyIds] });
+    const ids = await invoke('list_starred_entry_ids');
+    starredEntryIds = new Set((Array.isArray(ids) ? ids : []).map(Number).filter(Number.isFinite));
+    starredStateReady = true;
+    localStorage.setItem('starred-migration-v1', '1');
+    localStorage.removeItem('starred-ids');
+    updateOverviewCounts();
+    renderFeedList(allFeeds);
+    renderEntryList(allEntries);
+  } catch (error) {
+    starredEntryIds = legacyIds;
+    starredStateReady = false;
+    console.warn('加载数据库星标失败，暂时使用本地星标:', error);
+  }
+}
+
 function toggleStar(entryId) {
-  const s = starredIds();
-  if (s.has(entryId)) s.delete(entryId); else s.add(entryId);
-  localStorage.setItem('starred-ids', JSON.stringify([...s]));
+  const previous = starredIds();
+  const next = new Set(previous);
+  if (next.has(entryId)) next.delete(entryId); else next.add(entryId);
+  if (starredStateReady) starredEntryIds = next;
+  else localStorage.setItem('starred-ids', JSON.stringify([...next]));
+  const write = starredStateReady
+    ? invoke('set_entry_starred', { entryId, isStarred: next.has(entryId) })
+    : Promise.resolve();
+  return write.catch(error => {
+    starredEntryIds = previous;
+    renderEntryList(allEntries);
+    updateOverviewCounts();
+    setGlobalStatus(`保存星标失败：${error}`, 'error');
+  });
 }
 
 function normalizeEntryFilterValue(value) {
@@ -1000,7 +1095,6 @@ async function activateAiModel(configId) {
     updateView(!!settings.api_key);
     setAiModelStatus(`已启用 ${settings.model_display_name || settings.model}`, 'success');
     setTimeout(() => setAiModelStatus('', ''), 2500);
-    invoke('start_translation_pipeline').catch(() => {});
   } catch (error) {
     setAiModelStatus('启用失败: ' + error, 'error');
   }
@@ -1233,11 +1327,7 @@ async function saveTranslationSettings() {
     setAiModelEditorVisible(false);
     showSettingsStatus('模型已保存', 'success');
     updateView(!!savedSettings.api_key);
-    // If the user just configured (or updated) the API key, kick the pipeline so
-    // any entries that were waiting for a key start translating immediately,
-    // and refresh the balance card with the new credentials.
     if (settings.api_key && !pubmedPreviewSettingsReturnPending) {
-      invoke('start_translation_pipeline').catch(() => {});
       if (supportsDeepSeekBalance(activeProviderId(), settings.base_url)) {
         refreshDeepSeekBalance({ silent: true });
       }
@@ -1292,15 +1382,14 @@ function toggleApiKeyVisibility() {
 function updateView(hasApiKey) {
   hasConfiguredApiKey = hasApiKey;
   // The onboarding banner in the settings/translation section reminds users
-  // they can unlock auto-translation by adding a key. Hide it once a key is
+  // they can unlock on-demand translation by adding a key. Hide it once a key is
   // present; re-show if they ever clear it. The banner is informational —
   // the main view is fully usable without a key.
   const banner = document.getElementById('onboarding-banner');
   if (banner) banner.classList.toggle('hidden', hasApiKey);
   // Always boot into the main view. Articles render in their original
-  // language when no key is configured; the translation pipeline silently
-  // skips itself. Users who want Chinese translation can opt in via
-  // Settings → 翻译 at any time.
+  // language when no key is configured. Translation only runs after an
+  // explicit title, summary, or batch translation action.
   showMain();
   loadFeeds();
   loadPubmedSearches();
@@ -1407,8 +1496,12 @@ function setSidebarSectionCollapsed(section, collapsed, { persist = true } = {})
   if (!toggle || !list) return;
 
   toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-  toggle.title = `${collapsed ? '展开' : '折叠'}${section === 'pubmed' ? ' PubMed 检索' : '订阅源'}`;
+  const sectionLabel = section === 'pubmed'
+    ? 'PubMed 检索'
+    : (section === 'pmc-gallery' ? 'PMC 图库' : '订阅源');
+  toggle.title = `${collapsed ? '展开' : '折叠'}${sectionLabel}`;
   list.hidden = collapsed;
+  toggle.closest('.sidebar-source-section')?.classList.toggle('is-collapsed', collapsed);
 
   if (persist) {
     const state = loadSidebarSectionCollapsedState();
@@ -1683,10 +1776,10 @@ function choosePubmedExportFields(initialFormat, context, onGoogleExport = null)
           <p class="pubmed-export-field-status"></p>
         </div>
         <footer class="pubmed-modal-footer">
+          <button class="btn btn-primary" data-confirm type="button">继续选择保存位置</button>
           <button class="btn btn-secondary hidden" data-open-google type="button">打开 Google 翻译</button>
           <button class="btn btn-secondary hidden" data-import-google type="button">导入译文</button>
           <button class="btn btn-secondary" data-close type="button">取消</button>
-          <button class="btn btn-primary" data-confirm type="button">继续选择保存位置</button>
         </footer>
       </section>
     `;
@@ -2475,6 +2568,7 @@ async function importOpml() {
 // ── Feed management ────────────────────────────
 let pubmedEditingSearchId = null;
 let pubmedSearchBuilderMode = 'topic';
+let pubmedCreationTarget = 'search';
 
 function pubmedRetrievalScope() {
   return document.querySelector('input[name="pubmed-retrieval-scope"]:checked')?.value || '';
@@ -2517,6 +2611,11 @@ function updatePubmedRetrievalUi() {
   if (count) count.textContent = total ? `(${total.toLocaleString('zh-CN')} 篇)` : '';
   const button = document.getElementById('btn-create-pubmed-search');
   if (!button) return;
+  if (pubmedCreationTarget === 'feed') {
+    button.textContent = '生成并添加订阅';
+    button.disabled = !pubmedPreview;
+    return;
+  }
   const prefix = pubmedEditingSearchId ? '保存并更新' : '创建并抓取';
   if (pubmedPreview && !scope) {
     button.textContent = '请选择抓取范围';
@@ -2588,34 +2687,101 @@ function setPubmedSearchBuilderMode(nextMode) {
   invalidatePubmedPreview();
 }
 
-function openPubmedSearchModal({ source = null, editing = false } = {}) {
+function renderPubmedAuthorQueryCandidates(candidates = []) {
+  const container = document.getElementById('pubmed-author-query-candidates');
+  if (!container) return;
+  pubmedAuthorQueryCandidates = Array.isArray(candidates) ? candidates : [];
+  if (!pubmedAuthorQueryCandidates.length) {
+    container.replaceChildren();
+    container.classList.add('hidden');
+    return;
+  }
+  container.innerHTML = `
+    <div class="pubmed-author-query-candidates-heading">选择检索方案</div>
+    ${pubmedAuthorQueryCandidates.map((candidate, index) => `
+      <label class="pubmed-author-query-candidate">
+        <input type="radio" name="pubmed-author-query-candidate" value="${index}" ${index === 0 ? 'checked' : ''} />
+        <span>
+          <strong>${escapeHtml(candidate.label || `方案 ${index + 1}`)}</strong>
+          <small>${escapeHtml(candidate.rationale || '')}</small>
+          <code>${escapeHtml(candidate.query || '')}</code>
+        </span>
+      </label>
+    `).join('')}`;
+  container.classList.remove('hidden');
+  container.querySelectorAll('input[name="pubmed-author-query-candidate"]').forEach(input => {
+    input.addEventListener('change', () => {
+      const candidate = pubmedAuthorQueryCandidates[Number(input.value)];
+      if (!candidate?.query) return;
+      document.getElementById('pubmed-batch-query-input').value = candidate.query;
+      invalidatePubmedPreview();
+      document.getElementById('pubmed-preview-status').textContent = `已选择“${candidate.label || `方案 ${Number(input.value) + 1}`}”，请预览结果`;
+    });
+  });
+}
+
+function renderPubmedSearchNameHistory() {
+  const datalist = document.getElementById('pubmed-search-name-history');
+  if (!datalist) return;
+  datalist.replaceChildren();
+  [...new Set(allPubmedSearches.map(search => search.name?.trim()).filter(Boolean))].forEach(name => {
+    const option = document.createElement('option');
+    option.value = name;
+    datalist.appendChild(option);
+  });
+}
+
+function extractAuthorSearchIdentity(source) {
+  const question = String(source?.question || '').trim();
+  const match = question.match(/作者\s+(.+?)(?:（([^）]+)）)?\s+的\s*PubMed\s*文献/i);
+  const nameMatch = String(source?.name || '').match(/【作者\s*[|｜]\s*([^】]+)】/i);
+  const authorName = (match?.[1] || nameMatch?.[1] || '').trim();
+  if (!authorName) return null;
+  return {
+    authorName,
+    affiliation: match?.[2]?.trim() || '',
+  };
+}
+
+function openPubmedSearchModal({ source = null, editing = false, creationTarget = 'search' } = {}) {
   const modal = document.getElementById('pubmed-search-modal');
   if (!modal) return;
+  const authorIdentity = editing ? extractAuthorSearchIdentity(source) : null;
+  pubmedCreationTarget = creationTarget === 'feed' ? 'feed' : 'search';
   pubmedEditingSearchId = editing ? source?.id || null : null;
   document.getElementById('pubmed-question').value = source?.question || '';
   document.getElementById('pubmed-batch-query-input').value = source?.query || '';
-  document.getElementById('pubmed-author-name').value = '';
-  document.getElementById('pubmed-author-affiliation').value = '';
+  document.getElementById('pubmed-author-name').value = authorIdentity?.authorName || '';
+  document.getElementById('pubmed-author-affiliation').value = authorIdentity?.affiliation || '';
   document.getElementById('pubmed-author-start-date').value = '';
   document.getElementById('pubmed-author-end-date').value = '';
   document.getElementById('pubmed-search-name').value = source
     ? (editing ? source.name : `${source.name} 副本`)
     : '';
   setPubmedRetrievalForm(source);
-  document.getElementById('pubmed-modal-title').textContent = editing ? '编辑 PubMed 检索' : '新建 PubMed 检索';
-  document.getElementById('pubmed-modal-description').textContent = editing
-    ? '保存后保留历史文献与筛选记录，后续更新使用新的检索式。'
-    : '确认检索式后，Cento 将直接从 PubMed 抓取并持续更新。';
+  document.getElementById('pubmed-modal-title').textContent = pubmedCreationTarget === 'feed'
+    ? '添加 PubMed RSS 订阅'
+    : (editing ? '编辑 PubMed 检索' : '新建 PubMed 检索');
+  document.getElementById('pubmed-modal-description').textContent = pubmedCreationTarget === 'feed'
+    ? '生成并预览检索式后，将其添加为持续更新的 PubMed RSS 订阅。'
+    : (editing
+      ? '保存后保留历史文献与筛选记录，后续更新使用新的检索式。'
+      : '确认检索式后，Cento 将直接从 PubMed 抓取并持续更新。');
   document.getElementById('pubmed-preview-status').textContent = '';
   document.getElementById('pubmed-preview-results').innerHTML = '';
   document.getElementById('pubmed-preview-results').classList.add('hidden');
   document.getElementById('btn-create-pubmed-search').disabled = true;
   document.getElementById('pubmed-retrieval-panel').disabled = true;
-  document.getElementById('pubmed-preview-ai-enabled').checked = true;
+  document.getElementById('pubmed-retrieval-panel').classList.toggle('hidden', pubmedCreationTarget === 'feed');
+  document.getElementById('pubmed-rss-options').classList.toggle('hidden', pubmedCreationTarget !== 'feed');
+  document.getElementById('pubmed-rss-limit').value = '15';
+  document.getElementById('pubmed-preview-ai-enabled').checked = false;
+  renderPubmedAuthorQueryCandidates();
   pubmedPreview = null;
   pubmedPreviewAssessment = null;
   updatePubmedRetrievalUi();
-  setPubmedSearchBuilderMode('topic');
+  setPubmedSearchBuilderMode(authorIdentity ? 'author' : 'topic');
+  renderPubmedSearchNameHistory();
   modal.classList.remove('hidden');
   setTimeout(() => document.getElementById(source ? 'pubmed-batch-query-input' : 'pubmed-question')?.focus(), 0);
 }
@@ -2630,19 +2796,29 @@ async function buildPubmedAuthorQuery() {
   button.disabled = true;
   status.textContent = 'AI 正在识别作者和机构并构建检索式…';
   try {
-    const query = await invoke('build_pubmed_author_query', {
+    const result = await invoke('build_pubmed_author_query', {
       authorName,
       affiliation: affiliation || null,
       startDate: startDate || null,
       endDate: endDate || null,
     });
     loadCostSummary();
+    const query = typeof result === 'string' ? result : result?.query || '';
+    renderPubmedAuthorQueryCandidates(typeof result === 'string' ? [] : result?.candidates || []);
+    const detectedAuthor = typeof result === 'string' ? authorName : result?.author_name?.trim() || authorName;
+    const detectedAffiliation = affiliation || (typeof result === 'string' ? '' : result?.affiliation?.trim() || '');
     document.getElementById('pubmed-batch-query-input').value = query;
+    document.getElementById('pubmed-author-name').value = detectedAuthor;
+    if (!affiliation && detectedAffiliation) {
+      document.getElementById('pubmed-author-affiliation').value = detectedAffiliation;
+    }
     const nameInput = document.getElementById('pubmed-search-name');
-    if (!nameInput.value.trim()) nameInput.value = `【作者｜${authorName}】`;
-    document.getElementById('pubmed-question').value = `持续关注作者 ${authorName}${affiliation ? `（${affiliation}）` : ''} 的 PubMed 文献`;
+    if (!nameInput.value.trim()) nameInput.value = `【作者｜${detectedAuthor}】`;
+    document.getElementById('pubmed-question').value = `持续关注作者 ${detectedAuthor}${detectedAffiliation ? `（${detectedAffiliation}）` : ''} 的 PubMed 文献`;
     invalidatePubmedPreview();
-    status.textContent = 'AI 作者检索式已构建，请预览并核对作者与机构';
+    status.textContent = detectedAffiliation
+      ? `已识别作者“${detectedAuthor}”和单位“${detectedAffiliation}”，请点击预览结果后再进行 AI 评估`
+      : `已识别作者“${detectedAuthor}”，未识别到单位；可手工补充后再预览`;
   } catch (e) {
     status.textContent = `构建失败：${e}`;
   } finally {
@@ -2653,6 +2829,7 @@ async function buildPubmedAuthorQuery() {
 function closePubmedSearchModal() {
   document.getElementById('pubmed-search-modal')?.classList.add('hidden');
   pubmedEditingSearchId = null;
+  pubmedCreationTarget = 'search';
   pubmedPreviewSettingsReturnPending = false;
 }
 
@@ -2669,9 +2846,10 @@ async function generatePubmedQuery() {
   try {
     const query = await invoke('natural_to_pubmed_query', { text: question });
     loadCostSummary();
+    renderPubmedAuthorQueryCandidates();
     document.getElementById('pubmed-batch-query-input').value = query;
     invalidatePubmedPreview();
-    status.textContent = '检索式已生成，可继续修改';
+    status.textContent = '检索式已生成，可继续修改；点击预览结果后再进行 AI 评估';
   } catch (e) {
     status.textContent = `AI 生成失败：${e}。仍可手工输入检索式。`;
   } finally {
@@ -2692,7 +2870,14 @@ function openPubmedQueryInBrowser() {
   openUrl(buildPubmedSearchUrl(query));
 }
 
-function pubmedPreviewEntryAssessmentMeta(status) {
+function pubmedPreviewEntryAssessmentMeta(status, kind = 'topic') {
+  if (kind === 'author') {
+    return {
+      relevant: { label: '作者匹配', className: 'relevant' },
+      maybe: { label: '待确认', className: 'maybe' },
+      irrelevant: { label: '非目标作者', className: 'irrelevant' },
+    }[status] || { label: '待确认', className: 'maybe' };
+  }
   return {
     relevant: { label: '符合', className: 'relevant' },
     maybe: { label: '待确认', className: 'maybe' },
@@ -2716,6 +2901,22 @@ function pubmedPreviewRecallRiskMeta(risk) {
   }[risk] || { label: '中', className: 'moderate' };
 }
 
+function authorAssessmentNextStep(assessment) {
+  const relevant = Number(assessment?.relevant_count || 0);
+  const maybe = Number(assessment?.maybe_count || 0);
+  const total = Number(assessment?.sample_size || assessment?.entries?.length || 0);
+  if (total > 0 && relevant === 0 && maybe === 0) {
+    return '不建议直接采用当前检索式抓取。请先找 1–3 篇已确认属于目标作者的核心文献，核对英文署名顺序、姓名缩写、共同作者，以及机构的中英文名、简称、院系/附属医院和历史名称，再用这些身份线索重新构建并预览检索式。';
+  }
+  if (relevant === 0 && maybe > 0) {
+    return '当前没有可以确认的作者文献。请先人工核对“待确认”样本中的共同作者与机构变体，包括中英文名、简称、旧称、院系和附属医院，选出核心文献后重新评估，暂时不要直接创建抓取任务。';
+  }
+  if (assessment?.suggested_query) {
+    return 'AI 找到了可运行的改进检索式。采用下方建议后需要重新预览和评估，旧的作者归属结论不会直接沿用。';
+  }
+  return '当前没有发现可以安全自动加入的姓名变体，因此未生成新的检索式。建议保留当前检索式，并用已确认核心文献补充作者指纹后再次评估。';
+}
+
 function truncatePubmedPreviewText(value, limit = 320) {
   const text = String(value || '').trim();
   return text.length > limit ? `${text.slice(0, limit)}…` : text;
@@ -2724,11 +2925,12 @@ function truncatePubmedPreviewText(value, limit = 320) {
 function renderPubmedPreviewResults(preview, assessment = null, assessmentError = '') {
   const results = document.getElementById('pubmed-preview-results');
   if (!results || !preview) return;
+  const isAuthorMode = pubmedSearchBuilderMode === 'author';
   const assessmentByPmid = new Map((assessment?.entries || []).map(item => [item.pmid, item]));
   const renderSampleEntry = entry => {
     const itemAssessment = assessmentByPmid.get(entry.pmid);
     const assessmentMeta = itemAssessment
-      ? pubmedPreviewEntryAssessmentMeta(itemAssessment.status)
+      ? pubmedPreviewEntryAssessmentMeta(itemAssessment.status, isAuthorMode ? 'author' : 'topic')
       : null;
     const abstractText = truncatePubmedPreviewText(entry.abstract_text || '暂无摘要');
     return `
@@ -2754,30 +2956,32 @@ function renderPubmedPreviewResults(preview, assessment = null, assessmentError 
     const coverageGaps = (assessment.coverage_gaps || [])
       .map(gap => `<li>${escapeHtml(gap)}</li>`)
       .join('');
+    const authorNextStep = isAuthorMode ? authorAssessmentNextStep(assessment) : '';
     assessmentHtml = `
       <section class="pubmed-preview-assessment ${verdict.className}">
         <div class="pubmed-preview-assessment-heading">
-          <strong>AI 检索式质量评估</strong>
+          <strong>${isAuthorMode ? 'AI 作者归属评估' : 'AI 检索式质量评估'}</strong>
           <span class="pubmed-preview-verdict ${verdict.className}">${verdict.label}</span>
         </div>
         <div class="pubmed-preview-quality-grid">
-          <div><span>查准率估计</span><strong>${Number(assessment.precision_percent || 0).toFixed(1)}%</strong><small>95% CI ${Number(assessment.precision_low_percent || 0).toFixed(1)}–${Number(assessment.precision_high_percent || 0).toFixed(1)}%</small></div>
-          <div><span>查全风险</span><strong class="${recallRisk.className}">${recallRisk.label}</strong><small>不等同于真实查全率</small></div>
+          <div><span>${isAuthorMode ? '作者匹配率估计' : '查准率估计'}</span><strong>${Number(assessment.precision_percent || 0).toFixed(1)}%</strong><small>95% CI ${Number(assessment.precision_low_percent || 0).toFixed(1)}–${Number(assessment.precision_high_percent || 0).toFixed(1)}%</small></div>
+          <div><span>${isAuthorMode ? '身份覆盖风险' : '查全风险'}</span><strong class="${recallRisk.className}">${recallRisk.label}</strong><small>${isAuthorMode ? '姓名变体与机构变更' : '不等同于真实查全率'}</small></div>
           <div><span>抽样规模</span><strong>${assessment.sample_size || assessment.entries?.length || 0}</strong><small>当前排序结果等距抽样</small></div>
-          <div><span>摘要可用</span><strong>${assessment.abstract_count || 0}</strong><small>其余仅依据题名判断</small></div>
+          <div><span>${isAuthorMode ? '作者字段可用' : '摘要可用'}</span><strong>${assessment.abstract_count || 0}</strong><small>${isAuthorMode ? '用于作者归属判断' : '其余仅依据题名判断'}</small></div>
         </div>
         <div class="pubmed-preview-assessment-counts">
-          <span class="relevant">符合 ${assessment.relevant_count}</span>
+          <span class="relevant">${isAuthorMode ? '作者匹配' : '符合'} ${assessment.relevant_count}</span>
           <span class="maybe">待确认 ${assessment.maybe_count}</span>
-          <span class="irrelevant">不符合 ${assessment.irrelevant_count}</span>
+          <span class="irrelevant">${isAuthorMode ? '非目标作者' : '不符合'} ${assessment.irrelevant_count}</span>
         </div>
         <p>${escapeHtml(assessment.summary || '')}</p>
         <div class="pubmed-preview-recall-note">${escapeHtml(assessment.recall_assessment || '')}</div>
-        ${coverageGaps ? `<div class="pubmed-preview-coverage-gaps"><strong>可能的覆盖缺口</strong><ul>${coverageGaps}</ul></div>` : ''}
+        ${coverageGaps ? `<div class="pubmed-preview-coverage-gaps"><strong>${isAuthorMode ? '作者身份覆盖缺口' : '可能的覆盖缺口'}</strong><ul>${coverageGaps}</ul></div>` : ''}
+        ${authorNextStep ? `<div class="pubmed-preview-next-step"><strong>下一步建议</strong><p>${escapeHtml(authorNextStep)}</p></div>` : ''}
         ${assessment.suggested_query ? `
           <div class="pubmed-preview-suggested-query">
             <div class="pubmed-preview-suggested-query-heading">
-              <strong>建议检索式</strong>
+              <strong>${isAuthorMode ? '建议作者检索式' : '建议检索式'}</strong>
               <button class="btn btn-secondary btn-sm" type="button" data-use-suggested-query>采用建议检索式</button>
             </div>
             <code>${escapeHtml(assessment.suggested_query)}</code>
@@ -2797,7 +3001,7 @@ function renderPubmedPreviewResults(preview, assessment = null, assessmentError 
 
   results.innerHTML = `
     ${assessmentHtml}
-    <div class="pubmed-preview-summary">抽样题名与摘要 · 显示前 ${Math.min(5, sampleEntries.length)} 篇${assessment ? ` · AI 已判断 ${assessment.entries?.length || 0} 篇` : ''}</div>
+    <div class="pubmed-preview-summary">${isAuthorMode ? '抽样作者与机构字段' : '抽样题名与摘要'} · 显示前 ${Math.min(5, sampleEntries.length)} 篇${assessment ? ` · AI 已判断 ${assessment.entries?.length || 0} 篇` : ''}</div>
     ${previews || '<div class="pubmed-preview-item-meta">没有可预览记录</div>'}
     ${remainingSamples ? `<details class="pubmed-preview-sample-details"><summary>查看其余 ${sampleEntries.length - 5} 篇抽样文献</summary><div>${remainingSamples}</div></details>` : ''}
   `;
@@ -2832,31 +3036,40 @@ function formatPubmedPreviewAssessmentError(error) {
 
 async function retryPubmedPreviewAssessment() {
   if (!pubmedPreview) return;
+  const isAuthorMode = pubmedSearchBuilderMode === 'author';
   const question = document.getElementById('pubmed-question')?.value.trim() || '';
+  const authorName = document.getElementById('pubmed-author-name')?.value.trim() || '';
+  const affiliation = document.getElementById('pubmed-author-affiliation')?.value.trim() || '';
   const status = document.getElementById('pubmed-preview-status');
   const button = document.getElementById('btn-preview-pubmed-search');
-  if (!question) {
-    status.textContent = '请先填写研究问题';
+  if (isAuthorMode ? !authorName : !question) {
+    status.textContent = isAuthorMode ? '请先填写作者姓名' : '请先填写研究问题';
     return;
   }
 
   button.disabled = true;
-  status.textContent = `AI 正在重新评估 ${pubmedPreview.entries.length} 篇样本…`;
+  status.textContent = `${isAuthorMode ? 'AI 正在重新评估作者归属' : 'AI 正在重新评估'} ${pubmedPreview.entries.length} 篇样本…`;
   try {
-    pubmedPreviewAssessment = await invoke('assess_pubmed_search_preview', {
-      question,
-      query: pubmedPreview.query,
-      entries: pubmedPreview.entries,
-    });
+    pubmedPreviewAssessment = isAuthorMode
+      ? await invoke('assess_pubmed_author_preview', {
+        authorName,
+        affiliation: affiliation || null,
+        query: pubmedPreview.query,
+        entries: pubmedPreview.entries,
+      })
+      : await invoke('assess_pubmed_search_preview', {
+        question,
+        query: pubmedPreview.query,
+        entries: pubmedPreview.entries,
+      });
     pubmedPreviewSettingsReturnPending = false;
     loadCostSummary();
     renderPubmedPreviewResults(pubmedPreview, pubmedPreviewAssessment);
     const verdict = pubmedPreviewVerdictMeta(pubmedPreviewAssessment.verdict);
-    status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇 · 抽样 ${pubmedPreviewAssessment.sample_size} 篇 · ${verdict.label}`;
-    invoke('start_translation_pipeline').catch(() => {});
+    status.textContent = `${isAuthorMode ? '命中' : '命中'} ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇 · 抽样 ${pubmedPreviewAssessment.sample_size} 篇 · ${isAuthorMode ? '作者归属' : ''}${verdict.label}`;
   } catch (error) {
     renderPubmedPreviewResults(pubmedPreview, null, String(error));
-    status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇 · AI 初判失败`;
+    status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇 · ${isAuthorMode ? '作者评估' : 'AI 初判'}失败`;
   } finally {
     button.disabled = false;
   }
@@ -2886,35 +3099,54 @@ async function previewPubmedSearch() {
   try {
     pubmedPreview = await invoke('preview_pubmed_search', { query, options });
     renderPubmedPreviewResults(pubmedPreview);
-    document.getElementById('pubmed-retrieval-panel').disabled = false;
+    if (pubmedCreationTarget === 'search') {
+      document.getElementById('pubmed-retrieval-panel').disabled = false;
+    }
     updatePubmedRetrievalUi();
 
-    const shouldAssess = pubmedSearchBuilderMode === 'topic'
-      && question
+    const authorName = document.getElementById('pubmed-author-name')?.value.trim() || '';
+    const affiliation = document.getElementById('pubmed-author-affiliation')?.value.trim() || '';
+    const shouldAssess = (pubmedSearchBuilderMode === 'topic'
+      ? question
+      : authorName)
       && document.getElementById('pubmed-preview-ai-enabled')?.checked
       && (pubmedPreview.entries || []).length > 0;
     if (shouldAssess) {
-      status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇，AI 正在评估 ${pubmedPreview.entries.length} 篇题名与摘要…`;
+      const isAuthorMode = pubmedSearchBuilderMode === 'author';
+      status.textContent = isAuthorMode
+        ? `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇，AI 正在评估 ${pubmedPreview.entries.length} 篇作者归属…`
+        : `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇，AI 正在评估 ${pubmedPreview.entries.length} 篇题名与摘要…`;
       try {
-        pubmedPreviewAssessment = await invoke('assess_pubmed_search_preview', {
-          question,
-          query: pubmedPreview.query,
-          entries: pubmedPreview.entries,
-        });
+        pubmedPreviewAssessment = isAuthorMode
+          ? await invoke('assess_pubmed_author_preview', {
+            authorName,
+            affiliation: affiliation || null,
+            query: pubmedPreview.query,
+            entries: pubmedPreview.entries,
+          })
+          : await invoke('assess_pubmed_search_preview', {
+            question,
+            query: pubmedPreview.query,
+            entries: pubmedPreview.entries,
+          });
         loadCostSummary();
         renderPubmedPreviewResults(pubmedPreview, pubmedPreviewAssessment);
         const verdict = pubmedPreviewVerdictMeta(pubmedPreviewAssessment.verdict);
-        status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇 · 抽样 ${pubmedPreviewAssessment.sample_size} 篇 · ${verdict.label}`;
+        status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇 · 抽样 ${pubmedPreviewAssessment.sample_size} 篇 · ${isAuthorMode ? '作者归属' : ''}${verdict.label}`;
       } catch (assessmentError) {
         renderPubmedPreviewResults(pubmedPreview, null, String(assessmentError));
-        status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇 · AI 初判失败`;
+        status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇 · ${isAuthorMode ? '作者评估' : 'AI 初判'}失败`;
       }
     } else {
       const assessmentHint = pubmedSearchBuilderMode === 'topic'
         && document.getElementById('pubmed-preview-ai-enabled')?.checked
         && !question
         ? ' · 填写研究问题后可进行 AI 初判'
-        : '';
+        : (pubmedSearchBuilderMode === 'author'
+          && document.getElementById('pubmed-preview-ai-enabled')?.checked
+          && !authorName
+          ? ' · 填写作者姓名后可进行作者归属评估'
+          : '');
       status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇${assessmentHint}`;
     }
   } catch (e) {
@@ -2934,13 +3166,6 @@ async function createAndRunPubmedSearch() {
   const query = document.getElementById('pubmed-batch-query-input').value.trim();
   const button = document.getElementById('btn-create-pubmed-search');
   const status = document.getElementById('pubmed-preview-status');
-  let options;
-  try {
-    options = pubmedRetrievalOptionsFromForm();
-  } catch (error) {
-    status.textContent = String(error.message || error);
-    return;
-  }
   if (!pubmedPreview || pubmedPreview.query !== query) {
     status.textContent = '检索式有变化，请重新预览';
     button.disabled = true;
@@ -2948,6 +3173,32 @@ async function createAndRunPubmedSearch() {
   }
   if (!name) {
     status.textContent = '请填写检索名称';
+    return;
+  }
+  if (pubmedCreationTarget === 'feed') {
+    const pubmedLimit = clampPubmedLimit(document.getElementById('pubmed-rss-limit').value);
+    button.disabled = true;
+    status.textContent = '正在生成并添加 PubMed RSS…';
+    try {
+      const generatedUrl = await invoke('build_pubmed_rss_url', { query, limit: pubmedLimit });
+      await persistNewFeed(generatedUrl, {
+        title: name,
+        pubmedQuery: query,
+        pubmedLimit,
+      });
+      closePubmedSearchModal();
+      setGlobalStatus('PubMed RSS 订阅已添加', 'success');
+    } catch (error) {
+      status.textContent = `添加订阅失败：${error}`;
+      button.disabled = false;
+    }
+    return;
+  }
+  let options;
+  try {
+    options = pubmedRetrievalOptionsFromForm();
+  } catch (error) {
+    status.textContent = String(error.message || error);
     return;
   }
   button.disabled = true;
@@ -3160,6 +3411,7 @@ async function loadPubmedSearches() {
   try {
     allPubmedSearches = await invoke('list_pubmed_searches');
     renderPubmedSearchList();
+    renderPubmedSearchNameHistory();
     let keptCount = 0;
     try { keptCount = (await invoke('list_kept_pubmed_entries')).length; } catch {}
     const countEl = document.getElementById('count-kept');
@@ -3222,6 +3474,7 @@ function showPubmedSearchContextMenu(x, y, search) {
   menu.className = 'context-menu';
   menu.innerHTML = `
     <div class="context-item" data-action="refresh">更新检索批次</div>
+    ${isAuthorPubmedSearch(search) ? '<div class="context-item" data-action="author-identity">作者身份审核</div>' : ''}
     <div class="context-item" data-action="open-source">在 PubMed 打开</div>
     <div class="context-separator"></div>
     <div class="context-item" data-action="translate-title">批量翻译标题</div>
@@ -3241,6 +3494,9 @@ function showPubmedSearchContextMenu(x, y, search) {
     if (action === 'refresh') {
       await selectPubmedSearch(search.id);
       await runCurrentPubmedSearch();
+    } else if (action === 'author-identity') {
+      await selectPubmedSearch(search.id);
+      openAuthorIdentityReview();
     } else if (action === 'open-source') {
       const url = buildPubmedSearchUrl(search.query);
       if (url) openUrl(url);
@@ -3312,7 +3568,7 @@ function normalizePubmedEntry(entry) {
     id: entry.entry_id,
     author: entry.authors,
     source: entry.journal,
-    published_at: entry.publication_date || entry.publication_date_raw || null,
+    published_at: entry.publication_date || entry.publication_date_raw || entry.published_at || null,
     link: pmid ? `https://pubmed.ncbi.nlm.nih.gov/${pmid}/` : '',
     guid: pmid ? `pubmed:${pmid}` : `entry:${entry.entry_id}`,
     feed_id: null,
@@ -3328,9 +3584,9 @@ function entryMatchesLiteratureSearchQuery(entry, query) {
   const tags = Array.isArray(entry.tags) ? entry.tags : [];
   const haystack = [
     entry.title,
-    entry.translated_title,
+    entry.title_translated,
     entry.summary,
-    entry.translated_summary,
+    entry.summary_translated,
     entry.author,
     entry.authors,
     entry.source,
@@ -3363,12 +3619,352 @@ async function selectPubmedSearch(searchId) {
   try {
     const entries = await invoke('list_pubmed_search_entries', { searchId: search.id });
     allEntries = entries.map(normalizePubmedEntry);
+    await hydrateAuthorIdentityState(search.id);
     refreshEntryTagFilterOptions(allEntries);
     renderEntryList(allEntries);
     refreshPaperChatAfterScopeDataChange();
   } catch (e) {
     entryItemsEl.innerHTML = `<li class="entry-empty">加载检索结果失败: ${escapeHtml(String(e))}</li>`;
   }
+}
+
+function isAuthorPubmedSearch(search = currentPubmedSearch) {
+  if (!search) return false;
+  const name = String(search.name || '');
+  const question = String(search.question || '');
+  return /【作者\s*[|｜]/i.test(name)
+    || /持续关注作者|作者\s+.+?的\s*PubMed\s*文献/i.test(question);
+}
+
+function authorIdentityStorageKey(searchId) {
+  return `${AUTHOR_IDENTITY_STORAGE_PREFIX}-${searchId}`;
+}
+
+function normalizeAuthorIdentityState(value = {}) {
+  const ids = key => Array.isArray(value[key]) ? [...new Set(value[key].map(Number).filter(Number.isFinite))] : [];
+  const aliases = new Map();
+  (Array.isArray(value.affiliationAliases) ? value.affiliationAliases : []).forEach(item => {
+    const label = String(item || '').trim().slice(0, 300);
+    if (label) aliases.set(label.toLocaleLowerCase(), label);
+  });
+  return {
+    seedIds: ids('seedIds'),
+    confirmedIds: ids('confirmedIds'),
+    likelyIds: ids('likelyIds'),
+    reviewIds: ids('reviewIds'),
+    sameNameIds: ids('sameNameIds'),
+    affiliationAliases: [...aliases.values()].slice(0, 50),
+    decisions: value.decisions && typeof value.decisions === 'object' ? value.decisions : {},
+  };
+}
+
+function loadAuthorIdentityState(searchId) {
+  if (authorIdentityStateCache.has(Number(searchId))) {
+    return normalizeAuthorIdentityState(authorIdentityStateCache.get(Number(searchId)));
+  }
+  try {
+    const value = JSON.parse(localStorage.getItem(authorIdentityStorageKey(searchId)) || '{}');
+    return normalizeAuthorIdentityState(value);
+  } catch (_) {
+    return normalizeAuthorIdentityState();
+  }
+}
+
+async function hydrateAuthorIdentityState(searchId) {
+  try {
+    const stateJson = await invoke('get_pubmed_author_identity_state', { searchId });
+    if (stateJson) {
+      const state = normalizeAuthorIdentityState(JSON.parse(stateJson));
+      authorIdentityStateCache.set(Number(searchId), state);
+      localStorage.setItem(authorIdentityStorageKey(searchId), JSON.stringify(state));
+      return state;
+    }
+  } catch (error) {
+    console.warn('读取作者身份状态失败，使用本机缓存', error);
+  }
+  const legacy = loadAuthorIdentityState(searchId);
+  authorIdentityStateCache.set(Number(searchId), legacy);
+  if (legacy.seedIds.length) {
+    try {
+      await invoke('save_pubmed_author_identity_state', { searchId, stateJson: JSON.stringify(legacy) });
+    } catch (_) { /* 旧版应用仍使用本机缓存 */ }
+  }
+  return legacy;
+}
+
+async function saveAuthorIdentityState(searchId, value) {
+  const state = normalizeAuthorIdentityState(value);
+  authorIdentityStateCache.set(Number(searchId), state);
+  localStorage.setItem(authorIdentityStorageKey(searchId), JSON.stringify(state));
+  await invoke('save_pubmed_author_identity_state', {
+    searchId,
+    stateJson: JSON.stringify(state),
+  });
+}
+
+function authorIdentityFingerprint(entries = allEntries, state = null) {
+  if (!isAuthorPubmedSearch() || !currentPubmedSearch) return null;
+  const identityState = state || loadAuthorIdentityState(currentPubmedSearch.id);
+  const identity = extractAuthorSearchIdentity(currentPubmedSearch);
+  const trustedIds = [...new Set([...identityState.seedIds, ...identityState.confirmedIds])];
+  return buildAuthorFingerprint(
+    entries,
+    trustedIds,
+    identity?.authorName || '',
+    currentPubmedSearch.query,
+    [identity?.affiliation || '', ...identityState.affiliationAliases],
+  );
+}
+
+function authorIdentityClusters(entries = allEntries) {
+  if (!isAuthorPubmedSearch() || !currentPubmedSearch) return [];
+  const state = loadAuthorIdentityState(currentPubmedSearch.id);
+  const fingerprint = authorIdentityFingerprint(entries, state);
+  return fingerprint ? buildAuthorIdentityClusters(entries, fingerprint, state.decisions) : [];
+}
+
+function authorIdentityStatusMap(entries = allEntries) {
+  const statuses = new Map();
+  authorIdentityClusters(entries).forEach(cluster => {
+    cluster.entries.forEach(entry => statuses.set(Number(entry.id), cluster.status));
+  });
+  return statuses;
+}
+
+function authorIdentityGroupLabel(index) {
+  let value = Number(index) + 1;
+  let label = '';
+  while (value > 0) {
+    value -= 1;
+    label = String.fromCharCode(65 + (value % 26)) + label;
+    value = Math.floor(value / 26);
+  }
+  return label;
+}
+
+async function applyAuthorIdentityClusterStatus(searchId, cluster, status) {
+  const next = loadAuthorIdentityState(searchId);
+  const ids = cluster.entries.map(entry => Number(entry.id));
+  ['confirmedIds', 'likelyIds', 'reviewIds', 'sameNameIds'].forEach(key => {
+    next[key] = next[key].filter(id => !ids.includes(id));
+  });
+  const destination = {
+    confirmed: 'confirmedIds', likely: 'likelyIds', review: 'reviewIds', same_name: 'sameNameIds',
+  }[status];
+  if (destination) next[destination] = [...new Set([...next[destination], ...ids])];
+  if (status === 'confirmed') {
+    next.affiliationAliases = [
+      ...next.affiliationAliases,
+      ...(cluster.affiliation && cluster.affiliation !== '单位信息不足' ? [cluster.affiliation] : []),
+    ];
+  }
+  next.decisions[cluster.key] = status;
+  await saveAuthorIdentityState(searchId, next);
+
+  const screeningStatus = { confirmed: 'keep', likely: 'keep', review: 'maybe', same_name: 'exclude' }[status];
+  await invoke('bulk_set_pubmed_screening_status', { searchId, entryIds: ids, status: screeningStatus });
+  allEntries.forEach(entry => {
+    if (ids.includes(Number(entry.id))) entry.screening_status = screeningStatus;
+  });
+  await loadPubmedSearches();
+}
+
+async function openAuthorIdentityReview() {
+  if (!currentPubmedSearch || !isAuthorPubmedSearch()) return;
+  const searchId = currentPubmedSearch.id;
+  await hydrateAuthorIdentityState(searchId);
+  const state = loadAuthorIdentityState(searchId);
+  const identity = extractAuthorSearchIdentity(currentPubmedSearch);
+  const seedCandidates = recommendAuthorSeedCandidates(
+    allEntries,
+    identity?.authorName || '',
+    currentPubmedSearch.query,
+    [identity?.affiliation || '', ...state.affiliationAliases],
+  );
+  const fingerprint = authorIdentityFingerprint(allEntries, state);
+  const stability = assessAuthorFingerprintStability(fingerprint);
+  const clusters = authorIdentityClusters();
+  const counts = { confirmed: 0, likely: 0, review: 0, same_name: 0 };
+  clusters.forEach(cluster => { counts[cluster.status] += cluster.entries.length; });
+  const currentSelection = selectedEntryIds.size >= 1 && selectedEntryIds.size <= 10
+    ? [...selectedEntryIds]
+    : [];
+  const initialSeedIds = state.seedIds.length
+    ? state.seedIds
+    : currentSelection.length
+      ? currentSelection
+      : seedCandidates.filter(item => item.recommended).map(item => Number(item.entry.id));
+  const modalSeedIds = new Set(initialSeedIds);
+  const overlay = document.createElement('div');
+  overlay.className = 'pubmed-modal';
+  overlay.innerHTML = `
+    <div class="pubmed-modal-backdrop"></div>
+    <section class="pubmed-modal-panel author-identity-panel">
+      <header class="pubmed-modal-header">
+        <div><h2>作者身份分组审核</h2><p>${escapeHtml(currentPubmedSearch.name)} · 宽检索候选 ${allEntries.length} 篇</p></div>
+        <button class="pubmed-modal-close" data-close type="button" aria-label="关闭">×</button>
+      </header>
+      <div class="author-identity-summary">
+        <strong>全部候选 ${allEntries.length}</strong>
+        ${Object.entries(AUTHOR_IDENTITY_META).map(([key, meta]) => `<span class="author-identity-count ${meta.className}">${meta.label} ${counts[key]}</span>`).join('')}
+      </div>
+      <div class="author-affiliation-aliases">
+        <strong>单位写法</strong>
+        ${identity?.affiliation ? `<span class="author-affiliation-chip primary" title="${escapeHtml(identity.affiliation)}"><b>主单位</b>${escapeHtml(identity.affiliation)}</span>` : ''}
+        ${state.affiliationAliases.map(alias => `<span class="author-affiliation-chip" title="${escapeHtml(alias)}">${escapeHtml(alias)}<button type="button" data-remove-affiliation-alias="${escapeHtml(alias)}" aria-label="删除单位别名" title="删除单位别名">×</button></span>`).join('')}
+        <span class="author-affiliation-editor"><input type="text" data-affiliation-alias-input maxlength="300" placeholder="添加英文名、简称或旧称"><button type="button" data-add-affiliation-alias>添加</button></span>
+      </div>
+      <div class="author-identity-actions">
+        <button class="btn btn-primary" data-use-seeds type="button">用选中的 ${modalSeedIds.size} 篇建立作者指纹</button>
+        <button class="btn btn-secondary" data-clear-seeds type="button" ${state.seedIds.length ? '' : 'disabled'}>重新选择种子论文</button>
+        ${state.seedIds.length
+          ? `<span class="author-fingerprint-stability ${stability.level}">指纹稳定度 ${stability.score} · ${stability.label}${stability.missing.length ? ` · 待补：${escapeHtml(stability.missing.join('、'))}` : ''}</span>`
+          : `<span>系统推荐 ${seedCandidates.filter(item => item.recommended).length} 篇，最多可确认 10 篇</span>`}
+      </div>
+      ${!state.seedIds.length ? `<div class="author-seed-picker">
+        <div class="author-seed-picker-header"><strong>推荐种子候选</strong><span>确认属于目标作者的论文</span></div>
+        ${seedCandidates.map(item => {
+          const entry = item.entry;
+          const year = String(entry.publication_date || entry.publication_date_raw || entry.published_at || '').match(/\b(19|20)\d{2}\b/)?.[0] || '年份未知';
+          return `<label class="author-seed-candidate">
+            <input type="checkbox" data-seed-entry="${Number(entry.id)}" ${modalSeedIds.has(Number(entry.id)) ? 'checked' : ''}>
+            <span class="author-seed-candidate-main"><strong>${escapeHtml(entry.title)}</strong><span>${escapeHtml(year)} · ${escapeHtml(entry.affiliation || entry.authors || '单位信息不足')}</span></span>
+            <span class="author-seed-candidate-evidence">${item.recommended ? '<b>推荐</b>' : ''}<span>${item.score} · ${escapeHtml(item.reasons.join('、'))}</span></span>
+          </label>`;
+        }).join('') || '<div class="author-identity-empty">当前候选缺少足够的作者信息，请补充 PMID、DOI 或已知论文标题。</div>'}
+      </div>` : ''}
+      <div class="author-identity-list">
+        ${clusters.length ? `<div class="author-identity-grid author-identity-grid-header">
+          <span>作者身份组</span><span>文献数</span><span>主要单位</span><span>常见共同作者</span><span>研究方向</span><span>判断</span>
+        </div>${clusters.map((cluster, index) => {
+          const meta = AUTHOR_IDENTITY_META[cluster.status];
+          return `<details class="author-identity-group" data-cluster-key="${escapeHtml(cluster.key)}">
+            <summary class="author-identity-grid">
+              <strong>组 ${authorIdentityGroupLabel(index)}</strong>
+              <span>${cluster.entries.length}</span>
+              <span title="${escapeHtml(cluster.affiliation)}">${escapeHtml(cluster.affiliation)}</span>
+              <span>${escapeHtml(cluster.coauthors.join('、') || '信息不足')}</span>
+              <span>${escapeHtml(cluster.topics.join('、') || '信息不足')}</span>
+              <span class="author-identity-judgment"><span class="author-identity-badge ${meta.className}">${meta.label}</span></span>
+            </summary>
+            <div class="author-identity-group-review">
+              <div class="author-identity-group-note">置信度 ${cluster.score} · ${escapeHtml(cluster.reasons.join('、'))} · ${cluster.years.length ? `${cluster.years[0]}–${cluster.years.at(-1)}` : '年份未知'}</div>
+              <div class="author-identity-paper-header"><span>年份</span><span>标题</span><span>单位 / 作者</span><span>匹配证据</span><span>状态</span></div>
+              ${cluster.entries.slice(0, 12).map((entry, entryIndex) => {
+                const assessment = cluster.assessments[entryIndex];
+                const itemMeta = AUTHOR_IDENTITY_META[assessment.status];
+                const year = String(entry.publication_date || entry.publication_date_raw || entry.published_at || '').match(/\b(19|20)\d{2}\b/)?.[0] || '—';
+                return `<div class="author-identity-paper-row"><span>${year}</span><strong>${escapeHtml(entry.title)}</strong><span>${escapeHtml(entry.affiliation || entry.authors || '信息不足')}</span><span>${escapeHtml(assessment.reasons.join('、'))}</span><span class="author-identity-badge ${itemMeta.className}">${itemMeta.label}</span></div>`;
+              }).join('')}
+              ${cluster.entries.length > 12 ? `<div class="author-identity-more">另有 ${cluster.entries.length - 12} 篇，将随身份组一并处理</div>` : ''}
+              <div class="author-identity-row-actions">
+                <button type="button" data-status="confirmed">确认作者</button>
+                <button type="button" data-status="likely">高度可能</button>
+                <button type="button" data-status="review">需要确认</button>
+                <button type="button" data-status="same_name">同名作者</button>
+              </div>
+            </div>
+          </details>`;
+        }).join('')}` : '<div class="author-identity-empty">确认推荐种子后，系统将在这里按作者身份组整理全部候选。</div>'}
+      </div>
+      <footer class="pubmed-modal-footer"><button class="btn btn-secondary" data-close type="button">关闭</button></footer>
+    </section>`;
+  const close = () => overlay.remove();
+  overlay.querySelectorAll('[data-close], .pubmed-modal-backdrop').forEach(element => element.addEventListener('click', close));
+  const aliasInput = overlay.querySelector('[data-affiliation-alias-input]');
+  const addAffiliationAlias = async () => {
+    const alias = aliasInput?.value.trim();
+    if (!alias) return;
+    const known = [identity?.affiliation || '', ...state.affiliationAliases]
+      .some(value => value.trim().toLocaleLowerCase() === alias.toLocaleLowerCase());
+    if (known) {
+      setGlobalStatus('这个单位写法已经存在', 'error');
+      return;
+    }
+    if (state.affiliationAliases.length >= 50) {
+      setGlobalStatus('单位别名最多保存 50 个', 'error');
+      return;
+    }
+    await saveAuthorIdentityState(searchId, {
+      ...state,
+      affiliationAliases: [...state.affiliationAliases, alias],
+    });
+    close();
+    renderEntryList(allEntries);
+    await openAuthorIdentityReview();
+  };
+  overlay.querySelector('[data-add-affiliation-alias]')?.addEventListener('click', addAffiliationAlias);
+  aliasInput?.addEventListener('keydown', event => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      addAffiliationAlias();
+    }
+  });
+  overlay.querySelectorAll('[data-remove-affiliation-alias]').forEach(button => {
+    button.addEventListener('click', async () => {
+      const alias = button.dataset.removeAffiliationAlias;
+      await saveAuthorIdentityState(searchId, {
+        ...state,
+        affiliationAliases: state.affiliationAliases.filter(value => value !== alias),
+      });
+      close();
+      renderEntryList(allEntries);
+      await openAuthorIdentityReview();
+    });
+  });
+  const seedButton = overlay.querySelector('[data-use-seeds]');
+  const updateSeedButton = () => {
+    seedButton.textContent = `用选中的 ${modalSeedIds.size} 篇建立作者指纹`;
+    seedButton.disabled = modalSeedIds.size < 1 || modalSeedIds.size > 10;
+  };
+  overlay.querySelectorAll('[data-seed-entry]').forEach(checkbox => {
+    checkbox.addEventListener('change', () => {
+      const entryId = Number(checkbox.dataset.seedEntry);
+      if (checkbox.checked && modalSeedIds.size >= 10) {
+        checkbox.checked = false;
+        setGlobalStatus('种子论文最多选择 10 篇', 'error');
+        return;
+      }
+      if (checkbox.checked) modalSeedIds.add(entryId);
+      else modalSeedIds.delete(entryId);
+      updateSeedButton();
+    });
+  });
+  updateSeedButton();
+  overlay.querySelector('[data-use-seeds]')?.addEventListener('click', async () => {
+    await saveAuthorIdentityState(searchId, {
+      seedIds: [...modalSeedIds], confirmedIds: [], likelyIds: [], reviewIds: [], sameNameIds: [], decisions: {},
+    });
+    close();
+    renderEntryList(allEntries);
+    await openAuthorIdentityReview();
+  });
+  overlay.querySelector('[data-clear-seeds]')?.addEventListener('click', async () => {
+    await saveAuthorIdentityState(searchId, normalizeAuthorIdentityState());
+    close();
+    renderEntryList(allEntries);
+    await openAuthorIdentityReview();
+  });
+  overlay.querySelectorAll('[data-cluster-key] [data-status]').forEach(button => {
+    button.addEventListener('click', async event => {
+      event.preventDefault();
+      event.stopPropagation();
+      const key = button.closest('[data-cluster-key]').dataset.clusterKey;
+      const cluster = clusters.find(item => item.key === key);
+      if (!cluster) return;
+      button.disabled = true;
+      try {
+        await applyAuthorIdentityClusterStatus(searchId, cluster, button.dataset.status);
+        close();
+        renderEntryList(allEntries);
+        await openAuthorIdentityReview();
+      } catch (error) {
+        button.disabled = false;
+        setGlobalStatus(`保存身份组判断失败: ${error}`, 'error');
+      }
+    });
+  });
+  document.body.appendChild(overlay);
 }
 
 async function enterKeptMode(options = {}) {
@@ -3582,7 +4178,6 @@ function captureLiteratureSearchRestoreState() {
     entryFilterValue,
     pubmedSearchId: pubmedScope?.id || null,
     pubmedSearchName: pubmedScope?.name || '',
-    pubmedEntries: pubmedScope ? [...allEntries] : null,
     selectedBriefingId,
   };
 }
@@ -3617,9 +4212,6 @@ async function runLiteratureSearch(query) {
   const requestId = ++literatureSearchRequestId;
   const restore = literatureSearchRestoreState;
   const searchPubmedId = restore?.mode === 'pubmed' ? restore.pubmedSearchId : null;
-  const searchPubmedEntries = searchPubmedId && Array.isArray(restore?.pubmedEntries)
-    ? restore.pubmedEntries
-    : null;
   const searchFeedId = searchPubmedId ? null : (selectedFeedId || null);
   enterLiteratureSearchMode({ preservePubmedSearch: !!searchPubmedId });
   entryItemsEl.innerHTML = '<li class="entry-empty">正在检索…</li>';
@@ -3629,9 +4221,11 @@ async function runLiteratureSearch(query) {
     : (feed ? (feed.title || feed.url || '当前订阅源') : entryFilterLabel(entryFilterValue));
   toolbarSubtitle.innerHTML = `<span>检索</span><span class="ts-meta">·</span><span class="ts-tertiary">${escapeHtml(scopeLabel)} · ${escapeHtml(query)}</span>`;
   try {
-    const entries = searchPubmedEntries
-      ? searchPubmedEntries.filter(entry => entryMatchesLiteratureSearchQuery(entry, query))
-      : await invoke('search_entries', { query, feedId: searchFeedId });
+    const entries = await invoke('search_entries', {
+      query,
+      feedId: searchFeedId,
+      pubmedSearchId: searchPubmedId,
+    });
     const activeRestore = literatureSearchRestoreState;
     if (
       requestId !== literatureSearchRequestId ||
@@ -3872,13 +4466,17 @@ async function addFeed() {
 let feedAddMode = 'url';
 
 function setFeedAddMode(nextMode) {
-  feedAddMode = nextMode === 'author' ? 'author' : 'url';
+  if (nextMode === 'pubmed') {
+    closeFeedAddModal();
+    openPubmedSearchModal({ creationTarget: 'feed' });
+    return;
+  }
+  feedAddMode = 'url';
   document.querySelectorAll('[data-feed-add-mode]').forEach(button => {
     button.classList.toggle('active', button.dataset.feedAddMode === feedAddMode);
   });
   document.getElementById('feed-add-url-builder')?.classList.toggle('hidden', feedAddMode !== 'url');
-  document.getElementById('feed-add-author-builder')?.classList.toggle('hidden', feedAddMode !== 'author');
-  document.getElementById('btn-create-feed').textContent = feedAddMode === 'author' ? '创建并添加' : '添加订阅';
+  document.getElementById('btn-create-feed').textContent = '添加订阅';
   syncFeedAddModalState();
 }
 
@@ -3887,12 +4485,6 @@ function openFeedAddModal() {
   const input = document.getElementById('feed-add-url');
   if (!modal || !input) return;
   input.value = '';
-  document.getElementById('feed-author-name').value = '';
-  document.getElementById('feed-author-affiliation').value = '';
-  document.getElementById('feed-author-start-date').value = '';
-  document.getElementById('feed-author-end-date').value = '';
-  document.getElementById('feed-author-limit').value = '15';
-  document.getElementById('feed-author-title').value = '';
   document.getElementById('feed-add-status').textContent = '';
   setFeedAddMode('url');
   modal.classList.remove('hidden');
@@ -3907,10 +4499,7 @@ function syncFeedAddModalState({ clearStatus = true } = {}) {
   const input = document.getElementById('feed-add-url');
   const button = document.getElementById('btn-create-feed');
   if (!input || !button) return;
-  const hasRequiredValue = feedAddMode === 'author'
-    ? !!document.getElementById('feed-author-name')?.value.trim()
-    : !!input.value.trim();
-  button.disabled = !hasRequiredValue;
+  button.disabled = !input.value.trim();
   if (clearStatus) document.getElementById('feed-add-status').textContent = '';
 }
 
@@ -3919,41 +4508,20 @@ async function createFeedFromModal() {
   const button = document.getElementById('btn-create-feed');
   const status = document.getElementById('feed-add-status');
   const url = input?.value.trim() || '';
-  const authorName = document.getElementById('feed-author-name')?.value.trim() || '';
-  if (!button || !status || (feedAddMode === 'url' ? !url : !authorName)) return;
+  if (!button || !status || !url) return;
 
   button.disabled = true;
-  button.textContent = feedAddMode === 'author' ? '正在创建…' : '正在添加…';
+  button.textContent = '正在添加…';
   status.textContent = '';
   try {
-    if (feedAddMode === 'author') {
-      status.textContent = 'AI 正在识别作者和机构并构建检索式…';
-      const query = await invoke('build_pubmed_author_query', {
-        authorName,
-        affiliation: document.getElementById('feed-author-affiliation').value.trim() || null,
-        startDate: document.getElementById('feed-author-start-date').value || null,
-        endDate: document.getElementById('feed-author-end-date').value || null,
-      });
-      loadCostSummary();
-      const pubmedLimit = clampPubmedLimit(document.getElementById('feed-author-limit').value);
-      status.textContent = '正在生成 PubMed RSS…';
-      const generatedUrl = await invoke('build_pubmed_rss_url', { query, limit: pubmedLimit });
-      const customTitle = document.getElementById('feed-author-title').value.trim();
-      await persistNewFeed(generatedUrl, {
-        title: customTitle || `${authorName} 文献`,
-        pubmedQuery: query,
-        pubmedLimit,
-      });
-    } else {
-      await persistNewFeed(url);
-    }
+    await persistNewFeed(url);
     closeFeedAddModal();
     setGlobalStatus('订阅源已添加', 'success');
   } catch (e) {
     status.textContent = `添加失败：${e}`;
-    (feedAddMode === 'author' ? document.getElementById('feed-author-name') : input)?.focus();
+    input?.focus();
   } finally {
-    button.textContent = feedAddMode === 'author' ? '创建并添加' : '添加订阅';
+    button.textContent = '添加订阅';
     syncFeedAddModalState({ clearStatus: false });
   }
 }
@@ -4214,7 +4782,7 @@ async function refreshFeed(feed) {
     const result = await invoke('fetch_feed', { feedId: feed.id });
     const first = Array.isArray(result.feeds) ? result.feeds[0] : null;
     let msg = `「${feedName}」更新完成`;
-    if ((first?.new_entries || 0) > 0) msg += `，新增 ${first.new_entries} 篇 · 正在自动翻译…`;
+    if ((first?.new_entries || 0) > 0) msg += `，新增 ${first.new_entries} 篇`;
     else msg += '，没有新文章';
     if (result.errors?.length) msg += `，${result.errors.length} 个问题`;
     setGlobalStatus(msg, result.errors?.length ? 'error' : 'success');
@@ -4354,7 +4922,7 @@ function getFilteredEntries(entries = allEntries) {
 
 function getFilteredPubmedEntries(entries = allEntries) {
   let filtered = [...entries];
-  const query = literatureSearchInput?.value.trim() || '';
+  const query = mode === 'search' ? '' : (literatureSearchInput?.value.trim() || '');
   if (query) filtered = filtered.filter(entry => entryMatchesLiteratureSearchQuery(entry, query));
   const stars = starredIds();
   if (entryFilterValue === 'unread') filtered = filtered.filter(e => !e.is_read);
@@ -4605,6 +5173,7 @@ function syncEntryBulkActions() {
   if (pubmedBulkStatus) pubmedBulkStatus.disabled = count === 0;
   btnPubmedAiScreen?.classList.toggle('hidden', !pubmedBatchMode || !entrySelectionMode);
   if (btnPubmedAiScreen) btnPubmedAiScreen.disabled = count === 0;
+  btnPubmedAuthorIdentity?.classList.toggle('hidden', !pubmedBatchMode || !isAuthorPubmedSearch());
   if (currentEntry) refreshPaperChatScopeControls();
 }
 
@@ -6618,6 +7187,13 @@ async function loadEntries(feedId) {
   try {
     clearEntrySelection({ render: false, syncPaperChat: false });
     allEntries = await invoke('list_entries', { feedId: feedId || null });
+    if (feedId != null) {
+      const states = await invoke('list_feed_screening_states', { feedId });
+      allEntries = allEntries.map(entry => ({
+        ...entry,
+        ...(states?.[entry.id] || {}),
+      }));
+    }
     refreshEntryTagFilterOptions(allEntries);
     syncEntryBulkActions();
     renderEntryList(allEntries);
@@ -6627,8 +7203,354 @@ async function loadEntries(feedId) {
   }
 }
 
+function currentScreeningTableScope() {
+  if (mode === 'pubmed' && currentPubmedSearch?.id) {
+    return { scopeKind: 'pubmed', scopeId: Number(currentPubmedSearch.id) };
+  }
+  if (mode === 'feed' && selectedFeedId) {
+    return { scopeKind: 'feed', scopeId: Number(selectedFeedId) };
+  }
+  return null;
+}
+
+function screeningTableFilters(scopeKey = '') {
+  const filters = {};
+  const query = screeningTableSearchQueries.get(scopeKey)?.trim();
+  if (query) filters.query = query;
+  if (mode === 'pubmed' && pubmedFilters.status && pubmedFilters.status !== 'all') {
+    filters.screeningStatus = pubmedFilters.status;
+  }
+  if (entryFilterValue === 'unread') filters.read = false;
+  if (entryFilterValue === 'starred') filters.starred = true;
+  if (entryFilterValue === 'reading-notes') filters.hasReadingNote = true;
+  if (pubmedFilters.star === 'starred') filters.starred = true;
+  if (pubmedFilters.star === 'unstarred') filters.starred = false;
+  if (pubmedFilters.publishedFrom) filters.publishedFrom = pubmedFilters.publishedFrom;
+  if (pubmedFilters.publishedTo) filters.publishedTo = pubmedFilters.publishedTo;
+  const metricIf = entryMetricFilters.if;
+  if (metricIf === 'ge5') filters.minImpactFactor = 5;
+  if (metricIf === 'ge10') filters.minImpactFactor = 10;
+  if (metricIf === 'ge20') filters.minImpactFactor = 20;
+  if (entryMetricFilters.q !== 'all' && entryMetricFilters.q !== 'na') filters.q = [entryMetricFilters.q];
+  if (entryMetricFilters.b !== 'all' && entryMetricFilters.b !== 'na') filters.b = [entryMetricFilters.b];
+  if (entryMetricFilters.top === 'top') filters.top = true;
+  if (entryMetricFilters.top === 'non-top') filters.top = false;
+  if (entryTagFilterValue !== 'all') filters.tags = [entryTagFilterValue];
+  if (standaloneScreeningLaunchFilters) Object.assign(filters, standaloneScreeningLaunchFilters);
+  if (query) filters.query = query;
+  return filters;
+}
+
+function screeningTableSorts(config) {
+  return (config.sorts || []).map(sort => ({
+    field: sort.field === 'publicationDate' ? 'publication' : sort.field,
+    direction: sort.direction === 'asc' ? 'asc' : 'desc',
+  }));
+}
+
+async function loadScreeningTableConfig(scope) {
+  const key = screeningScopeKey(scope.scopeKind, scope.scopeId);
+  if (screeningTableConfigs.has(key)) return screeningTableConfigs.get(key);
+  let config = defaultScreeningTableConfig();
+  try {
+    const saved = await invoke('get_screening_table_preferences', scope);
+    if (saved?.configJson) config = normalizeScreeningTableConfig(JSON.parse(saved.configJson));
+  } catch (error) {
+    console.warn('读取初筛表格配置失败，使用默认配置', error);
+  }
+  if (config.searchQuery && !screeningTableSearchQueries.has(key)) {
+    screeningTableSearchQueries.set(key, config.searchQuery);
+  }
+  screeningTableConfigs.set(key, config);
+  return config;
+}
+
+async function saveScreeningTableConfig(scope, config) {
+  const key = screeningScopeKey(scope.scopeKind, scope.scopeId);
+  const normalized = normalizeScreeningTableConfig(config);
+  screeningTableConfigs.set(key, normalized);
+  try {
+    await invoke('save_screening_table_preferences', {
+      ...scope,
+      schemaVersion: SCREENING_TABLE_SCHEMA_VERSION,
+      configJson: JSON.stringify(normalized),
+    });
+  } catch (error) {
+    console.warn('保存初筛表格配置失败', error);
+  }
+}
+
+async function exportScreeningTable() {
+  const scope = currentScreeningTableScope();
+  const dialog = window.__TAURI__?.dialog;
+  if (!scope || !dialog) return setGlobalStatus('当前范围不支持初筛 Excel 导出', 'error');
+  const path = await dialog.save({
+    title: '导出初筛 Excel',
+    defaultPath: `${safeExportFileName(currentPubmedSearch?.name || 'RSS初筛')}-screening.xlsx`,
+    filters: [{ name: 'Excel', extensions: ['xlsx'] }],
+  });
+  if (!path) return;
+  try {
+    const config = await loadScreeningTableConfig(scope);
+    const report = await invoke('export_screening_xlsx', {
+      path,
+      ...scope,
+      selection: {
+        mode: 'allFiltered',
+        filters: screeningTableFilters(screeningScopeKey(scope.scopeKind, scope.scopeId)),
+        excludedEntryIds: [],
+      },
+      sorts: screeningTableSorts(config),
+    });
+    setGlobalStatus(`初筛 Excel 已导出：${report.articleCount} 篇`, 'success');
+  } catch (error) {
+    setGlobalStatus(`导出初筛 Excel 失败：${error}`, 'error');
+  }
+}
+
+function screeningImportReview(preview) {
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.className = 'screening-import-review';
+    const conflicts = (preview.candidates || []).flatMap(candidate => (candidate.conflicts || []).map(conflict => ({ ...conflict, entryId: candidate.entryId })));
+    overlay.innerHTML = `<div class="screening-import-review-backdrop"></div><section class="screening-import-review-panel" role="dialog" aria-modal="true">
+      <header><h2>初筛 Excel 导入预览</h2><p>共 ${preview.articleCount || 0} 篇，冲突 ${conflicts.length} 个；阅读笔记不会被覆盖。</p></header>
+      ${preview.issues?.length ? `<div class="screening-import-issues">${preview.issues.map(issue => `<div>${escapeHtml(issue)}</div>`).join('')}</div>` : ''}
+      <div class="screening-import-conflicts">${conflicts.length ? conflicts.map((conflict, index) => `<label class="screening-import-conflict"><span>文章 ${conflict.entryId} · ${escapeHtml(conflict.field)}<small>Cento：${escapeHtml(conflict.current)} / Excel：${escapeHtml(conflict.excel)}</small></span><select data-conflict-index="${index}"><option value="cento">保留 Cento</option><option value="excel">采用 Excel</option></select></label>`).join('') : '<div class="entry-empty">没有字段冲突，可以直接应用。</div>'}</div>
+      <footer><button type="button" class="btn btn-secondary" data-screening-import-cancel>取消</button><button type="button" class="btn btn-primary" data-screening-import-apply>应用导入</button></footer>
+    </section>`;
+    const finish = value => { overlay.remove(); resolve(value); };
+    overlay.querySelector('.screening-import-review-backdrop').addEventListener('click', () => finish(null));
+    overlay.querySelector('[data-screening-import-cancel]').addEventListener('click', () => finish(null));
+    overlay.querySelector('[data-screening-import-apply]').addEventListener('click', () => {
+      const resolutions = {};
+      conflicts.forEach((conflict, index) => {
+        const value = overlay.querySelector(`[data-conflict-index="${index}"]`)?.value || 'cento';
+        resolutions[`${conflict.entryId}:${conflict.field}`] = value;
+      });
+      finish(resolutions);
+    });
+    document.body.appendChild(overlay);
+  });
+}
+
+async function importScreeningTable() {
+  const scope = currentScreeningTableScope();
+  const dialog = window.__TAURI__?.dialog;
+  if (!scope || !dialog) return setGlobalStatus('当前范围不支持初筛 Excel 导入', 'error');
+  const selected = await dialog.open({ title: '选择初筛 Excel', multiple: false, filters: [{ name: 'Excel', extensions: ['xlsx'] }] });
+  const path = Array.isArray(selected) ? selected[0] : selected;
+  if (!path) return;
+  try {
+    const preview = await invoke('preview_screening_xlsx_import', { path, ...scope });
+    const resolutions = await screeningImportReview(preview);
+    if (!resolutions) return;
+    const report = await invoke('apply_screening_xlsx_import', {
+      ...scope,
+      candidates: preview.candidates || [],
+      resolutions,
+    });
+    setGlobalStatus(`初筛 Excel 导入完成：更新 ${report.updatedEntries} 篇、${report.updatedFields} 个字段`, 'success');
+    if (scope.scopeKind === 'feed') await loadEntries(scope.scopeId);
+    else await selectPubmedSearch(scope.scopeId);
+    refreshScreeningTable();
+  } catch (error) {
+    setGlobalStatus(`导入初筛 Excel 失败：${error}`, 'error');
+  }
+}
+
+async function refreshScreeningTable() {
+  const scope = currentScreeningTableScope();
+  if (!screeningTableMode || !scope || !screeningTableEl) return;
+  const requestId = ++screeningTableRequestId;
+  const config = await loadScreeningTableConfig(scope);
+  const scopeKey = screeningScopeKey(scope.scopeKind, scope.scopeId);
+  const offset = screeningTableOffsets.get(scopeKey) || 0;
+  try {
+    const page = await invoke('query_screening_scope', {
+      request: {
+        ...scope,
+        offset,
+        limit: 500,
+        filters: screeningTableFilters(scopeKey),
+        sorts: screeningTableSorts(config),
+      },
+    });
+    if (requestId !== screeningTableRequestId) return;
+    if (offset > 0 && page.total > 0 && !page.rows.length) {
+      screeningTableOffsets.set(scopeKey, 0);
+      refreshScreeningTable();
+      return;
+    }
+    renderScreeningTable(screeningTableEl, page, config, {
+      escapeHtml,
+      searchQuery: screeningTableSearchQueries.get(scopeKey) || '',
+      onSelect: row => {
+        const entry = allEntries.find(item => Number(item.id) === Number(row.entryId));
+        if (entry) showDetail(entry);
+      },
+      onStar: async row => {
+        await toggleStar(row.entryId);
+        refreshScreeningTable();
+      },
+      onStatus: async (row, status) => {
+        const entry = allEntries.find(item => Number(item.id) === Number(row.entryId));
+        if (!entry) return;
+        if (mode === 'pubmed') await updatePubmedScreeningStatus(entry, status);
+        else await updateEntryScreeningStatus(entry, status);
+        refreshScreeningTable();
+      },
+      onSort: async field => {
+        const next = toggleScreeningTableSort(config, field);
+        screeningTableOffsets.set(scopeKey, 0);
+        await saveScreeningTableConfig(scope, next);
+        refreshScreeningTable();
+      },
+      onConfigChange: async next => {
+        await saveScreeningTableConfig(scope, next);
+        refreshScreeningTable();
+      },
+      onExport: exportScreeningTable,
+      onImport: importScreeningTable,
+      onPageChange: nextOffset => {
+        screeningTableOffsets.set(scopeKey, Math.max(0, nextOffset));
+        refreshScreeningTable();
+      },
+      onSearch: query => {
+        screeningTableSearchQueries.set(scopeKey, query);
+        screeningTableOffsets.set(scopeKey, 0);
+        clearTimeout(screeningTableSearchTimer);
+        screeningTableSearchTimer = setTimeout(async () => {
+          const latest = screeningTableConfigs.get(scopeKey) || config;
+          await saveScreeningTableConfig(scope, { ...latest, searchQuery: query });
+          refreshScreeningTable();
+        }, 220);
+      },
+      onScroll: scrollTop => {
+        const next = { ...config, scrollTop };
+        saveScreeningTableConfig(scope, next);
+      },
+    });
+  } catch (error) {
+    screeningTableEl.innerHTML = `<div class="entry-empty">加载初筛表格失败: ${escapeHtml(String(error))}</div>`;
+  }
+}
+
+async function setScreeningTableMode(enabled) {
+  if (enabled && !currentScreeningTableScope()) {
+    setGlobalStatus('请先打开一个 PubMed 检索或 RSS 订阅', 'info');
+    return;
+  }
+  screeningTableMode = !!enabled;
+  btnScreeningTableToggle?.setAttribute('aria-pressed', String(screeningTableMode));
+  btnScreeningTableToggle?.classList.toggle('active', screeningTableMode);
+  entryItemsEl?.classList.toggle('hidden', screeningTableMode);
+  screeningTableEl?.classList.toggle('hidden', !screeningTableMode);
+  if (screeningTableMode) await refreshScreeningTable();
+}
+
+function standaloneScreeningScopeFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  const scopeKind = params.get('screeningScope');
+  const scopeId = Number(params.get('screeningId'));
+  if (!['pubmed', 'feed'].includes(scopeKind) || !Number.isInteger(scopeId) || scopeId <= 0) return null;
+  return { scopeKind, scopeId };
+}
+
+function screeningWindowLaunchKey(scope) {
+  return `screening-window-launch-v1:${scope.scopeKind}:${scope.scopeId}`;
+}
+
+async function activateStandaloneScreeningWindow() {
+  const scope = standaloneScreeningScopeFromUrl();
+  if (!scope || !screeningWindowView) return false;
+  document.querySelector('.toolbar')?.classList.add('hidden');
+  settingsView?.classList.add('hidden');
+  mainView?.classList.add('hidden');
+  screeningWindowView.classList.remove('hidden');
+  document.body.classList.add('screening-window-mode');
+  screeningTableMode = true;
+  screeningTableEl = document.getElementById('screening-window-table');
+  try {
+    const launch = JSON.parse(localStorage.getItem(screeningWindowLaunchKey(scope)) || 'null');
+    standaloneScreeningLaunchFilters = launch?.filters || null;
+    if (standaloneScreeningLaunchFilters?.query) {
+      screeningTableSearchQueries.set(
+        screeningScopeKey(scope.scopeKind, scope.scopeId),
+        standaloneScreeningLaunchFilters.query,
+      );
+    }
+  } catch (error) {
+    standaloneScreeningLaunchFilters = null;
+    console.warn('读取初筛工作台启动范围失败', error);
+  }
+  if (scope.scopeKind === 'pubmed') {
+    mode = 'pubmed';
+    currentPubmedSearch = { id: scope.scopeId, name: `PubMed 检索 #${scope.scopeId}` };
+    selectedFeedId = null;
+    try {
+      const searches = await invoke('list_pubmed_searches');
+      const search = (searches || []).find(item => Number(item.id) === scope.scopeId);
+      if (search) currentPubmedSearch = search;
+    } catch (error) {
+      console.warn('读取初筛工作台检索名称失败', error);
+    }
+  } else {
+    mode = 'feed';
+    currentPubmedSearch = null;
+    selectedFeedId = scope.scopeId;
+    try {
+      const feeds = await invoke('list_feeds');
+      const feed = (feeds || []).find(item => Number(item.id) === scope.scopeId);
+      if (feed) screeningWindowSubtitle.textContent = `${feed.title || feed.name || 'RSS 订阅'} · 完整结果初筛`;
+    } catch (error) {
+      console.warn('读取初筛工作台订阅名称失败', error);
+    }
+  }
+  const title = scope.scopeKind === 'pubmed'
+    ? (currentPubmedSearch?.name || 'PubMed 检索初筛')
+    : 'RSS 订阅初筛';
+  if (screeningWindowTitle) screeningWindowTitle.textContent = title;
+  if (screeningWindowSubtitle && scope.scopeKind === 'pubmed') {
+    screeningWindowSubtitle.textContent = `范围 ID：${scope.scopeId} · 可分页查看完整结果`;
+  }
+  btnScreeningWindowClose?.addEventListener('click', () => window.__TAURI__?.window?.getCurrentWindow?.()?.close());
+  await refreshScreeningTable();
+  return true;
+}
+
+async function openStandaloneScreeningWindow() {
+  const scope = currentScreeningTableScope();
+  if (!scope) {
+    setGlobalStatus('请先打开一个 PubMed 检索或 RSS 订阅', 'info');
+    return;
+  }
+  try {
+    const scopeKey = screeningScopeKey(scope.scopeKind, scope.scopeId);
+    const filters = screeningTableFilters(scopeKey);
+    const selectedIds = [...selectedEntryIds].map(Number).filter(Number.isFinite);
+    if (selectedIds.length) filters.entryIds = selectedIds;
+    localStorage.setItem(screeningWindowLaunchKey(scope), JSON.stringify({ filters }));
+    await invoke('open_screening_window', scope);
+    setGlobalStatus('初筛工作台已打开', 'success');
+  } catch (error) {
+    setGlobalStatus(`打开初筛工作台失败：${error}`, 'error');
+  }
+}
+
 function renderEntryList(entries, options = {}) {
   syncCompactFilterSummaries();
+  if (screeningTableMode && !currentScreeningTableScope()) {
+    screeningTableMode = false;
+    btnScreeningTableToggle?.setAttribute('aria-pressed', 'false');
+    btnScreeningTableToggle?.classList.remove('active');
+    entryItemsEl?.classList.remove('hidden');
+    screeningTableEl?.classList.add('hidden');
+  }
+  if (screeningTableMode && currentScreeningTableScope()) {
+    refreshScreeningTable();
+    return;
+  }
   if (mode === 'pubmed' || mode === 'kept' || mode !== 'search') {
     renderPubmedEntryList(entries, options);
     return;
@@ -6672,8 +7594,7 @@ function renderEntryList(entries, options = {}) {
     const source = shortJournalDisplayName(journalName(entry));
 
     // Visual translation status — spinner during work, small error pill on failure.
-    // No "待翻译" tag — translation now runs automatically in the background, so
-    // a pending state is the default; cluttering every entry with a tag would be noise.
+    // No "待翻译" tag. Untranslated text is the default until the user requests translation.
     const isTranslating = entry._titleTranslating || entry._summaryTranslating;
     let tagHtml = '';
     if (entry._transError) tagHtml = ` <span class="entry-tag entry-tag-error">失败</span>`;
@@ -6784,6 +7705,7 @@ function renderPubmedEntryList(entries, options = {}) {
     return;
   }
 
+  const authorIdentityStatuses = isPubmedList ? authorIdentityStatusMap(allEntries) : new Map();
   visible.forEach((entry, index) => {
     const li = document.createElement('li');
     li.className = `pubmed-entry-item ${entry.is_read ? 'read' : 'unread'}`;
@@ -6809,6 +7731,11 @@ function renderPubmedEntryList(entries, options = {}) {
     }
     if (entry.has_free_fulltext) {
       badges.push('<span class="pill pill-free">PMC全文</span>');
+    }
+    const authorIdentityStatus = authorIdentityStatuses.get(Number(entry.id));
+    if (authorIdentityStatus) {
+      const identityMeta = AUTHOR_IDENTITY_META[authorIdentityStatus];
+      badges.push(`<span class="author-identity-badge ${identityMeta.className}">${identityMeta.label}</span>`);
     }
     badges.push(...renderEntryTagBadges(entry.tags, { limit: 6 }));
     li.innerHTML = `
@@ -6903,9 +7830,9 @@ function restoreEntryListScrollTop(scrollTop) {
 
 function formatPubmedPublicationDate(entry) {
   if (entry.publication_date_precision === 'season' || entry.publication_date_precision === 'medline') {
-    return entry.publication_date_raw || entry.publication_date || '';
+    return entry.publication_date_raw || entry.publication_date || formatSlashDate(entry.published_at) || '';
   }
-  const value = entry.publication_date || '';
+  const value = entry.publication_date || entry.published_at || '';
   return formatSlashDate(value) || entry.publication_date_raw || value;
 }
 
@@ -6929,10 +7856,17 @@ async function updatePubmedScreeningStatus(entry, status) {
 
 async function updateEntryScreeningStatus(entry, status) {
   try {
-    await invoke('set_entry_screening_status', {
-      entryId: entry.id,
-      status,
-    });
+    if (selectedFeedId != null) {
+      await invoke('set_feed_screening_state', {
+        feedId: selectedFeedId,
+        entryId: entry.id,
+        status,
+        exclusionReason: entry.exclusion_reason || null,
+        screeningNote: entry.screening_note || null,
+      });
+    } else {
+      await invoke('set_entry_screening_status', { entryId: entry.id, status });
+    }
     entry.screening_status = status;
     renderEntryList(allEntries);
     setGlobalStatus(`已设为${pubmedStatusLabel(status)}`, 'success');
@@ -8289,7 +9223,7 @@ function setupTranslationEvents() {
     if (p.status === 'needs_key') {
       showTranslationBanner({
         kind: 'needs_key',
-        text: `检测到 ${p.pending || ''} 篇待翻译文章，但未配置当前 AI 服务的 API Key。前往设置填写后会自动翻译。`,
+        text: `当前操作需要翻译 ${p.pending || ''} 篇文章，请先配置 AI 服务的 API Key。`,
       });
     } else if (p.status === 'auth_failed') {
       showTranslationBanner({
@@ -8610,7 +9544,7 @@ async function refreshAll() {
   try {
     const result = await invoke('fetch_all_feeds');
     let msg = `完成：${result.total_feeds} 个源`;
-    if (result.new_entries > 0) msg += `，新增 ${result.new_entries} 篇 · 正在自动翻译…`;
+    if (result.new_entries > 0) msg += `，新增 ${result.new_entries} 篇`;
     else msg += '，没有新文章';
     if (result.errors.length > 0) msg += `，${result.errors.length} 个问题`;
     setGlobalStatus(msg, 'success');
@@ -10253,6 +11187,10 @@ function escapeHtml(text) {
   return d.innerHTML;
 }
 
+function escapeHtmlAttribute(text) {
+  return escapeHtml(text).replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+}
+
 function stripHtml(html) {
   const d = document.createElement('div');
   d.innerHTML = html;
@@ -10279,6 +11217,950 @@ function formatPublicationDate(entry) {
   if (entry.publication_date) return formatSlashDate(entry.publication_date);
   if (!entry.published_at) return '';
   return formatSlashDate(entry.published_at);
+}
+
+function loadWordFrequencyTranslations() {
+  try {
+    const value = JSON.parse(localStorage.getItem(WORD_FREQUENCY_TRANSLATION_CACHE_KEY) || '{}');
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function persistWordFrequencyTranslations() {
+  const entries = Object.entries(wordFrequencyTranslations).slice(-1200);
+  wordFrequencyTranslations = Object.fromEntries(entries);
+  localStorage.setItem(WORD_FREQUENCY_TRANSLATION_CACHE_KEY, JSON.stringify(wordFrequencyTranslations));
+}
+
+function currentWordFrequencyScopeLabel(entryCount) {
+  if (mode === 'search' && literatureSearchRestoreState?.mode === 'pubmed') {
+    return `${literatureSearchRestoreState.pubmedSearchName || '当前 PubMed 检索'} · ${entryCount} 篇`;
+  }
+  if (mode === 'pubmed' && currentPubmedSearch) {
+    return `${currentPubmedSearch.name} · ${entryCount} 篇`;
+  }
+  if (mode === 'kept') return `保留文献 · ${entryCount} 篇`;
+  const feed = allFeeds.find(item => item.id === selectedFeedId);
+  if (feed) return `${feed.title || feed.url || '当前订阅源'} · ${entryCount} 篇`;
+  return `当前结果 · ${entryCount} 篇`;
+}
+
+function setWordFrequencyStatus(message, type = '') {
+  const element = document.getElementById('word-frequency-status');
+  if (!element) return;
+  element.textContent = message;
+  element.classList.toggle('error', type === 'error');
+}
+
+function availableWordFrequencyTranslations() {
+  return (wordFrequencyResult?.items || []).filter(item => wordFrequencyTranslations[item.term]).length;
+}
+
+function syncWordFrequencyControls() {
+  document.querySelectorAll('[data-word-frequency-view]').forEach(button => {
+    button.classList.toggle('active', button.dataset.wordFrequencyView === wordFrequencyView);
+  });
+  const translatedCount = availableWordFrequencyTranslations();
+  document.querySelectorAll('[data-word-frequency-language]').forEach(button => {
+    const language = button.dataset.wordFrequencyLanguage;
+    button.disabled = language === 'zh' && translatedCount === 0;
+    button.classList.toggle('active', language === wordFrequencyLanguage);
+  });
+  const translateButton = document.getElementById('btn-translate-word-frequency');
+  if (!translateButton) return;
+  const targetItems = (wordFrequencyResult?.items || []).slice(0, 80);
+  const untranslatedCount = targetItems.filter(item => !wordFrequencyTranslations[item.term]).length;
+  translateButton.disabled = wordFrequencyBusy || targetItems.length === 0 || untranslatedCount === 0;
+  translateButton.textContent = wordFrequencyBusy
+    ? '正在翻译…'
+    : (untranslatedCount === 0 && targetItems.length ? '已翻译' : '翻译关键词');
+}
+
+function wordFrequencyDisplayTerm(item) {
+  if (wordFrequencyLanguage === 'zh') {
+    return wordFrequencyTranslations[item.term] || item.term;
+  }
+  return item.term;
+}
+
+function renderWordFrequency() {
+  const cloud = document.getElementById('word-frequency-cloud');
+  const list = document.getElementById('word-frequency-list');
+  const tableBody = document.getElementById('word-frequency-table-body');
+  const empty = document.getElementById('word-frequency-empty');
+  if (!cloud || !list || !tableBody || !empty || !wordFrequencyResult) return;
+
+  const items = wordFrequencyResult.items || [];
+  const hasItems = items.length > 0;
+  empty.classList.toggle('hidden', hasItems);
+  cloud.classList.toggle('hidden', !hasItems || wordFrequencyView !== 'cloud');
+  list.classList.toggle('hidden', !hasItems || wordFrequencyView !== 'list');
+  if (!hasItems) {
+    empty.textContent = '当前结果没有可统计的英文关键词';
+    cloud.innerHTML = '';
+    tableBody.innerHTML = '';
+    setWordFrequencyStatus(`${wordFrequencyResult.document_count || 0} 篇文献`);
+    syncWordFrequencyControls();
+    return;
+  }
+
+  const cloudItems = items.slice(0, 60);
+  const counts = cloudItems.map(item => Math.max(1, Number(item.count) || 1));
+  const minLog = Math.log(Math.min(...counts));
+  const maxLog = Math.log(Math.max(...counts));
+  cloud.innerHTML = cloudItems.map((item, index) => {
+    const ratio = maxLog === minLog ? 0.5 : (Math.log(Math.max(1, item.count)) - minLog) / (maxLog - minLog);
+    const size = Math.round(13 + ratio * 23);
+    const weight = Math.round(500 + ratio * 200);
+    const display = wordFrequencyDisplayTerm(item);
+    const title = wordFrequencyLanguage === 'zh'
+      ? `${display} · ${item.term} · ${item.count} 次`
+      : `${item.term} · ${item.count} 次`;
+    return `<button class="word-cloud-term tone-${index % 5}" type="button" role="listitem" data-word-frequency-term="${escapeHtmlAttribute(item.term)}" title="${escapeHtmlAttribute(title)}" style="--word-size:${size}px;--word-weight:${weight}">${escapeHtml(display)}</button>`;
+  }).join('');
+
+  tableBody.innerHTML = items.map(item => {
+    const display = wordFrequencyDisplayTerm(item);
+    const original = wordFrequencyLanguage === 'zh' && display !== item.term
+      ? `<span class="word-frequency-original">${escapeHtml(item.term)}</span>`
+      : '';
+    return `<tr>
+      <td><button class="word-frequency-term-button" type="button" data-word-frequency-term="${escapeHtmlAttribute(item.term)}">${escapeHtml(display)}${original}</button></td>
+      <td>${Number(item.count || 0).toLocaleString()}</td>
+      <td>${Number(item.document_count || 0).toLocaleString()}</td>
+    </tr>`;
+  }).join('');
+
+  const pdfCount = Number(wordFrequencyResult.pdf_document_count || 0);
+  setWordFrequencyStatus(`${Number(wordFrequencyResult.document_count || 0).toLocaleString()} 篇文献 · ${pdfCount.toLocaleString()} 篇 PDF 全文`);
+  syncWordFrequencyControls();
+}
+
+async function openWordFrequencyModal() {
+  const modal = document.getElementById('word-frequency-modal');
+  if (!modal) return;
+  const entries = getFilteredEntries(allEntries);
+  const entryIds = entries.map(entry => Number(entry.id)).filter(Number.isFinite);
+  const requestId = ++wordFrequencyRequestId;
+  wordFrequencyResult = null;
+  wordFrequencyView = 'cloud';
+  wordFrequencyLanguage = 'en';
+  wordFrequencyBusy = false;
+  modal.classList.remove('hidden');
+  document.getElementById('word-frequency-scope').textContent = currentWordFrequencyScopeLabel(entryIds.length);
+  document.getElementById('word-frequency-cloud').innerHTML = '';
+  document.getElementById('word-frequency-list').classList.add('hidden');
+  document.getElementById('word-frequency-empty').classList.add('hidden');
+  setWordFrequencyStatus(entryIds.length ? '正在统计英文关键词…' : '当前结果没有文献');
+  syncWordFrequencyControls();
+  if (!entryIds.length) {
+    wordFrequencyResult = { items: [], document_count: 0, pdf_document_count: 0 };
+    renderWordFrequency();
+    return;
+  }
+
+  try {
+    const result = await invoke('analyze_word_frequency', { entryIds, limit: 100 });
+    if (requestId !== wordFrequencyRequestId || modal.classList.contains('hidden')) return;
+    wordFrequencyResult = result;
+    renderWordFrequency();
+  } catch (error) {
+    if (requestId !== wordFrequencyRequestId) return;
+    document.getElementById('word-frequency-empty').textContent = '词频统计失败';
+    document.getElementById('word-frequency-empty').classList.remove('hidden');
+    setWordFrequencyStatus(String(error), 'error');
+  }
+}
+
+function closeWordFrequencyModal() {
+  wordFrequencyRequestId += 1;
+  document.getElementById('word-frequency-modal')?.classList.add('hidden');
+}
+
+function setWordFrequencyView(view) {
+  if (!['cloud', 'list'].includes(view)) return;
+  wordFrequencyView = view;
+  renderWordFrequency();
+}
+
+function setWordFrequencyLanguage(language) {
+  if (language === 'zh' && availableWordFrequencyTranslations() === 0) return;
+  if (!['en', 'zh'].includes(language)) return;
+  wordFrequencyLanguage = language;
+  renderWordFrequency();
+}
+
+async function translateWordFrequencyTerms() {
+  if (wordFrequencyBusy || !wordFrequencyResult?.items?.length) return;
+  const terms = wordFrequencyResult.items
+    .slice(0, 80)
+    .map(item => item.term)
+    .filter(term => !wordFrequencyTranslations[term]);
+  if (!terms.length) {
+    wordFrequencyLanguage = 'zh';
+    renderWordFrequency();
+    return;
+  }
+
+  wordFrequencyBusy = true;
+  syncWordFrequencyControls();
+  setWordFrequencyStatus(`正在翻译 ${terms.length} 个关键词…`);
+  try {
+    const translations = await invoke('translate_word_frequency_terms', { terms });
+    translations.forEach(item => {
+      if (item?.term && item?.translated) wordFrequencyTranslations[item.term] = item.translated;
+    });
+    persistWordFrequencyTranslations();
+    wordFrequencyLanguage = 'zh';
+    renderWordFrequency();
+    loadCostSummary();
+  } catch (error) {
+    setWordFrequencyStatus(String(error), 'error');
+  } finally {
+    wordFrequencyBusy = false;
+    syncWordFrequencyControls();
+  }
+}
+
+function searchWordFrequencyTerm(term) {
+  const query = String(term || '').trim();
+  if (!query || !literatureSearchInput) return;
+  closeWordFrequencyModal();
+  literatureSearchInput.value = query;
+  syncLiteratureSearchUi();
+  captureLiteratureSearchRestoreState();
+  runLiteratureSearch(query);
+  literatureSearchInput.focus();
+}
+
+function setPmcGalleryStatus(message, type = '') {
+  const element = document.getElementById('pmc-gallery-status');
+  if (!element) return;
+  element.textContent = message;
+  element.classList.toggle('error', type === 'error');
+}
+
+function setPmcGalleryPreviewStatus(message, type = '') {
+  const element = document.getElementById('pmc-gallery-preview-status');
+  if (!element) return;
+  element.textContent = message;
+  element.classList.toggle('error', type === 'error');
+}
+
+function syncPmcGallerySearchButton() {
+  const button = document.getElementById('btn-search-pmc-gallery');
+  const saveButton = document.getElementById('btn-save-pmc-gallery-search');
+  const query = document.getElementById('pmc-gallery-query')?.value.trim() || '';
+  if (!button) return;
+  button.disabled = pmcGalleryBusy || !query || pmcGalleryPreviewQuery !== query;
+  if (saveButton) saveButton.disabled = pmcGalleryBusy || !query || pmcGalleryPreviewQuery !== query;
+  if (!pmcGalleryBusy) button.textContent = '抓取图库';
+}
+
+function resetPmcGalleryJournalOptions(selectedValue = 'all', disabled = true) {
+  const input = document.getElementById('pmc-gallery-journal-filter');
+  const datalist = document.getElementById('pmc-gallery-journal-options');
+  if (!input || !datalist) return;
+  datalist.replaceChildren();
+  if (selectedValue && selectedValue !== 'all') {
+    const option = document.createElement('option');
+    option.value = selectedValue;
+    datalist.appendChild(option);
+  }
+  input.value = selectedValue === 'all' ? '' : (selectedValue || '');
+  input.disabled = disabled;
+}
+
+function populatePmcGalleryJournalOptions(result, selectedValue = 'all') {
+  const input = document.getElementById('pmc-gallery-journal-filter');
+  const datalist = document.getElementById('pmc-gallery-journal-options');
+  if (!input || !datalist) return;
+  const journals = Array.isArray(result?.journals) ? result.journals : [];
+  resetPmcGalleryJournalOptions(selectedValue, false);
+  const existingValues = new Set([...datalist.options].map(option => option.value));
+  journals.forEach(journal => {
+    if (!journal?.name || existingValues.has(journal.name)) return;
+    const option = document.createElement('option');
+    option.value = journal.name;
+    const abbreviation = journal.abbreviation && journal.abbreviation !== journal.name
+      ? ` · ${journal.abbreviation}`
+      : '';
+    option.label = `${journal.name}${abbreviation} (${Number(journal.count || 0)})`;
+    datalist.appendChild(option);
+    existingValues.add(journal.name);
+  });
+  input.value = selectedValue === 'all' ? '' : (selectedValue || '');
+}
+
+function invalidatePmcGalleryPreview(message = '', { preserveJournal = false } = {}) {
+  pmcGalleryPreview = null;
+  pmcGalleryPreviewQuery = '';
+  const currentJournal = document.getElementById('pmc-gallery-journal-filter')?.value || 'all';
+  resetPmcGalleryJournalOptions(preserveJournal ? currentJournal : 'all');
+  const results = document.getElementById('pmc-gallery-preview-results');
+  if (results) {
+    results.innerHTML = '';
+    results.classList.add('hidden');
+  }
+  if (message) setPmcGalleryPreviewStatus(message);
+  syncPmcGallerySearchButton();
+}
+
+function normalizePmcGallerySearch(record) {
+  return {
+    ...record,
+    authorName: record.author_name ?? record.authorName ?? '',
+    startDate: record.start_date ?? record.startDate ?? '',
+    endDate: record.end_date ?? record.endDate ?? '',
+    articleLimit: String(record.article_limit ?? record.limit ?? '8'),
+    journalFilter: record.journal_filter ?? record.metricFilters?.journal ?? 'all',
+    impactFactorFilter: record.impact_factor_filter ?? record.metricFilters?.impactFactor ?? 'all',
+    jcrQuartileFilter: record.jcr_quartile_filter ?? record.metricFilters?.jcrQuartile ?? 'all',
+    casPartitionFilter: record.cas_partition_filter ?? record.metricFilters?.casPartition ?? 'all',
+    topFilter: record.top_filter ?? record.metricFilters?.top ?? 'all',
+    totalCount: Number(record.last_result_count ?? record.totalCount ?? 0),
+    lastFigureCount: Number(record.last_figure_count ?? 0),
+    lastNextOffset: Number(record.last_next_offset ?? 0),
+    lastHasMore: Boolean(record.last_has_more),
+  };
+}
+
+function legacyPmcGalleryHistoryPayload(record) {
+  return {
+    name: record.label || record.query,
+    mode: record.mode || 'topic',
+    question: record.question || null,
+    authorName: record.authorName || null,
+    affiliation: record.affiliation || null,
+    startDate: record.startDate || null,
+    endDate: record.endDate || null,
+    query: record.query,
+    articleLimit: Number(record.limit || 8),
+    journalFilter: record.metricFilters?.journal || 'all',
+    impactFactorFilter: record.metricFilters?.impactFactor || 'all',
+    jcrQuartileFilter: record.metricFilters?.jcrQuartile || 'all',
+    casPartitionFilter: record.metricFilters?.casPartition || 'all',
+    topFilter: record.metricFilters?.top || 'all',
+  };
+}
+
+async function loadPmcGalleryHistory() {
+  let legacy = [];
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PMC_GALLERY_HISTORY_KEY) || '[]');
+    legacy = Array.isArray(parsed) ? parsed.slice(0, 30) : [];
+  } catch {}
+  try {
+    pmcGalleryHistory = (await invoke('list_pmc_gallery_searches')).map(normalizePmcGallerySearch);
+    if (!pmcGalleryHistory.length && legacy.length) {
+      for (const record of legacy) {
+        try { await invoke('create_pmc_gallery_search', { payload: legacyPmcGalleryHistoryPayload(record) }); } catch {}
+      }
+      pmcGalleryHistory = (await invoke('list_pmc_gallery_searches')).map(normalizePmcGallerySearch);
+      localStorage.removeItem(PMC_GALLERY_HISTORY_KEY);
+    }
+  } catch (error) {
+    pmcGalleryHistory = legacy.map(record => ({
+      ...record,
+      id: record.id || `legacy-${record.query}`,
+      name: record.label || record.query,
+      totalCount: Number(record.totalCount || 0),
+    }));
+    setGlobalStatus(`PMC 图库检索记录读取失败：${error}`, 'error');
+  }
+  renderPmcGallerySidebarList();
+  renderPmcGalleryNameHistory();
+}
+
+function renderPmcGalleryNameHistory() {
+  const datalist = document.getElementById('pmc-gallery-name-history');
+  if (!datalist) return;
+  datalist.replaceChildren();
+  const seen = new Set();
+  pmcGalleryHistory.forEach(record => {
+    const name = String(record.name || record.label || '').trim();
+    if (!name || seen.has(name)) return;
+    const option = document.createElement('option');
+    option.value = name;
+    option.label = record.query || '';
+    datalist.appendChild(option);
+    seen.add(name);
+  });
+}
+
+async function restorePmcGallerySearchByName(name) {
+  const normalizedName = String(name || '').trim();
+  if (!normalizedName) return;
+  const record = pmcGalleryHistory.find(item => String(item.name || item.label || '').trim() === normalizedName);
+  if (!record || record.id === pmcGalleryActiveHistoryId) return;
+  await openPmcGalleryModal(record.id);
+}
+
+function renderPmcGallerySidebarList() {
+  const list = document.getElementById('pmc-gallery-search-list');
+  if (!list) return;
+  list.replaceChildren();
+  if (!pmcGalleryHistory.length) {
+    const empty = document.createElement('li');
+    empty.className = 'pubmed-search-empty';
+    empty.textContent = '点击 + 新建图库检索';
+    list.appendChild(empty);
+    return;
+  }
+  pmcGalleryHistory.forEach(record => {
+    const item = document.createElement('li');
+    item.className = 'pubmed-search-item';
+    item.classList.toggle('selected', pmcGalleryActiveHistoryId === record.id);
+    item.dataset.pmcGalleryHistoryId = record.id;
+    item.innerHTML = `
+      <span class="pubmed-search-item-icon pmc-gallery-search-item-icon" aria-hidden="true">
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3" width="11" height="10" rx="1.4" /><circle cx="5.5" cy="6" r="1" /><path d="m3.8 11 2.7-2.7 1.8 1.8 1.5-1.5 2.4 2.4" /></svg>
+      </span>
+      <span class="pubmed-search-item-main"><span class="pubmed-search-item-title">${escapeHtml(record.name || record.label || record.query)}</span></span>
+      <span class="pubmed-search-item-count">${record.totalCount ? Number(record.totalCount).toLocaleString('zh-CN') : ''}</span>
+    `;
+    item.addEventListener('click', () => openPmcGalleryModal(record.id));
+    item.addEventListener('contextmenu', event => {
+      event.preventDefault();
+      showPmcGallerySearchContextMenu(event.clientX, event.clientY, record);
+    });
+    list.appendChild(item);
+  });
+}
+
+function showPmcGallerySearchContextMenu(x, y, search) {
+  hideContextMenu();
+  const menu = document.createElement('div');
+  menu.className = 'context-menu';
+  menu.innerHTML = `
+    <div class="context-item" data-action="edit">编辑检索</div>
+    <div class="context-item" data-action="open-source">在 PubMed 打开</div>
+    <div class="context-item context-item-danger" data-action="delete">删除</div>
+  `;
+  menu.addEventListener('click', async event => {
+    const action = event.target.closest('[data-action]')?.dataset.action;
+    if (!action) return;
+    hideContextMenu();
+    if (action === 'edit') {
+      openPmcGalleryModal(search.id);
+      setTimeout(() => document.getElementById('pmc-gallery-name')?.focus(), 0);
+    } else if (action === 'open-source') {
+      openUrl(buildPubmedSearchUrl(search.query));
+    } else if (action === 'delete') {
+      const confirmed = await confirmDialog(`删除 PMC 图库检索“${search.name || search.query}”？已缓存的图片链接也会删除。`, {
+        okLabel: '删除', cancelLabel: '取消', danger: true,
+      });
+      if (!confirmed) return;
+      try {
+        await invoke('delete_pmc_gallery_search', { id: Number(search.id) });
+        if (pmcGalleryActiveHistoryId === search.id) pmcGalleryActiveHistoryId = '';
+        await loadPmcGalleryHistory();
+        setGlobalStatus('PMC 图库检索已删除', 'success');
+      } catch (error) {
+        setGlobalStatus(`删除 PMC 图库检索失败：${error}`, 'error');
+      }
+    }
+  });
+  mountContextMenu(menu, x, y);
+  document.addEventListener('click', hideContextMenu, { once: true });
+}
+
+function capturePmcGallerySearchPayload() {
+  const query = document.getElementById('pmc-gallery-query')?.value.trim() || '';
+  const question = document.getElementById('pmc-gallery-question')?.value.trim() || '';
+  const authorName = document.getElementById('pmc-gallery-author-name')?.value.trim() || '';
+  return {
+    name: document.getElementById('pmc-gallery-name')?.value.trim() || (pmcGallerySearchMode === 'author' ? authorName : question) || query,
+    mode: pmcGallerySearchMode,
+    question: question || null,
+    authorName: authorName || null,
+    affiliation: document.getElementById('pmc-gallery-author-affiliation')?.value.trim() || null,
+    startDate: document.getElementById('pmc-gallery-author-start-date')?.value || null,
+    endDate: document.getElementById('pmc-gallery-author-end-date')?.value || null,
+    query,
+    articleLimit: Number(document.getElementById('pmc-gallery-limit')?.value || 8),
+    ...Object.fromEntries(Object.entries(readPmcGalleryMetricFilters()).map(([key, value]) => [
+      { journal: 'journalFilter', impactFactor: 'impactFactorFilter', jcrQuartile: 'jcrQuartileFilter', casPartition: 'casPartitionFilter', top: 'topFilter' }[key], value,
+    ])),
+  };
+}
+
+async function savePmcGallerySearch() {
+  const payload = capturePmcGallerySearchPayload();
+  if (!payload.query || payload.query.length < 2) {
+    setPmcGalleryPreviewStatus('请先填写并预览检索式', 'error');
+    return false;
+  }
+  if (!payload.name) {
+    setPmcGalleryPreviewStatus('请填写检索名称，便于在左侧列表中找到它', 'error');
+    document.getElementById('pmc-gallery-name')?.focus();
+    return false;
+  }
+  const command = pmcGalleryActiveHistoryId && Number.isFinite(Number(pmcGalleryActiveHistoryId))
+    ? 'update_pmc_gallery_search'
+    : 'create_pmc_gallery_search';
+  const args = command === 'update_pmc_gallery_search'
+    ? { id: Number(pmcGalleryActiveHistoryId), payload }
+    : { payload };
+  try {
+    const record = normalizePmcGallerySearch(await invoke(command, args));
+    pmcGalleryActiveHistoryId = record.id;
+    await loadPmcGalleryHistory();
+    setPmcGalleryPreviewStatus('检索已保存到左侧 PMC 图库列表');
+    return true;
+  } catch (error) {
+    setPmcGalleryPreviewStatus(`保存失败：${error}`, 'error');
+    return false;
+  }
+}
+
+function setPmcGallerySearchMode(mode) {
+  if (!['topic', 'author'].includes(mode)) return;
+  pmcGallerySearchMode = mode;
+  document.querySelectorAll('[data-pmc-search-mode]').forEach(button => {
+    button.classList.toggle('active', button.dataset.pmcSearchMode === mode);
+  });
+  document.getElementById('pmc-topic-builder')?.classList.toggle('hidden', mode !== 'topic');
+  document.getElementById('pmc-author-builder')?.classList.toggle('hidden', mode !== 'author');
+}
+
+function restorePmcGalleryHistory(recordId) {
+  const record = pmcGalleryHistory.find(item => item.id === recordId);
+  if (!record) return;
+  pmcGalleryActiveHistoryId = record.id;
+  renderPmcGallerySidebarList();
+  setPmcGallerySearchMode(record.mode || 'topic');
+  document.getElementById('pmc-gallery-name').value = record.name || record.label || '';
+  document.getElementById('pmc-gallery-query').value = record.query || '';
+  document.getElementById('pmc-gallery-question').value = record.question || '';
+  document.getElementById('pmc-gallery-author-name').value = record.authorName || '';
+  document.getElementById('pmc-gallery-author-affiliation').value = record.affiliation || '';
+  document.getElementById('pmc-gallery-author-start-date').value = record.startDate || '';
+  document.getElementById('pmc-gallery-author-end-date').value = record.endDate || '';
+  document.getElementById('pmc-gallery-limit').value = record.articleLimit || '8';
+  const filterIds = {
+    journal: 'pmc-gallery-journal-filter',
+    impactFactor: 'pmc-gallery-if-filter',
+    jcrQuartile: 'pmc-gallery-q-filter',
+    casPartition: 'pmc-gallery-b-filter',
+    top: 'pmc-gallery-top-filter',
+  };
+  Object.entries(filterIds).forEach(([key, id]) => {
+    const input = document.getElementById(id);
+    const value = record[{ journal: 'journalFilter', impactFactor: 'impactFactorFilter', jcrQuartile: 'jcrQuartileFilter', casPartition: 'casPartitionFilter', top: 'topFilter' }[key]] || 'all';
+    if (key === 'journal') {
+      resetPmcGalleryJournalOptions(value, true);
+    } else if (input) {
+      input.value = value;
+    }
+  });
+  invalidatePmcGalleryPreview('已恢复历史检索，请预览结果后再抓取图片', { preserveJournal: true });
+}
+
+async function generatePmcGalleryQuery() {
+  const question = document.getElementById('pmc-gallery-question')?.value.trim() || '';
+  const button = document.getElementById('btn-generate-pmc-query');
+  if (!question) {
+    setPmcGalleryPreviewStatus('请先填写研究问题', 'error');
+    return;
+  }
+  if (button) button.disabled = true;
+  setPmcGalleryPreviewStatus('正在生成 PubMed 检索式…');
+  try {
+    const query = await invoke('natural_to_pubmed_query', { text: question });
+    loadCostSummary();
+    document.getElementById('pmc-gallery-query').value = query;
+    invalidatePmcGalleryPreview('检索式已生成，可继续修改；确认后请点击“预览结果”');
+  } catch (error) {
+    setPmcGalleryPreviewStatus(`生成失败：${error}。仍可手工输入检索式。`, 'error');
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function buildPmcGalleryAuthorQuery() {
+  const authorName = document.getElementById('pmc-gallery-author-name')?.value.trim() || '';
+  const affiliation = document.getElementById('pmc-gallery-author-affiliation')?.value.trim() || '';
+  const startDate = document.getElementById('pmc-gallery-author-start-date')?.value || '';
+  const endDate = document.getElementById('pmc-gallery-author-end-date')?.value || '';
+  const button = document.getElementById('btn-build-pmc-author-query');
+  if (!authorName) {
+    setPmcGalleryPreviewStatus('请先填写作者姓名或描述', 'error');
+    return;
+  }
+  if (button) button.disabled = true;
+  setPmcGalleryPreviewStatus('AI 正在识别作者和机构并构建检索式…');
+  try {
+    const result = await invoke('build_pubmed_author_query', {
+      authorName,
+      affiliation: affiliation || null,
+      startDate: startDate || null,
+      endDate: endDate || null,
+    });
+    loadCostSummary();
+    const query = typeof result === 'string' ? result : result?.query || '';
+    const detectedAuthor = typeof result === 'string' ? authorName : result?.author_name?.trim() || authorName;
+    const detectedAffiliation = affiliation || (typeof result === 'string' ? '' : result?.affiliation?.trim() || '');
+    document.getElementById('pmc-gallery-query').value = query;
+    document.getElementById('pmc-gallery-author-name').value = detectedAuthor;
+    if (!affiliation && detectedAffiliation) {
+      document.getElementById('pmc-gallery-author-affiliation').value = detectedAffiliation;
+    }
+    invalidatePmcGalleryPreview(detectedAffiliation
+      ? `已识别作者“${detectedAuthor}”和单位“${detectedAffiliation}”，请预览结果`
+      : `已识别作者“${detectedAuthor}”，未识别到单位；可补充后再预览`);
+  } catch (error) {
+    setPmcGalleryPreviewStatus(`构建失败：${error}`, 'error');
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function renderPmcGalleryPreview(preview) {
+  const results = document.getElementById('pmc-gallery-preview-results');
+  if (!results) return;
+  const entries = (preview?.entries || []).slice(0, 5);
+  const totalCount = Number(preview?.total_count || 0).toLocaleString('zh-CN');
+  const openAccessCount = Number(preview?.open_access_count || 0).toLocaleString('zh-CN');
+  results.innerHTML = `
+    <div class="pubmed-preview-summary">PMC 全文检索命中 ${totalCount} 篇 · 开放文献候选 ${openAccessCount} 篇 · 显示前 ${entries.length} 篇</div>
+    ${entries.map(entry => `
+      <div class="pubmed-preview-item">
+        <div class="pubmed-preview-item-title">${escapeHtml(entry.title || '题名待确认')}</div>
+        <div class="pubmed-preview-item-meta">${escapeHtml(shortJournalDisplayName(entry.journal) || '期刊待确认')} · ${escapeHtml(formatPubmedPublicationDate(entry) || '日期待确认')} · ${escapeHtml(entry.pmcid || (entry.pmid ? `PMID ${entry.pmid}` : 'PMCID 待确认'))}</div>
+        ${pmcGallerySearchMode === 'author' ? `<div class="pubmed-preview-item-meta">作者：${escapeHtml(entry.authors || '作者待确认')}</div><div class="pubmed-preview-item-meta">机构：${escapeHtml(entry.affiliation || '机构待确认')}</div>` : ''}
+      </div>`).join('') || '<div class="pubmed-preview-item-meta">没有可预览记录</div>'}
+  `;
+  results.classList.remove('hidden');
+}
+
+async function previewPmcGallerySearch() {
+  const query = document.getElementById('pmc-gallery-query')?.value.trim() || '';
+  const button = document.getElementById('btn-preview-pmc-gallery');
+  if (!query) {
+    setPmcGalleryPreviewStatus('请先填写 PubMed 检索式', 'error');
+    return;
+  }
+  if (button) button.disabled = true;
+  setPmcGalleryPreviewStatus('正在查询 PMC 全文文献及开放文献数量…');
+  document.getElementById('pmc-gallery-preview-results')?.classList.add('hidden');
+  try {
+    const selectedJournal = document.getElementById('pmc-gallery-journal-filter')?.value || 'all';
+    const journalOptionsPromise = invoke('list_pmc_gallery_journals', {
+      query,
+      sampleLimit: 200,
+    }).catch(() => null);
+    pmcGalleryPreview = await invoke('preview_pmc_gallery_search', {
+      query,
+      sampleLimit: 10,
+    });
+    const journalOptions = await journalOptionsPromise;
+    populatePmcGalleryJournalOptions(journalOptions, selectedJournal);
+    pmcGalleryPreviewQuery = query;
+    renderPmcGalleryPreview(pmcGalleryPreview);
+    const journalText = journalOptions?.journals?.length
+      ? ` · ${journalOptions.journals.length} 个期刊可筛选`
+      : '';
+    const totalCount = Number(pmcGalleryPreview.total_count || 0).toLocaleString('zh-CN');
+    const openAccessCount = Number(pmcGalleryPreview.open_access_count || 0).toLocaleString('zh-CN');
+    setPmcGalleryPreviewStatus(`PMC 全文命中 ${totalCount} 篇 · 开放文献候选 ${openAccessCount} 篇${journalText}，可开始抓取图片`);
+  } catch (error) {
+    invalidatePmcGalleryPreview();
+    setPmcGalleryPreviewStatus(`预览失败：${error}`, 'error');
+  } finally {
+    if (button) button.disabled = false;
+    syncPmcGallerySearchButton();
+  }
+}
+
+function readPmcGalleryMetricFilters() {
+  return {
+    journal: document.getElementById('pmc-gallery-journal-filter')?.value.trim() || 'all',
+    impactFactor: document.getElementById('pmc-gallery-if-filter')?.value || 'all',
+    jcrQuartile: document.getElementById('pmc-gallery-q-filter')?.value || 'all',
+    casPartition: document.getElementById('pmc-gallery-b-filter')?.value || 'all',
+    top: document.getElementById('pmc-gallery-top-filter')?.value || 'all',
+  };
+}
+
+function syncPmcGalleryLoadMore() {
+  const row = document.getElementById('pmc-gallery-load-more-row');
+  const button = document.getElementById('btn-load-more-pmc-gallery');
+  if (!row || !button) return;
+  row.classList.toggle('hidden', !pmcGalleryResult || !pmcGalleryHasMore);
+  button.disabled = pmcGalleryBusy;
+  button.textContent = pmcGalleryBusy ? '正在加载…' : '继续加载 20 篇';
+}
+
+function pmcGalleryCardMarkup(figure) {
+  const isGraphicalAbstract = figure.figure_kind === 'graphical_abstract';
+  const typeLabel = isGraphicalAbstract ? '图形摘要' : (figure.label || '正文图');
+  return `<article class="pmc-gallery-card">
+      <button class="pmc-gallery-image-button" type="button" data-pmc-gallery-open="${escapeHtmlAttribute(figure.article_url)}" aria-label="在 PMC 打开 ${escapeHtmlAttribute(figure.label || figure.pmcid)}">
+        <img src="${escapeHtmlAttribute(figure.image_url)}" alt="${escapeHtmlAttribute(figure.caption || figure.label || figure.article_title)}" loading="lazy" />
+        <span class="pmc-gallery-image-fallback">图片暂时无法加载</span>
+      </button>
+      <div class="pmc-gallery-card-body">
+        <div class="pmc-gallery-card-meta">
+          <span class="pmc-gallery-kind${isGraphicalAbstract ? ' is-graphical' : ''}">${escapeHtml(typeLabel)}</span>
+          ${figure.license ? `<span>${escapeHtml(figure.license)}</span>` : ''}
+        </div>
+        <p class="pmc-gallery-caption">${escapeHtml(figure.caption || '该图片没有独立图注')}</p>
+      </div>
+    </article>`;
+}
+
+function pmcGalleryArticleGroupMarkup(group, kind) {
+  const groupKey = `${kind}:${group.pmcid || group.article_url}`;
+  const figureCount = group.figures.length;
+  const storedIndex = pmcGalleryFigureIndexes.get(groupKey) || 0;
+  const figureIndex = Math.min(Math.max(storedIndex, 0), Math.max(figureCount - 1, 0));
+  const figure = group.figures[figureIndex];
+  pmcGalleryFigureIndexes.set(groupKey, figureIndex);
+  const previousButton = figureCount > 1
+    ? `<button class="pmc-gallery-carousel-arrow is-previous" type="button" data-pmc-gallery-nav="-1" data-pmc-gallery-group-key="${escapeHtmlAttribute(groupKey)}" data-pmc-gallery-group-count="${figureCount}" title="上一张" aria-label="上一张">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
+      </button>`
+    : '';
+  const nextButton = figureCount > 1
+    ? `<button class="pmc-gallery-carousel-arrow is-next" type="button" data-pmc-gallery-nav="1" data-pmc-gallery-group-key="${escapeHtmlAttribute(groupKey)}" data-pmc-gallery-group-count="${figureCount}" title="下一张" aria-label="下一张">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
+      </button>`
+    : '';
+  return `<section class="pmc-gallery-article-group">
+    <header class="pmc-gallery-article-header">
+      <button class="pmc-gallery-article-link" type="button" data-pmc-gallery-open="${escapeHtmlAttribute(group.article_url)}">${escapeHtml(group.article_title || group.pmcid)}</button>
+      <div class="pmc-gallery-article-meta">
+        <span>${escapeHtml(group.pmcid)}</span>
+        <span>${figureIndex + 1} / ${figureCount}</span>
+      </div>
+    </header>
+    <div class="pmc-gallery-carousel">
+      ${previousButton}
+      ${pmcGalleryCardMarkup(figure)}
+      ${nextButton}
+    </div>
+  </section>`;
+}
+
+function renderPmcGallerySection(kind, gridId, countId, emptyId) {
+  const grid = document.getElementById(gridId);
+  const count = document.getElementById(countId);
+  const empty = document.getElementById(emptyId);
+  if (!grid || !count || !empty) return;
+  let figures = (pmcGalleryResult?.figures || []).filter(figure => figure.figure_kind === kind);
+  if (pmcGalleryView === 'figure-number') {
+    figures = kind === 'figure'
+      ? figures.filter(figure => isPmcFigureNumber(figure, pmcGalleryFigureNumber))
+      : [];
+  }
+  const groups = groupPmcFiguresByArticle(figures);
+  grid.innerHTML = groups.map(group => pmcGalleryArticleGroupMarkup(group, kind)).join('');
+  grid.classList.toggle('hidden', figures.length === 0);
+  empty.classList.toggle('hidden', figures.length > 0);
+  count.textContent = `${groups.length} 篇 · ${figures.length} 张`;
+}
+
+function renderPmcGallery() {
+  const results = document.getElementById('pmc-gallery-results');
+  const empty = document.getElementById('pmc-gallery-empty');
+  if (!results || !empty) return;
+  syncPmcGalleryLoadMore();
+  document.querySelectorAll('[data-pmc-gallery-view]').forEach(button => {
+    button.classList.toggle('active', button.dataset.pmcGalleryView === pmcGalleryView);
+  });
+  document.getElementById('pmc-gallery-figure-number-control')
+    ?.classList.toggle('hidden', pmcGalleryView !== 'figure-number');
+  const hasResult = pmcGalleryResult !== null;
+  document.querySelector('.pmc-gallery-body')?.classList.toggle('has-gallery-results', hasResult);
+  results.classList.toggle('hidden', !hasResult);
+  empty.classList.toggle('hidden', hasResult);
+  if (!hasResult) {
+    empty.textContent = '输入 PubMed 检索式开始浏览 PMC 开放文献图片';
+    return;
+  }
+
+  const graphicalSection = document.getElementById('pmc-gallery-graphical-section');
+  const figureTitle = document.getElementById('pmc-gallery-figure-title');
+  const figureEmpty = document.getElementById('pmc-gallery-figure-empty');
+  const extractingFigure = pmcGalleryView === 'figure-number';
+  const figureLabel = `Figure ${pmcGalleryFigureNumber}`;
+  graphicalSection?.classList.toggle('hidden', extractingFigure);
+  if (figureTitle) figureTitle.textContent = extractingFigure ? figureLabel : '正文图';
+  if (figureEmpty) figureEmpty.textContent = extractingFigure ? `当前检索结果中未找到 ${figureLabel}` : '未找到正文图';
+  renderPmcGallerySection(
+    'graphical_abstract',
+    'pmc-gallery-graphical-grid',
+    'pmc-gallery-graphical-count',
+    'pmc-gallery-graphical-empty',
+  );
+  renderPmcGallerySection(
+    'figure',
+    'pmc-gallery-figure-grid',
+    'pmc-gallery-figure-count',
+    'pmc-gallery-figure-empty',
+  );
+  results.querySelectorAll('img').forEach(image => {
+    image.addEventListener('load', () => image.closest('.pmc-gallery-image-button')?.classList.add('is-loaded'), { once: true });
+    image.addEventListener('error', () => image.closest('.pmc-gallery-image-button')?.classList.add('is-error'), { once: true });
+  });
+}
+
+async function openPmcGalleryModal(historyId = '') {
+  const modal = document.getElementById('pmc-gallery-modal');
+  const queryInput = document.getElementById('pmc-gallery-query');
+  if (!modal || !queryInput) return;
+  pmcGalleryResult = null;
+  pmcGalleryNextOffset = 0;
+  pmcGalleryHasMore = false;
+  pmcGalleryActiveMetricFilters = null;
+  pmcGalleryFigureIndexes.clear();
+  setPmcGalleryStatus('');
+  await loadPmcGalleryHistory();
+  if (historyId) {
+    restorePmcGalleryHistory(historyId);
+  } else {
+    pmcGalleryActiveHistoryId = '';
+    setPmcGallerySearchMode('topic');
+    queryInput.value = '';
+    document.getElementById('pmc-gallery-name').value = '';
+    document.getElementById('pmc-gallery-question').value = '';
+    document.getElementById('pmc-gallery-author-name').value = '';
+    document.getElementById('pmc-gallery-author-affiliation').value = '';
+    document.getElementById('pmc-gallery-author-start-date').value = '';
+    document.getElementById('pmc-gallery-author-end-date').value = '';
+    document.getElementById('pmc-gallery-limit').value = '8';
+    ['pmc-gallery-journal-filter', 'pmc-gallery-if-filter', 'pmc-gallery-q-filter', 'pmc-gallery-b-filter', 'pmc-gallery-top-filter']
+      .forEach(id => { document.getElementById(id).value = id === 'pmc-gallery-journal-filter' ? '' : 'all'; });
+    invalidatePmcGalleryPreview();
+    setPmcGalleryPreviewStatus('');
+    renderPmcGallerySidebarList();
+  }
+  syncPmcGallerySearchButton();
+  modal.classList.remove('hidden');
+  renderPmcGallery();
+  if (historyId) {
+    try {
+      const cached = await invoke('load_pmc_gallery_cache', { id: Number(historyId) });
+      pmcGalleryResult = cached;
+      pmcGalleryNextOffset = Number(cached.next_offset || 0);
+      pmcGalleryHasMore = Boolean(cached.has_more);
+      pmcGalleryActiveMetricFilters = readPmcGalleryMetricFilters();
+      renderPmcGallery();
+      setPmcGalleryStatus(cached.figures?.length
+        ? `已恢复上次缓存：${cached.figures.length} 张图片；点击“预览结果”后可重新抓取`
+        : '已恢复检索条件，尚未缓存可展示的图片');
+    } catch {}
+  }
+  requestAnimationFrame(() => queryInput.focus());
+}
+
+function closePmcGalleryModal() {
+  pmcGalleryRequestId += 1;
+  pmcGalleryBusy = false;
+  document.getElementById('pmc-gallery-modal')?.classList.add('hidden');
+}
+
+async function searchPmcGallery(loadMore = false) {
+  const isLoadMore = loadMore === true;
+  const queryInput = document.getElementById('pmc-gallery-query');
+  const limitInput = document.getElementById('pmc-gallery-limit');
+  const searchButton = document.getElementById('btn-search-pmc-gallery');
+  const query = isLoadMore
+    ? String(pmcGalleryResult?.query || '').trim()
+    : (queryInput?.value.trim() || '');
+  if (query.length < 2) {
+    setPmcGalleryStatus('请输入至少 2 个字符的检索词', 'error');
+    queryInput?.focus();
+    return;
+  }
+  if (!isLoadMore && pmcGalleryPreviewQuery !== query) {
+    setPmcGalleryPreviewStatus('请先预览当前检索式，再抓取图片', 'error');
+    document.getElementById('btn-preview-pmc-gallery')?.focus();
+    syncPmcGallerySearchButton();
+    return;
+  }
+  if (!isLoadMore && !(await savePmcGallerySearch())) return;
+  if (pmcGalleryBusy) return;
+
+  const articleLimit = isLoadMore ? 20 : (Number(limitInput?.value) || 8);
+  const articleOffset = isLoadMore ? pmcGalleryNextOffset : 0;
+  const metricFilters = isLoadMore
+    ? pmcGalleryActiveMetricFilters
+    : readPmcGalleryMetricFilters();
+  const requestId = ++pmcGalleryRequestId;
+  pmcGalleryBusy = true;
+  if (!isLoadMore) {
+    pmcGalleryResult = null;
+    pmcGalleryNextOffset = 0;
+    pmcGalleryHasMore = false;
+    pmcGalleryActiveMetricFilters = metricFilters;
+    pmcGalleryFigureIndexes.clear();
+  }
+  if (searchButton) {
+    searchButton.disabled = true;
+    searchButton.textContent = '正在检索…';
+  }
+  setPmcGalleryStatus(isLoadMore
+    ? `正在继续筛选并读取第 ${articleOffset + 1}–${articleOffset + articleLimit} 篇…`
+    : `正在筛选并读取最多 ${articleLimit} 篇开放文献…`);
+  renderPmcGallery();
+
+  try {
+    const result = await invoke('search_pmc_gallery', {
+      query,
+      articleLimit,
+      articleOffset,
+      metricFilters,
+      searchId: pmcGalleryActiveHistoryId && Number.isFinite(Number(pmcGalleryActiveHistoryId))
+        ? Number(pmcGalleryActiveHistoryId)
+        : null,
+    });
+    if (requestId !== pmcGalleryRequestId) return;
+    pmcGalleryResult = isLoadMore
+      ? mergePmcGalleryResults(pmcGalleryResult, result)
+      : result;
+    pmcGalleryNextOffset = Number(result.next_offset || 0);
+    pmcGalleryHasMore = Boolean(result.has_more);
+    renderPmcGallery();
+    if (pmcGalleryActiveHistoryId) await loadPmcGalleryHistory();
+    const skipped = Number(pmcGalleryResult.skipped_articles || 0);
+    const filtered = Number(pmcGalleryResult.filtered_articles || 0);
+    const skippedText = skipped ? ` · ${skipped} 篇未提供可解析图像` : '';
+    const filteredText = filtered ? ` · 抓取前排除 ${filtered} 篇` : '';
+    setPmcGalleryStatus(
+      `找到 ${Number(pmcGalleryResult.total_articles || 0).toLocaleString()} 篇开放文献 · 已抓取 ${Number(pmcGalleryResult.scanned_articles || 0)} 篇 · ${Number(pmcGalleryResult.figures?.length || 0)} 张图片${filteredText}${skippedText}`
+    );
+  } catch (error) {
+    if (requestId !== pmcGalleryRequestId) return;
+    if (!isLoadMore) pmcGalleryResult = { figures: [] };
+    renderPmcGallery();
+    setPmcGalleryStatus(String(error), 'error');
+  } finally {
+    if (requestId === pmcGalleryRequestId) {
+      pmcGalleryBusy = false;
+      if (searchButton) {
+        searchButton.textContent = '抓取图库';
+      }
+      syncPmcGallerySearchButton();
+      syncPmcGalleryLoadMore();
+    }
+  }
+}
+
+function setPmcGalleryView(view) {
+  if (!['all', 'figure-number'].includes(view)) return;
+  pmcGalleryView = view;
+  renderPmcGallery();
+}
+
+function setPmcGalleryFigureNumber(value) {
+  const number = Math.trunc(Number(value));
+  if (!Number.isFinite(number) || number < 1 || number > 99) return;
+  pmcGalleryFigureNumber = number;
+  renderPmcGallery();
 }
 
 // ── Init ───────────────────────────────────────
@@ -10370,6 +12252,12 @@ window.addEventListener('DOMContentLoaded', () => {
   // Entry list
   entryListEl     = document.getElementById('entry-list');
   entryItemsEl    = document.getElementById('entry-items');
+  screeningTableEl = document.getElementById('screening-table');
+  btnScreeningTableToggle = document.getElementById('btn-screening-table-toggle');
+  screeningWindowView = document.getElementById('screening-window-view');
+  screeningWindowTitle = document.getElementById('screening-window-title');
+  screeningWindowSubtitle = document.getElementById('screening-window-subtitle');
+  btnScreeningWindowClose = document.getElementById('btn-screening-window-close');
   entryFilter     = document.getElementById('entry-filter');
   entrySortSelect = document.getElementById('entry-sort');
   entrySortDirection = document.getElementById('entry-sort-direction');
@@ -10415,6 +12303,7 @@ window.addEventListener('DOMContentLoaded', () => {
   btnDeletePubmedSnapshot = document.getElementById('btn-delete-pubmed-snapshot');
   pubmedBulkStatus = document.getElementById('pubmed-bulk-status');
   btnPubmedAiScreen = document.getElementById('btn-pubmed-ai-screen');
+  btnPubmedAuthorIdentity = document.getElementById('btn-pubmed-author-identity');
   restoreEntryFilter();
   restoreEntryMetricFilters();
   restoreEntrySortMode();
@@ -10490,6 +12379,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
   setupSidebarResizer();
   setupSidebarSectionToggles();
+  loadPmcGalleryHistory();
   setupListResizer();
   setupPaperChatResizer();
   setupPaperChatAttachmentDrop();
@@ -10686,6 +12576,10 @@ window.addEventListener('DOMContentLoaded', () => {
     row.addEventListener('click', () => {
       const view = row.dataset.view;
       const query = literatureSearchInput?.value.trim() || '';
+      if (view === 'pmc-gallery') {
+        openPmcGalleryModal();
+        return;
+      }
       if (view === 'briefing') {
         enterBriefingMode({ preserveSearch: !!query });
         return;
@@ -10835,6 +12729,8 @@ window.addEventListener('DOMContentLoaded', () => {
     refreshPaperChatAfterScopeDataChange();
   });
 
+  btnScreeningTableToggle?.addEventListener('click', openStandaloneScreeningWindow);
+
   briefingSortSelect?.addEventListener('change', () => {
     briefingSortField = briefingSortSelect.value || 'date';
     briefingSortDirectionMode = 'desc';
@@ -10866,6 +12762,7 @@ window.addEventListener('DOMContentLoaded', () => {
     }
     focusEntryList();
   });
+  btnPubmedAuthorIdentity?.addEventListener('click', openAuthorIdentityReview);
 
   btnEntryBulkSelectAll?.addEventListener('click', () => {
     if (!entrySelectionMode) {
@@ -10930,6 +12827,14 @@ window.addEventListener('DOMContentLoaded', () => {
 
   document.addEventListener('keydown', (e) => {
     const key = typeof e.key === 'string' ? e.key.toLowerCase() : '';
+    if (e.key === 'Escape' && !document.getElementById('pmc-gallery-modal')?.classList.contains('hidden')) {
+      closePmcGalleryModal();
+      return;
+    }
+    if (e.key === 'Escape' && !document.getElementById('word-frequency-modal')?.classList.contains('hidden')) {
+      closeWordFrequencyModal();
+      return;
+    }
     if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && canHandleEntryArrowShortcut(e)) {
       e.preventDefault();
       navigateEntryList(e.key === 'ArrowDown' ? 1 : -1);
@@ -10987,6 +12892,84 @@ window.addEventListener('DOMContentLoaded', () => {
     literatureSearchInput?.focus();
   });
 
+  document.getElementById('btn-word-frequency')?.addEventListener('click', openWordFrequencyModal);
+  document.querySelectorAll('[data-pmc-gallery-close]').forEach(element => {
+    element.addEventListener('click', closePmcGalleryModal);
+  });
+  document.getElementById('btn-new-pmc-gallery-search')?.addEventListener('click', () => openPmcGalleryModal());
+  document.getElementById('pmc-gallery-name')?.addEventListener('change', event => {
+    restorePmcGallerySearchByName(event.currentTarget.value);
+  });
+  document.querySelectorAll('[data-pmc-search-mode]').forEach(button => {
+    button.addEventListener('click', () => setPmcGallerySearchMode(button.dataset.pmcSearchMode));
+  });
+  document.getElementById('btn-generate-pmc-query')?.addEventListener('click', generatePmcGalleryQuery);
+  document.getElementById('btn-build-pmc-author-query')?.addEventListener('click', buildPmcGalleryAuthorQuery);
+  document.getElementById('btn-preview-pmc-gallery')?.addEventListener('click', previewPmcGallerySearch);
+  document.getElementById('btn-save-pmc-gallery-search')?.addEventListener('click', savePmcGallerySearch);
+  document.getElementById('btn-search-pmc-gallery')?.addEventListener('click', () => searchPmcGallery(false));
+  document.getElementById('btn-load-more-pmc-gallery')?.addEventListener('click', () => searchPmcGallery(true));
+  document.getElementById('pmc-gallery-query')?.addEventListener('input', () => {
+    invalidatePmcGalleryPreview('检索式有变化，请重新预览');
+  });
+  document.getElementById('pmc-gallery-query')?.addEventListener('keydown', event => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    previewPmcGallerySearch();
+  });
+  document.querySelectorAll('[data-pmc-gallery-view]').forEach(button => {
+    button.addEventListener('click', () => setPmcGalleryView(button.dataset.pmcGalleryView));
+  });
+  document.getElementById('pmc-gallery-figure-number')?.addEventListener('input', event => {
+    setPmcGalleryFigureNumber(event.currentTarget.value);
+  });
+  [
+    'pmc-gallery-journal-filter',
+    'pmc-gallery-if-filter',
+    'pmc-gallery-q-filter',
+    'pmc-gallery-b-filter',
+    'pmc-gallery-top-filter',
+  ].forEach(id => {
+    document.getElementById(id)?.addEventListener('change', () => {
+      if (!pmcGalleryResult) return;
+      pmcGalleryHasMore = false;
+      syncPmcGalleryLoadMore();
+      setPmcGalleryStatus('筛选条件已更改，请点击“抓取图库”重新筛选');
+    });
+  });
+  document.getElementById('pmc-gallery-results')?.addEventListener('click', event => {
+    const navigationButton = event.target.closest('[data-pmc-gallery-nav]');
+    if (navigationButton) {
+      const groupKey = navigationButton.dataset.pmcGalleryGroupKey;
+      const figureCount = Number(navigationButton.dataset.pmcGalleryGroupCount || 0);
+      const direction = Number(navigationButton.dataset.pmcGalleryNav || 0);
+      if (groupKey && figureCount > 1 && direction) {
+        const currentIndex = pmcGalleryFigureIndexes.get(groupKey) || 0;
+        pmcGalleryFigureIndexes.set(groupKey, (currentIndex + direction + figureCount) % figureCount);
+        renderPmcGallery();
+      }
+      return;
+    }
+    const target = event.target.closest('[data-pmc-gallery-open]');
+    if (target?.dataset.pmcGalleryOpen) openUrl(target.dataset.pmcGalleryOpen);
+  });
+  document.querySelectorAll('[data-word-frequency-close]').forEach(element => {
+    element.addEventListener('click', closeWordFrequencyModal);
+  });
+  document.querySelectorAll('[data-word-frequency-view]').forEach(button => {
+    button.addEventListener('click', () => setWordFrequencyView(button.dataset.wordFrequencyView));
+  });
+  document.querySelectorAll('[data-word-frequency-language]').forEach(button => {
+    button.addEventListener('click', () => setWordFrequencyLanguage(button.dataset.wordFrequencyLanguage));
+  });
+  document.getElementById('btn-translate-word-frequency')?.addEventListener('click', translateWordFrequencyTerms);
+  ['word-frequency-cloud', 'word-frequency-list'].forEach(id => {
+    document.getElementById(id)?.addEventListener('click', event => {
+      const button = event.target.closest('[data-word-frequency-term]');
+      if (button) searchWordFrequencyTerm(button.dataset.wordFrequencyTerm);
+    });
+  });
+
   document.getElementById('btn-new-pubmed-search')?.addEventListener('click', () => openPubmedSearchModal());
   document.getElementById('btn-new-feed')?.addEventListener('click', openFeedAddModal);
   document.querySelectorAll('[data-feed-add-modal-close]').forEach(element => {
@@ -11001,7 +12984,6 @@ window.addEventListener('DOMContentLoaded', () => {
     event.preventDefault();
     createFeedFromModal();
   });
-  document.getElementById('feed-author-name')?.addEventListener('input', syncFeedAddModalState);
   document.getElementById('btn-create-feed')?.addEventListener('click', createFeedFromModal);
   document.querySelectorAll('[data-pubmed-modal-close]').forEach(element => {
     element.addEventListener('click', closePubmedSearchModal);
@@ -11105,10 +13087,11 @@ window.addEventListener('DOMContentLoaded', () => {
   wireTranslationBannerButtons();
   initUpdateChannel();
   ensureNotificationPermission();
-  loadSettings();
-  loadBriefings().then(() => startBriefingScheduler());
-  // Backfill: catch up on any pre-existing entries that still need translation.
-  // The pipeline itself is idempotent; if everything is already translated it
-  // just returns immediately.
-  invoke('start_translation_pipeline').catch(() => {});
+  loadStarredState();
+  if (standaloneScreeningScopeFromUrl()) {
+    activateStandaloneScreeningWindow();
+  } else {
+    loadSettings();
+    loadBriefings().then(() => startBriefingScheduler());
+  }
 });

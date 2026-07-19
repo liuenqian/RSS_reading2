@@ -7,14 +7,13 @@
 //      configured per-feed interval has elapsed since its last fetch.
 //   2. For each feed with `notify=1` that picked up new entries, fires a
 //      native banner notification via `tauri-plugin-notification`.
-//   3. Kicks the translation pipeline so the new entries get translated.
 //
 // One in-flight tick at a time: an `AtomicBool` guards against overlapping
 // runs (which would also cause UNIQUE-constraint churn in the DB).
 
 use crate::db::DbState;
 use crate::models::FetchResult;
-use crate::services::{fetch_service, notify, translation_pipeline, update_service};
+use crate::services::{fetch_service, notify, update_service};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,8 +66,6 @@ async fn tick(app: &AppHandle, running: &Arc<AtomicBool>) {
             dispatch_notifications(app, &r);
             // Tell the UI to reload entries so it stays in sync.
             let _ = app.emit("scheduler-refreshed", &r);
-            // Translate any new entries.
-            translation_pipeline::spawn(app.clone());
         }
         Err(e) => {
             warn!(error = %e, "调度刷新失败");

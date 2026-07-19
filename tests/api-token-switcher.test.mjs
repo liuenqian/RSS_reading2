@@ -25,11 +25,11 @@ test('each model keeps one API key without a second profile manager', () => {
 
 test('model picker is embedded in the monthly usage card', () => {
   const feedList = html.indexOf('id="feed-list"');
-  const sidebarAiTools = html.indexOf('id="sidebar-ai-tools"');
   const globalStatus = html.indexOf('id="global-status"');
+  const sidebarAiTools = html.indexOf('id="sidebar-ai-tools"');
 
-  assert.ok(feedList < sidebarAiTools);
-  assert.ok(sidebarAiTools < globalStatus);
+  assert.ok(feedList < globalStatus);
+  assert.ok(globalStatus < sidebarAiTools);
   assert.match(source, /toolbarApiPicker\.classList\.add\('sidebar-api-picker'\)/);
   assert.match(source, /costMeterBot\?\.append\(toolbarApiPicker\)/);
   assert.match(source, /document\.getElementById\('cost-model'\)\?\.remove\(\)/);
@@ -40,7 +40,7 @@ test('quick switching activates saved models and stays compact', () => {
   const end = source.indexOf('\nfunction ', start + 10);
   const activate = source.slice(start, end > start ? end : undefined);
 
-  assert.match(activate, /start_translation_pipeline/);
+  assert.doesNotMatch(activate, /start_translation_pipeline/);
   assert.match(source, /invoke\('list_ai_models'\)/);
   assert.match(source, /option\.dataset\.modelId = model\.id/);
   assert.match(source, /activateAiModel\(option\.dataset\.modelId\)/);

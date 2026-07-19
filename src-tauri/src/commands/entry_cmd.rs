@@ -1,6 +1,12 @@
 use crate::db::DbState;
-use crate::models::{Entry, EntryIdentifiers, ReadingStats};
-use crate::services::{article_service, entry_service, fulltext_service};
+use crate::models::{
+    Entry, EntryIdentifiers, ReadingStats, WordFrequencyResult, WordFrequencyTranslation,
+};
+use crate::services::{
+    article_service, cost_service, entry_service, fulltext_service, settings_service,
+    translate_service,
+};
+use std::collections::{HashMap, HashSet};
 use tauri::{ipc::Response, State};
 use tracing::{info, warn};
 
@@ -15,9 +21,91 @@ pub fn search_entries(
     state: State<DbState>,
     query: String,
     feed_id: Option<i64>,
+    pubmed_search_id: Option<i64>,
 ) -> Result<Vec<Entry>, String> {
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
-    entry_service::search_entries(&conn, &query, feed_id)
+    entry_service::search_entries(&conn, &query, feed_id, pubmed_search_id)
+}
+
+#[tauri::command]
+pub fn analyze_word_frequency(
+    state: State<DbState>,
+    entry_ids: Vec<i64>,
+    limit: Option<usize>,
+) -> Result<WordFrequencyResult, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    entry_service::analyze_word_frequency(&conn, &entry_ids, limit.unwrap_or(100))
+}
+
+#[tauri::command]
+pub async fn translate_word_frequency_terms(
+    state: State<'_, DbState>,
+    terms: Vec<String>,
+) -> Result<Vec<WordFrequencyTranslation>, String> {
+    let mut seen = HashSet::new();
+    let terms = terms
+        .into_iter()
+        .map(|term| term.trim().to_ascii_lowercase())
+        .filter(|term| !term.is_empty() && term.len() <= 80 && seen.insert(term.clone()))
+        .take(100)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let settings = {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        settings_service::get_settings(&conn)
+    };
+    if settings.api_key.trim().is_empty() {
+        return Err("请先在 AI 设置中配置 API Key".to_string());
+    }
+
+    let serialized = serde_json::to_string(&terms).map_err(|error| error.to_string())?;
+    let output = translate_service::complete_with_prompts(
+        &settings,
+        "你是生物医学术语翻译助手。把英文关键词准确、简洁地翻译成中文。基因、蛋白、药物缩写和专有符号应保留。只返回 JSON 对象，键必须与输入词完全一致，值为中文译名；不要返回 Markdown 或解释。",
+        &format!("翻译以下英文关键词：{}", serialized),
+        0.1,
+        (terms.len() as i64 * 24).clamp(256, 2000),
+    )
+    .await?;
+
+    let cleaned = output
+        .content
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let translations: HashMap<String, String> = serde_json::from_str(cleaned)
+        .map_err(|error| format!("关键词翻译结果格式不正确: {}", error))?;
+    let translated = terms
+        .into_iter()
+        .filter_map(|term| {
+            let value = translations
+                .get(&term)
+                .or_else(|| {
+                    translations
+                        .iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case(&term))
+                        .map(|(_, value)| value)
+                })?
+                .trim()
+                .to_string();
+            (!value.is_empty()).then_some(WordFrequencyTranslation {
+                term,
+                translated: value,
+            })
+        })
+        .collect::<Vec<_>>();
+    if translated.is_empty() {
+        return Err("AI 没有返回可用的关键词翻译".to_string());
+    }
+
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    let _ = cost_service::record_usage(&conn, &settings.provider, &settings.model, &output.usage);
+    Ok(translated)
 }
 
 #[tauri::command]
@@ -255,7 +343,11 @@ pub async fn fetch_entry_authors(
     let pmid = cached_pmid
         .or_else(|| article_service::extract_pmid_from_link(&link))
         .or_else(|| article_service::extract_pmid_from_guid(&guid))
-        .or_else(|| summary.as_deref().and_then(article_service::extract_pmid_from_text));
+        .or_else(|| {
+            summary
+                .as_deref()
+                .and_then(article_service::extract_pmid_from_text)
+        });
     let Some(pmid) = pmid else {
         return Ok(None);
     };
@@ -266,7 +358,7 @@ pub async fn fetch_entry_authors(
             "UPDATE entries SET author = ?1 WHERE id = ?2",
             rusqlite::params![authors, entry_id],
         )
-            .map_err(|e| format!("保存作者失败: {}", e))?;
+        .map_err(|e| format!("保存作者失败: {}", e))?;
     }
     Ok(authors)
 }
@@ -388,14 +480,20 @@ pub async fn resolve_entry_pdf_url(
 }
 
 #[tauri::command]
-pub async fn fetch_entry_pdf(
-    state: State<'_, DbState>,
-    entry_id: i64,
-) -> Result<Response, String> {
-    let url = resolve_entry_pdf_url(state, entry_id)
+pub async fn fetch_entry_pdf(state: State<'_, DbState>, entry_id: i64) -> Result<Response, String> {
+    let url = resolve_entry_pdf_url(state.clone(), entry_id)
         .await?
         .ok_or_else(|| "未找到可直接读取的全文 PDF".to_string())?;
     let bytes = fulltext_service::fetch_pdf_bytes(&url).await?;
+    match pdf_extract::extract_text_from_mem(&bytes) {
+        Ok(text) => {
+            let conn = state.conn.lock().map_err(|e| e.to_string())?;
+            if let Err(error) = entry_service::upsert_pdf_fulltext(&conn, entry_id, &url, &text) {
+                warn!(%error, entry_id, "PDF 全文索引保存失败");
+            }
+        }
+        Err(error) => warn!(%error, entry_id, "PDF 文字提取失败，继续打开原始 PDF"),
+    }
     Ok(Response::new(bytes))
 }
 

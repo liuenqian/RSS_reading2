@@ -1,6 +1,6 @@
 use crate::db::DbState;
 use crate::models::{
-    DeepSeekSettings, KeptPubmedEntry, PubmedArticleRecord, PubmedExportMetric,
+    DeepSeekSettings, KeptPubmedEntry, PubmedArticleRecord, PubmedAuthorRecord, PubmedExportMetric,
     PubmedPreviewAssessment, PubmedPreviewEntryAssessment, PubmedRetrievalOptions,
     PubmedScreeningSuggestion, PubmedSearch, PubmedSearchEntry, PubmedSearchMembershipLabel,
     PubmedSearchPage, PubmedSearchPreview, PubmedSearchProgress, PubmedSearchRunResult, TokenUsage,
@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
+use tracing::warn;
 
 const ESEARCH_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi";
 const EFETCH_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi";
@@ -261,6 +262,203 @@ pub async fn assess_preview(
         },
         usage,
     ))
+}
+
+pub async fn assess_author_preview(
+    settings: &DeepSeekSettings,
+    author_name: &str,
+    affiliation: Option<&str>,
+    query: &str,
+    entries: &[PubmedArticleRecord],
+) -> Result<(PubmedPreviewAssessment, TokenUsage), String> {
+    let author_name = author_name.trim();
+    if author_name.is_empty() {
+        return Err("请先填写作者姓名，再进行 AI 作者评估".to_string());
+    }
+    if author_name.chars().count() > 200 {
+        return Err("作者姓名不能超过 200 个字符".to_string());
+    }
+    let affiliation = affiliation.map(str::trim).filter(|value| !value.is_empty());
+    let query = normalize_query(query)?;
+    if entries.is_empty() {
+        return Err("没有可供 AI 作者评估的 PubMed 预览样本".to_string());
+    }
+    if entries.len() > PREVIEW_LIMIT {
+        return Err(format!("AI 作者评估最多支持 {} 篇预览样本", PREVIEW_LIMIT));
+    }
+
+    let mut assessments_by_pmid = HashMap::new();
+    let mut usage = TokenUsage::default();
+    let mut batch_summaries = Vec::new();
+    let mut suggested_query = None;
+    for batch in entries.chunks(ASSESSMENT_BATCH_SIZE) {
+        let (assessment, batch_usage) =
+            assess_author_preview_batch(settings, author_name, affiliation, &query, batch).await?;
+        add_token_usage(&mut usage, &batch_usage);
+        batch_summaries.push(assessment.summary.clone());
+        if suggested_query.is_none() {
+            suggested_query = assessment.suggested_query.clone();
+        }
+        for item in assessment.entries {
+            assessments_by_pmid.insert(item.pmid.clone(), item);
+        }
+    }
+
+    let assessments = entries
+        .iter()
+        .map(|entry| {
+            assessments_by_pmid.remove(&entry.pmid).unwrap_or_else(|| {
+                PubmedPreviewEntryAssessment {
+                    pmid: entry.pmid.clone(),
+                    status: "maybe".to_string(),
+                    reason: "AI 未返回该样本的明确作者判断".to_string(),
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let relevant_count = assessments
+        .iter()
+        .filter(|item| item.status == "relevant")
+        .count();
+    let maybe_count = assessments
+        .iter()
+        .filter(|item| item.status == "maybe")
+        .count();
+    let irrelevant_count = assessments.len() - relevant_count - maybe_count;
+    let total = assessments.len();
+    let precision = relevant_count as f64 / total as f64;
+    let (precision_low, precision_high) = wilson_interval(relevant_count, total);
+    let suggested_query = suggested_query.and_then(|candidate| {
+        let candidate = candidate.trim();
+        if candidate.is_empty() || candidate == query {
+            None
+        } else {
+            normalize_query(candidate).ok()
+        }
+    });
+    let author_field_count = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .authors
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+        .count();
+    let affiliation_label = affiliation.unwrap_or("未提供参考机构");
+    let summary = format!(
+        "目标作者“{}”{}：抽样 {} 篇中，确认或高度可能属于目标作者 {} 篇，需要人工确认 {} 篇，判为同名作者 {} 篇。AI 已综合姓名变体、单位、共同作者、研究方向和发表时间；逐篇理由保留具体证据。",
+        author_name,
+        if affiliation.is_some() {
+            format!("（机构：{}）", affiliation_label)
+        } else {
+            String::new()
+        },
+        total,
+        relevant_count,
+        maybe_count,
+        irrelevant_count,
+    );
+    let batch_note = batch_summaries
+        .into_iter()
+        .filter(|summary| !summary.trim().is_empty())
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("；");
+    let recall_assessment = format!(
+        "真实查全率不能由当前命中样本直接计算。作者可能存在姓名变体、历史单位和研究方向变化；建议用 1–3 篇确认文献补充作者指纹后重新聚类。{}",
+        batch_note.chars().take(100).collect::<String>()
+    );
+
+    Ok((
+        PubmedPreviewAssessment {
+            verdict: derive_quality_verdict(relevant_count, irrelevant_count, total).to_string(),
+            summary,
+            sample_size: total,
+            abstract_count: author_field_count,
+            relevant_count,
+            maybe_count,
+            irrelevant_count,
+            precision_percent: round_one(precision * 100.0),
+            precision_low_percent: round_one(precision_low * 100.0),
+            precision_high_percent: round_one(precision_high * 100.0),
+            recall_risk: "moderate".to_string(),
+            recall_assessment,
+            coverage_gaps: vec![
+                "姓名可能存在不同罗马化、连字符或首字母写法".to_string(),
+                "机构可能存在中英文名、简称、缩写、旧称或不同译法".to_string(),
+                "作者可能经历机构变更，院系或附属医院写法也会变化".to_string(),
+                "当前记录未必提供 ORCID 或逐位作者对应的单位".to_string(),
+            ],
+            suggested_query,
+            entries: assessments,
+        },
+        usage,
+    ))
+}
+
+fn build_author_assessment_context(
+    author_name: &str,
+    affiliation: Option<&str>,
+    query: &str,
+    entries: &[PubmedArticleRecord],
+) -> String {
+    let mut context = format!(
+        "目标作者：{}\n参考机构：{}\n当前检索式：{}\n\n请先把候选文献按可能的作者身份聚类，再逐篇判断归属。不要逐篇孤立判断。\n\n证据优先级与规则：\n1. 明确提供的 ORCID 是最强证据；当前记录未单独提供 ORCID 时不得编造，ORCID 缺失也不能作为排除依据。\n2. 优先核对目标作者本人对应的单位；Affiliation 字段可能不完整、可能汇总多位作者单位，不能把任意共同作者的单位当作目标作者单位。\n3. 综合姓名全称、缩写、首字母、拼写和罗马化变体。\n4. 机构名称需要归一化比较：识别中文/英文全称、简称、缩写、不同翻译或罗马化、历史名称和单位更名，以及院系、实验室、附属医院、上级机构之间的隶属关系。例如 Soochow University 与 Suzhou University 可能指同一机构，不能仅因原始字符串不同就判为不同机构。参考机构不是每篇文献都必须出现。\n5. 重复出现的共同作者网络是重要身份线索。\n6. 题名和摘要中的研究方向、疾病与技术仅作为连续性的辅助证据，不能单独证明作者身份。\n7. 结合发表年份判断单位、共同作者和研究方向变化在时间上是否合理。\n8. 信息缺失或证据冲突时必须进入“需要确认”，不得强行确认或排除。\n",
+        author_name,
+        affiliation.unwrap_or("未提供，仅按其他身份线索评估"),
+        query,
+    );
+
+    for (index, entry) in entries.iter().enumerate() {
+        let abstract_text = entry.abstract_text.as_deref().unwrap_or("暂无摘要");
+        let abstract_text = abstract_text.chars().take(1_000).collect::<String>();
+        context.push_str(&format!(
+            "\n[{}] PMID={}\nAuthors：{}\nAffiliation：{}\n发表日期：{}\n期刊：{}\n题名：{}\n摘要：{}\n",
+            index + 1,
+            entry.pmid,
+            entry.authors.as_deref().unwrap_or("暂无作者字段"),
+            entry.affiliation.as_deref().unwrap_or("暂无机构字段"),
+            entry
+                .publication_date
+                .as_deref()
+                .or(entry.publication_date_raw.as_deref())
+                .unwrap_or("未知"),
+            entry.journal.as_deref().unwrap_or("未知"),
+            entry.title,
+            abstract_text,
+        ));
+    }
+
+    context.push_str(
+        "\n四档判定与现有状态映射：\n- relevant：确认作者或高度可能。理由必须以“确认作者：”或“高度可能：”开头；确认作者需要强身份信息，高度可能需要至少两类相互独立且一致的证据。\n- maybe：需要确认。理由以“需要确认：”开头，说明缺失或冲突的证据。\n- irrelevant：同名作者。理由以“同名作者：”开头，说明相互冲突的单位、共同作者群、研究方向或时间线；不能仅因单位缺失或研究方向不同就排除。\n\nsummary 应概括识别出的可能身份组，并尽量写出各组的文献数、主要单位、常见共同作者和研究方向。suggested_query 以查全为优先，只补充可靠姓名变体；不要默认加入机构硬过滤。\n只返回 JSON：{\"summary\":\"中文总体判断，不超过180字\",\"suggested_query\":\"完整可运行的 PubMed 作者检索式；无需修改则为 null\",\"entries\":[{\"pmid\":\"...\",\"status\":\"relevant|maybe|irrelevant\",\"reason\":\"中文理由，不超过60字\"}]}。必须覆盖每个 PMID，不得编造输入中没有的信息。",
+    );
+    context
+}
+
+async fn assess_author_preview_batch(
+    settings: &DeepSeekSettings,
+    author_name: &str,
+    affiliation: Option<&str>,
+    query: &str,
+    entries: &[PubmedArticleRecord],
+) -> Result<(PubmedPreviewAssessment, TokenUsage), String> {
+    let context = build_author_assessment_context(author_name, affiliation, query, entries);
+    let output = translate_service::complete_with_messages(
+        settings,
+        vec![
+            (
+                "system".to_string(),
+                "你是一名 PubMed 作者身份消歧专家。你会把候选文献聚类为可能的作者身份，按 ORCID、目标作者单位、姓名变体、历史单位、共同作者网络、研究方向和发表时间的证据组合判断。研究主题只能作为辅助证据。不得编造输入中没有的身份信息。".to_string(),
+            ),
+            ("user".to_string(), context),
+        ],
+        0.1,
+        4_000,
+    )
+    .await?;
+    let assessment = parse_preview_assessment(&output.content, query, entries)?;
+    Ok((assessment, output.usage))
 }
 
 async fn assess_preview_batch(
@@ -703,6 +901,7 @@ pub fn create_search_with_options(
 }
 
 pub fn list_searches(conn: &Connection) -> Result<Vec<PubmedSearch>, String> {
+    repair_initial_partial_snapshots(conn)?;
     let mut stmt = conn
         .prepare(&search_select_sql(
             "",
@@ -717,6 +916,7 @@ pub fn list_searches(conn: &Connection) -> Result<Vec<PubmedSearch>, String> {
 }
 
 pub fn get_search(conn: &Connection, id: i64) -> Result<PubmedSearch, String> {
+    repair_initial_partial_snapshots(conn)?;
     conn.query_row(&search_select_sql("WHERE s.id = ?1", ""), [id], map_search)
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => "PubMed 检索不存在".to_string(),
@@ -931,44 +1131,46 @@ async fn run_search_inner(
 
         match fetch_records(&client, chunk).await {
             Ok(records) => {
-                let by_pmid = records
-                    .into_iter()
-                    .map(|record| (record.pmid.clone(), record))
-                    .collect::<HashMap<_, _>>();
                 let conn = state.conn.lock().map_err(|e| e.to_string())?;
-                let tx = conn
-                    .unchecked_transaction()
-                    .map_err(|e| format!("开始 PubMed 批次事务失败: {}", e))?;
-                for pmid in chunk {
-                    if let Some(record) = by_pmid.get(pmid) {
-                        match upsert_search_record(&tx, search_id, run_id, record) {
-                            Ok((entry_id, added)) => {
-                                tx.execute(
-                                    "UPDATE pubmed_search_run_items
-                                     SET status = ?1, entry_id = ?2, error_message = NULL
-                                     WHERE run_id = ?3 AND pmid = ?4",
-                                    params![
-                                        if added { "fetched" } else { "reused" },
-                                        entry_id,
-                                        run_id,
-                                        pmid
-                                    ],
-                                )
-                                .map_err(|e| format!("更新 PubMed 运行项失败: {}", e))?;
-                            }
-                            Err(error) => mark_run_item_failed(&tx, run_id, pmid, &error)?,
-                        }
-                    } else {
-                        mark_run_item_failed(&tx, run_id, pmid, "EFetch 未返回该 PMID")?;
-                    }
-                }
-                tx.commit()
-                    .map_err(|e| format!("提交 PubMed 批次失败: {}", e))?;
+                persist_pubmed_records(&conn, search_id, run_id, chunk, records)?;
             }
-            Err(error) => {
-                let conn = state.conn.lock().map_err(|e| e.to_string())?;
+            Err(batch_error) => {
+                warn!(
+                    search_id,
+                    run_id,
+                    pmids = chunk.len(),
+                    error = %batch_error,
+                    "PubMed 批量获取失败，降级为逐篇获取"
+                );
                 for pmid in chunk {
-                    mark_run_item_failed(&conn, run_id, pmid, &error)?;
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+                        finalize_run_error(&conn, run_id, "cancelled", "用户取消")?;
+                        let result = run_result(&conn, run_id, Some("用户取消".to_string()))?;
+                        emit_result_progress(app, &result);
+                        return Ok(result);
+                    }
+                    match fetch_records(&client, std::slice::from_ref(pmid)).await {
+                        Ok(records) => {
+                            let conn = state.conn.lock().map_err(|e| e.to_string())?;
+                            persist_pubmed_records(
+                                &conn,
+                                search_id,
+                                run_id,
+                                std::slice::from_ref(pmid),
+                                records,
+                            )?;
+                        }
+                        Err(error) => {
+                            let conn = state.conn.lock().map_err(|e| e.to_string())?;
+                            mark_run_item_failed(
+                                &conn,
+                                run_id,
+                                pmid,
+                                &format!("批量获取失败: {batch_error}; 单篇重试失败: {error}"),
+                            )?;
+                        }
+                    }
                 }
             }
         }
@@ -994,7 +1196,7 @@ async fn run_search_inner(
     if failed == 0 {
         complete_run(&conn, search_id, run_id)?;
     } else {
-        finalize_run_error(&conn, run_id, "partial", "部分 PMID 获取失败，可继续重试")?;
+        finalize_partial_run(&conn, search_id, run_id, "部分 PMID 获取失败，可继续重试")?;
     }
     let result = run_result(&conn, run_id, None)?;
     emit_result_progress(app, &result);
@@ -1375,6 +1577,47 @@ fn reuse_local_run_items(
     Ok(new_pmids)
 }
 
+fn persist_pubmed_records(
+    conn: &Connection,
+    search_id: i64,
+    run_id: i64,
+    pmids: &[String],
+    records: Vec<PubmedArticleRecord>,
+) -> Result<(), String> {
+    let by_pmid = records
+        .into_iter()
+        .map(|record| (record.pmid.clone(), record))
+        .collect::<HashMap<_, _>>();
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("开始 PubMed 批次事务失败: {}", e))?;
+    for pmid in pmids {
+        if let Some(record) = by_pmid.get(pmid) {
+            match upsert_search_record(&tx, search_id, run_id, record) {
+                Ok((entry_id, added)) => {
+                    tx.execute(
+                        "UPDATE pubmed_search_run_items
+                         SET status = ?1, entry_id = ?2, error_message = NULL
+                         WHERE run_id = ?3 AND pmid = ?4",
+                        params![
+                            if added { "fetched" } else { "reused" },
+                            entry_id,
+                            run_id,
+                            pmid
+                        ],
+                    )
+                    .map_err(|e| format!("更新 PubMed 运行项失败: {}", e))?;
+                }
+                Err(error) => mark_run_item_failed(&tx, run_id, pmid, &error)?,
+            }
+        } else {
+            mark_run_item_failed(&tx, run_id, pmid, "EFetch 未返回该 PMID")?;
+        }
+    }
+    tx.commit()
+        .map_err(|e| format!("提交 PubMed 批次失败: {}", e))
+}
+
 fn upsert_search_record(
     conn: &Connection,
     search_id: i64,
@@ -1461,6 +1704,7 @@ fn upsert_search_record(
         record.doi.as_deref(),
         "pubmed",
     )?;
+    replace_structured_authors(conn, entry_id, &record.structured_authors)?;
 
     let existing_membership = conn
         .query_row(
@@ -1497,37 +1741,87 @@ fn upsert_search_record(
     Ok((entry_id, !existing_membership))
 }
 
+fn replace_structured_authors(
+    conn: &Connection,
+    entry_id: i64,
+    authors: &[PubmedAuthorRecord],
+) -> Result<(), String> {
+    if authors.is_empty() {
+        return Ok(());
+    }
+    if authors
+        .iter()
+        .any(|author| author.display_name.trim().is_empty())
+    {
+        return Err("PubMed 作者姓名不能为空".to_string());
+    }
+    if authors
+        .iter()
+        .flat_map(|author| author.affiliations.iter())
+        .any(|affiliation| affiliation.trim().is_empty())
+    {
+        return Err("PubMed 作者单位不能为空".to_string());
+    }
+
+    conn.execute_batch("SAVEPOINT replace_pubmed_structured_authors;")
+        .map_err(|e| format!("开始保存 PubMed 作者结构失败: {}", e))?;
+    let result = (|| -> Result<(), String> {
+        conn.execute(
+            "DELETE FROM pubmed_entry_authors WHERE entry_id = ?1",
+            [entry_id],
+        )
+        .map_err(|e| format!("清理旧 PubMed 作者结构失败: {}", e))?;
+        for author in authors {
+            conn.execute(
+                "INSERT INTO pubmed_entry_authors (
+                    entry_id, author_order, last_name, fore_name, initials,
+                    collective_name, display_name, orcid
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    entry_id,
+                    author.author_order as i64,
+                    author.last_name.as_deref(),
+                    author.fore_name.as_deref(),
+                    author.initials.as_deref(),
+                    author.collective_name.as_deref(),
+                    author.display_name.as_str(),
+                    author.orcid.as_deref(),
+                ],
+            )
+            .map_err(|e| format!("保存 PubMed 作者失败: {}", e))?;
+            let entry_author_id = conn.last_insert_rowid();
+            for (index, affiliation) in author.affiliations.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO pubmed_entry_author_affiliations (
+                        entry_author_id, affiliation_order, raw_text
+                     ) VALUES (?1, ?2, ?3)",
+                    params![entry_author_id, index as i64 + 1, affiliation],
+                )
+                .map_err(|e| format!("保存 PubMed 作者单位失败: {}", e))?;
+            }
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => conn
+            .execute_batch("RELEASE SAVEPOINT replace_pubmed_structured_authors;")
+            .map_err(|e| format!("提交 PubMed 作者结构失败: {}", e)),
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT replace_pubmed_structured_authors;
+                 RELEASE SAVEPOINT replace_pubmed_structured_authors;",
+            );
+            Err(error)
+        }
+    }
+}
+
 fn complete_run(conn: &Connection, search_id: i64, run_id: i64) -> Result<(), String> {
     let tx = conn
         .unchecked_transaction()
         .map_err(|e| format!("开始完成 PubMed 运行事务失败: {}", e))?;
-    tx.execute(
-        "INSERT OR IGNORE INTO pubmed_search_entries
-            (search_id, entry_id, first_seen_run_id, is_current_match, pubmed_rank)
-         SELECT ?1, item.entry_id, ?2, 0, item.rank
-         FROM pubmed_search_run_items item
-         WHERE item.run_id = ?2 AND item.entry_id IS NOT NULL",
-        params![search_id, run_id],
-    )
-    .map_err(|e| format!("补全 PubMed 批次归属失败: {}", e))?;
-    tx.execute(
-        "UPDATE pubmed_search_entries SET is_current_match = 0 WHERE search_id = ?1",
-        [search_id],
-    )
-    .map_err(|e| format!("重置 PubMed 当前匹配失败: {}", e))?;
-    tx.execute(
-        "UPDATE pubmed_search_entries
-         SET is_current_match = 1,
-             pubmed_rank = (
-                SELECT item.rank FROM pubmed_search_run_items item
-                WHERE item.run_id = ?2 AND item.entry_id = pubmed_search_entries.entry_id
-             )
-         WHERE search_id = ?1 AND entry_id IN (
-             SELECT entry_id FROM pubmed_search_run_items WHERE run_id = ?2 AND entry_id IS NOT NULL
-         )",
-        params![search_id, run_id],
-    )
-    .map_err(|e| format!("提交 PubMed 当前匹配失败: {}", e))?;
+    publish_run_snapshot(&tx, search_id, run_id)?;
     let (added, reused): (i64, i64) = tx
         .query_row(
             "SELECT
@@ -1561,6 +1855,120 @@ fn complete_run(conn: &Connection, search_id: i64, run_id: i64) -> Result<(), St
     .map_err(|e| format!("更新 PubMed 检索成功时间失败: {}", e))?;
     tx.commit()
         .map_err(|e| format!("提交 PubMed 完成事务失败: {}", e))
+}
+
+fn publish_run_snapshot(conn: &Connection, search_id: i64, run_id: i64) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR IGNORE INTO pubmed_search_entries
+            (search_id, entry_id, first_seen_run_id, is_current_match, pubmed_rank)
+         SELECT ?1, item.entry_id, ?2, 0, item.rank
+         FROM pubmed_search_run_items item
+         WHERE item.run_id = ?2 AND item.entry_id IS NOT NULL",
+        params![search_id, run_id],
+    )
+    .map_err(|e| format!("补全 PubMed 批次归属失败: {}", e))?;
+    conn.execute(
+        "UPDATE pubmed_search_entries SET is_current_match = 0 WHERE search_id = ?1",
+        [search_id],
+    )
+    .map_err(|e| format!("重置 PubMed 当前匹配失败: {}", e))?;
+    conn.execute(
+        "UPDATE pubmed_search_entries
+         SET is_current_match = 1,
+             pubmed_rank = (
+                SELECT item.rank FROM pubmed_search_run_items item
+                WHERE item.run_id = ?2 AND item.entry_id = pubmed_search_entries.entry_id
+             )
+         WHERE search_id = ?1 AND entry_id IN (
+             SELECT entry_id FROM pubmed_search_run_items WHERE run_id = ?2 AND entry_id IS NOT NULL
+         )",
+        params![search_id, run_id],
+    )
+    .map_err(|e| format!("提交 PubMed 当前匹配失败: {}", e))?;
+    Ok(())
+}
+
+fn publish_partial_run_successes(
+    conn: &Connection,
+    search_id: i64,
+    run_id: i64,
+    replace_current_snapshot: bool,
+) -> Result<i64, String> {
+    if replace_current_snapshot {
+        publish_run_snapshot(conn, search_id, run_id)?;
+    } else {
+        conn.execute(
+            "INSERT OR IGNORE INTO pubmed_search_entries
+                (search_id, entry_id, first_seen_run_id, is_current_match, pubmed_rank)
+             SELECT ?1, item.entry_id, ?2, 1, item.rank
+             FROM pubmed_search_run_items item
+             WHERE item.run_id = ?2 AND item.entry_id IS NOT NULL",
+            params![search_id, run_id],
+        )
+        .map_err(|e| format!("补全 PubMed 部分成功归属失败: {}", e))?;
+        conn.execute(
+            "UPDATE pubmed_search_entries
+             SET is_current_match = 1,
+                 last_seen_at = datetime('now'),
+                 pubmed_rank = (
+                    SELECT item.rank FROM pubmed_search_run_items item
+                    WHERE item.run_id = ?2 AND item.entry_id = pubmed_search_entries.entry_id
+                 )
+             WHERE search_id = ?1 AND entry_id IN (
+                 SELECT entry_id FROM pubmed_search_run_items
+                 WHERE run_id = ?2 AND entry_id IS NOT NULL
+             )",
+            params![search_id, run_id],
+        )
+        .map_err(|e| format!("发布 PubMed 部分成功结果失败: {}", e))?;
+    }
+    conn.query_row(
+        "SELECT COUNT(*) FROM pubmed_search_entries
+         WHERE search_id = ?1 AND is_current_match = 1",
+        [search_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map_err(|e| format!("统计 PubMed 当前结果失败: {}", e))
+}
+
+fn finalize_partial_run(
+    conn: &Connection,
+    search_id: i64,
+    run_id: i64,
+    message: &str,
+) -> Result<(), String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("开始提交 PubMed 部分结果事务失败: {}", e))?;
+    let has_successful_snapshot: bool = tx
+        .query_row(
+            "SELECT last_success_at IS NOT NULL FROM pubmed_searches WHERE id = ?1",
+            [search_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("读取 PubMed 检索状态失败: {}", e))?;
+    let (added, reused, failed) = run_item_counts(&tx, run_id)?;
+    if added + reused > 0 {
+        let visible_count =
+            publish_partial_run_successes(&tx, search_id, run_id, !has_successful_snapshot)?;
+        tx.execute(
+            "UPDATE pubmed_searches SET
+                last_success_at = datetime('now'), last_result_count = ?2
+             WHERE id = ?1",
+            params![search_id, visible_count],
+        )
+        .map_err(|e| format!("更新 PubMed 可用结果失败: {}", e))?;
+    }
+    tx.execute(
+        "UPDATE pubmed_search_runs SET
+            status = 'partial', completed_at = datetime('now'), added_count = ?1,
+            reused_count = ?2, failed_count = ?3, error_message = ?4
+         WHERE id = ?5",
+        params![added, reused, failed, message, run_id],
+    )
+    .map_err(|e| format!("保存 PubMed 部分运行结果失败: {}", e))?;
+    tx.commit()
+        .map_err(|e| format!("提交 PubMed 部分结果事务失败: {}", e))
 }
 
 fn finalize_run_error(
@@ -1661,7 +2069,7 @@ pub fn list_search_entries(
                     pse.is_current_match, pse.pubmed_rank, e.title,
                     tt.translated_text, e.summary, ts.translated_text, e.author, e.source,
                     e.publication_date, e.publication_date_raw, e.publication_date_precision,
-                    e.publication_sort_key, e.pmid, e.pmcid, e.doi, e.affiliation,
+                    e.publication_sort_key, e.published_at, e.pmid, e.pmcid, e.doi, e.affiliation,
                     COALESCE(e.has_free_fulltext, 0), e.is_read, e.read_at,
                     EXISTS(SELECT 1 FROM reading_notes rn WHERE rn.entry_id = e.id),
                     (SELECT GROUP_CONCAT(tag, char(31)) FROM (
@@ -1691,25 +2099,92 @@ pub fn list_search_entries(
                 summary: row.get(9)?,
                 summary_translated: row.get(10)?,
                 authors: row.get(11)?,
+                structured_authors: Vec::new(),
                 journal: row.get(12)?,
                 publication_date: row.get(13)?,
                 publication_date_raw: row.get(14)?,
                 publication_date_precision: row.get(15)?,
                 publication_sort_key: row.get(16)?,
-                pmid: row.get(17)?,
-                pmcid: row.get(18)?,
-                doi: row.get(19)?,
-                affiliation: row.get(20)?,
-                has_free_fulltext: row.get::<_, i64>(21)? != 0,
-                is_read: row.get::<_, i64>(22)? != 0,
-                read_at: row.get(23)?,
-                has_reading_note: row.get::<_, i64>(24)? != 0,
-                tags: parse_tag_list(row.get::<_, Option<String>>(25)?.as_deref()),
+                published_at: row.get(17)?,
+                pmid: row.get(18)?,
+                pmcid: row.get(19)?,
+                doi: row.get(20)?,
+                affiliation: row.get(21)?,
+                has_free_fulltext: row.get::<_, i64>(22)? != 0,
+                is_read: row.get::<_, i64>(23)? != 0,
+                read_at: row.get(24)?,
+                has_reading_note: row.get::<_, i64>(25)? != 0,
+                tags: parse_tag_list(row.get::<_, Option<String>>(26)?.as_deref()),
             })
         })
         .map_err(|e| format!("查询 PubMed 批次文献失败: {}", e))?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("查询 PubMed 批次文献失败: {}", e))
+    let mut entries = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("查询 PubMed 批次文献失败: {}", e))?;
+    load_search_entry_structured_authors(conn, search_id, &mut entries)?;
+    Ok(entries)
+}
+
+fn load_search_entry_structured_authors(
+    conn: &Connection,
+    search_id: i64,
+    entries: &mut [PubmedSearchEntry],
+) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT author.entry_id, author.author_order, author.last_name, author.fore_name,
+                    author.initials, author.collective_name, author.display_name, author.orcid,
+                    affiliation.raw_text
+             FROM pubmed_entry_authors author
+             JOIN pubmed_search_entries search_entry ON search_entry.entry_id = author.entry_id
+             LEFT JOIN pubmed_entry_author_affiliations affiliation
+                    ON affiliation.entry_author_id = author.id
+             WHERE search_entry.search_id = ?1 AND search_entry.is_current_match = 1
+             ORDER BY author.entry_id, author.author_order, affiliation.affiliation_order",
+        )
+        .map_err(|e| format!("准备读取结构化作者失败: {}", e))?;
+    let rows = stmt
+        .query_map([search_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)? as usize,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })
+        .map_err(|e| format!("读取结构化作者失败: {}", e))?;
+    let mut by_entry: HashMap<i64, Vec<PubmedAuthorRecord>> = HashMap::new();
+    for row in rows {
+        let (entry_id, author_order, last_name, fore_name, initials, collective_name, display_name, orcid, affiliation) =
+            row.map_err(|e| format!("解析结构化作者失败: {}", e))?;
+        let authors = by_entry.entry(entry_id).or_default();
+        if authors.last().is_none_or(|author| author.author_order != author_order) {
+            authors.push(PubmedAuthorRecord {
+                author_order,
+                last_name,
+                fore_name,
+                initials,
+                collective_name,
+                display_name,
+                orcid,
+                affiliations: Vec::new(),
+            });
+        }
+        if let Some(affiliation) = affiliation.filter(|value| !value.trim().is_empty()) {
+            if let Some(author) = authors.last_mut() {
+                author.affiliations.push(affiliation);
+            }
+        }
+    }
+    for entry in entries {
+        entry.structured_authors = by_entry.remove(&entry.entry_id).unwrap_or_default();
+    }
+    Ok(())
 }
 
 fn parse_tag_list(raw: Option<&str>) -> Vec<String> {
@@ -1768,6 +2243,58 @@ pub fn set_screening_status(
     let mut entries = list_search_entries(conn, search_id)?;
     entries.retain(|entry| entry_ids.contains(&entry.entry_id));
     Ok(entries)
+}
+
+pub fn get_author_identity_state(
+    conn: &Connection,
+    search_id: i64,
+) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT state_json FROM pubmed_author_identity_states WHERE search_id = ?1",
+        [search_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| format!("读取作者身份状态失败: {}", e))
+}
+
+pub fn save_author_identity_state(
+    conn: &Connection,
+    search_id: i64,
+    state_json: &str,
+) -> Result<(), String> {
+    if state_json.len() > 512 * 1024 {
+        return Err("作者身份状态不能超过 512 KB".to_string());
+    }
+    let parsed: Value = serde_json::from_str(state_json)
+        .map_err(|e| format!("作者身份状态不是有效 JSON: {}", e))?;
+    if !parsed.is_object() {
+        return Err("作者身份状态必须是 JSON 对象".to_string());
+    }
+    let search_exists = conn
+        .query_row(
+            "SELECT 1 FROM pubmed_searches WHERE id = ?1",
+            [search_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| format!("验证作者检索失败: {}", e))?
+        .is_some();
+    if !search_exists {
+        return Err("作者检索不存在".to_string());
+    }
+    conn.execute(
+        "INSERT INTO pubmed_author_identity_states
+            (search_id, schema_version, state_json, updated_at)
+         VALUES (?1, 1, ?2, datetime('now'))
+         ON CONFLICT(search_id) DO UPDATE SET
+            schema_version = excluded.schema_version,
+            state_json = excluded.state_json,
+            updated_at = excluded.updated_at",
+        params![search_id, state_json],
+    )
+    .map_err(|e| format!("保存作者身份状态失败: {}", e))?;
+    Ok(())
 }
 
 pub fn apply_screening_suggestions(
@@ -2319,6 +2846,38 @@ fn search_select_sql(filter: &str, order: &str) -> String {
     )
 }
 
+fn repair_initial_partial_snapshots(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.id, r.id
+             FROM pubmed_searches s
+             JOIN pubmed_search_runs r ON r.search_id = s.id
+             WHERE s.last_success_at IS NULL
+               AND r.status = 'partial'
+               AND r.id = (
+                   SELECT latest.id FROM pubmed_search_runs latest
+                   WHERE latest.search_id = s.id
+                   ORDER BY latest.id DESC LIMIT 1
+               )
+               AND EXISTS (
+                   SELECT 1 FROM pubmed_search_run_items item
+                   WHERE item.run_id = r.id AND item.entry_id IS NOT NULL
+               )",
+        )
+        .map_err(|e| format!("检查 PubMed 历史部分结果失败: {}", e))?;
+    let candidates = stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+        .map_err(|e| format!("读取 PubMed 历史部分结果失败: {}", e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("读取 PubMed 历史部分结果失败: {}", e))?;
+    drop(stmt);
+
+    for (search_id, run_id) in candidates {
+        finalize_partial_run(conn, search_id, run_id, "部分 PMID 获取失败，可继续重试")?;
+    }
+    Ok(())
+}
+
 fn map_search(row: &rusqlite::Row<'_>) -> rusqlite::Result<PubmedSearch> {
     Ok(PubmedSearch {
         id: row.get(0)?,
@@ -2482,7 +3041,14 @@ fn parse_article(article: Node<'_, '_>) -> Result<PubmedArticleRecord, String> {
         })
         .collect::<Vec<_>>();
     let abstract_text = (!abstract_parts.is_empty()).then(|| abstract_parts.join("\n\n"));
-    let authors = parse_authors(article);
+    let structured_authors = parse_authors(article);
+    let authors = (!structured_authors.is_empty()).then(|| {
+        structured_authors
+            .iter()
+            .map(|author| author.display_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
     let journal =
         descendant_text(article, "Title").or_else(|| descendant_text(article, "ISOAbbreviation"));
     let affiliation = descendant_text(article, "Affiliation");
@@ -2497,6 +3063,7 @@ fn parse_article(article: Node<'_, '_>) -> Result<PubmedArticleRecord, String> {
         title,
         abstract_text,
         authors,
+        structured_authors,
         journal,
         affiliation,
         publication_date: date.iso,
@@ -2615,28 +3182,64 @@ fn parse_season_month(raw: &str) -> Option<u32> {
     }
 }
 
-fn parse_authors(article: Node<'_, '_>) -> Option<String> {
-    let names = article
+fn parse_authors(article: Node<'_, '_>) -> Vec<PubmedAuthorRecord> {
+    article
         .descendants()
         .filter(|node| node.has_tag_name("Author"))
-        .filter_map(|author| {
+        .enumerate()
+        .filter_map(|(index, author)| {
             let collective = direct_child_text(author, "CollectiveName");
-            if collective.is_some() {
-                return collective;
-            }
-            let last = direct_child_text(author, "LastName").unwrap_or_default();
-            let fore_name = direct_child_text(author, "ForeName").unwrap_or_default();
-            let initials = direct_child_text(author, "Initials").unwrap_or_default();
-            let given_name = if fore_name.is_empty() {
-                initials
+            let last_name = direct_child_text(author, "LastName");
+            let fore_name = direct_child_text(author, "ForeName");
+            let initials = direct_child_text(author, "Initials");
+            let display_name = if let Some(collective) = collective.as_deref() {
+                collective.to_string()
             } else {
-                fore_name
+                let given_name = fore_name.as_deref().or(initials.as_deref()).unwrap_or("");
+                format!("{} {}", given_name, last_name.as_deref().unwrap_or(""))
+                    .trim()
+                    .to_string()
             };
-            let name = format!("{} {}", given_name, last).trim().to_string();
-            (!name.is_empty()).then_some(name)
+            if display_name.is_empty() {
+                return None;
+            }
+            let orcid = author
+                .children()
+                .find(|child| {
+                    child.has_tag_name("Identifier")
+                        && child
+                            .attribute("Source")
+                            .is_some_and(|source| source.eq_ignore_ascii_case("ORCID"))
+                })
+                .map(node_text)
+                .and_then(normalize_orcid);
+            let affiliations = author
+                .children()
+                .filter(|child| child.has_tag_name("AffiliationInfo"))
+                .filter_map(|info| descendant_text(info, "Affiliation"))
+                .collect();
+            Some(PubmedAuthorRecord {
+                author_order: index + 1,
+                last_name,
+                fore_name,
+                initials,
+                collective_name: collective,
+                display_name,
+                orcid,
+                affiliations,
+            })
         })
-        .collect::<Vec<_>>();
-    (!names.is_empty()).then(|| names.join(", "))
+        .collect()
+}
+
+fn normalize_orcid(value: String) -> Option<String> {
+    let value = value
+        .trim()
+        .trim_start_matches("https://orcid.org/")
+        .trim_start_matches("http://orcid.org/")
+        .trim()
+        .to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 fn article_id(article: Node<'_, '_>, kind: &str) -> Option<String> {
@@ -2861,7 +3464,12 @@ mod tests {
             <Abstract><AbstractText Label="BACKGROUND">First part.</AbstractText><AbstractText>Second part.</AbstractText></Abstract>
             <AuthorList>
               <Author><LastName>Li</LastName><ForeName>Qian</ForeName><Initials>Q</Initials><AffiliationInfo><Affiliation>Institute A</Affiliation></AffiliationInfo></Author>
-              <Author><LastName>Smith</LastName><ForeName>Alice Beth</ForeName><Initials>AB</Initials></Author>
+              <Author>
+                <LastName>Smith</LastName><ForeName>Alice Beth</ForeName><Initials>AB</Initials>
+                <Identifier Source="ORCID">https://orcid.org/0000-0002-1825-0097</Identifier>
+                <AffiliationInfo><Affiliation>Institute B</Affiliation></AffiliationInfo>
+                <AffiliationInfo><Affiliation>Hospital C</Affiliation></AffiliationInfo>
+              </Author>
             </AuthorList>
           </Article>
         </MedlineCitation>
@@ -2937,6 +3545,28 @@ mod tests {
                 pmid TEXT NOT NULL, rank INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
                 entry_id INTEGER, error_message TEXT, PRIMARY KEY(run_id, pmid)
             );
+            CREATE TABLE pubmed_author_identity_states (
+                search_id INTEGER PRIMARY KEY REFERENCES pubmed_searches(id) ON DELETE CASCADE,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                state_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE pubmed_entry_authors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+                author_order INTEGER NOT NULL,
+                last_name TEXT, fore_name TEXT, initials TEXT, collective_name TEXT,
+                display_name TEXT NOT NULL, orcid TEXT,
+                UNIQUE(entry_id, author_order)
+            );
+            CREATE TABLE pubmed_entry_author_affiliations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_author_id INTEGER NOT NULL
+                    REFERENCES pubmed_entry_authors(id) ON DELETE CASCADE,
+                affiliation_order INTEGER NOT NULL,
+                raw_text TEXT NOT NULL,
+                UNIQUE(entry_author_id, affiliation_order)
+            );
             ",
         )
         .expect("create schema");
@@ -2951,6 +3581,7 @@ mod tests {
             title: title.to_string(),
             abstract_text: Some("Abstract".to_string()),
             authors: Some("Author A".to_string()),
+            structured_authors: Vec::new(),
             journal: Some("Journal".to_string()),
             affiliation: None,
             publication_date: Some("2026-07".to_string()),
@@ -2959,6 +3590,120 @@ mod tests {
             publication_sort_key: Some(20260700),
             has_free_fulltext: false,
         }
+    }
+
+    #[test]
+    fn author_assessment_uses_identity_clustering_evidence() {
+        let mut candidate = record("123", "Cardiac imaging after infarction");
+        candidate.authors = Some("Ji-Song Ji; Wei Zhang".to_string());
+        candidate.affiliation = Some("Lishui Central Hospital".to_string());
+        candidate.abstract_text = Some("Cardiac imaging research".to_string());
+        candidate.publication_date = Some("2024-05".to_string());
+
+        let context = build_author_assessment_context(
+            "Jisong Ji",
+            Some("Lishui Central Hospital"),
+            "Ji J[Author]",
+            &[candidate],
+        );
+
+        assert!(context.contains("先把候选文献按可能的作者身份聚类"));
+        assert!(context.contains("ORCID 缺失也不能作为排除依据"));
+        assert!(context.contains("目标作者本人对应的单位"));
+        assert!(context.contains("共同作者网络"));
+        assert!(context.contains("研究方向"));
+        assert!(context.contains("发表年份"));
+        assert!(context.contains("确认作者或高度可能"));
+        assert!(context.contains("需要确认"));
+        assert!(context.contains("同名作者"));
+        assert!(context.contains("Cardiac imaging research"));
+        assert!(!context.contains("不得作为作者归属依据"));
+    }
+
+    #[test]
+    fn persists_author_identity_state_for_a_search() {
+        let conn = search_db();
+        let search = create_search(&conn, "【作者 | Ji Jiansong】", None, "Ji J[Author]")
+            .expect("create author search");
+        let state = r#"{"seedIds":[1,2],"confirmedIds":[3],"decisions":{"group-a":"confirmed"}}"#;
+
+        save_author_identity_state(&conn, search.id, state).expect("save identity state");
+        assert_eq!(
+            get_author_identity_state(&conn, search.id)
+                .expect("read identity state")
+                .as_deref(),
+            Some(state)
+        );
+        assert!(save_author_identity_state(&conn, search.id, "[]").is_err());
+        assert!(save_author_identity_state(&conn, search.id, "not-json").is_err());
+    }
+
+    #[test]
+    fn persists_structured_authors_without_duplicates() {
+        let conn = search_db();
+        let search = create_search(&conn, "Author", None, "Smith AB[Author]").unwrap();
+        let run_id = begin_run(&conn, search.id).unwrap();
+        snapshot_run_items(&conn, run_id, &["123".to_string()]).unwrap();
+        let mut article = record("123", "Structured authors");
+        article.structured_authors = vec![
+            PubmedAuthorRecord {
+                author_order: 1,
+                last_name: Some("Li".to_string()),
+                fore_name: Some("Qian".to_string()),
+                initials: Some("Q".to_string()),
+                collective_name: None,
+                display_name: "Qian Li".to_string(),
+                orcid: None,
+                affiliations: vec!["Institute A".to_string()],
+            },
+            PubmedAuthorRecord {
+                author_order: 2,
+                last_name: Some("Smith".to_string()),
+                fore_name: Some("Alice Beth".to_string()),
+                initials: Some("AB".to_string()),
+                collective_name: None,
+                display_name: "Alice Beth Smith".to_string(),
+                orcid: Some("0000-0002-1825-0097".to_string()),
+                affiliations: vec!["Institute B".to_string(), "Hospital C".to_string()],
+            },
+        ];
+
+        let (entry_id, _) = finish_item(&conn, run_id, search.id, &article);
+        upsert_search_record(&conn, search.id, run_id, &article).unwrap();
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM pubmed_entry_authors WHERE entry_id = ?1",
+                [entry_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*)
+                 FROM pubmed_entry_author_affiliations affiliation
+                 JOIN pubmed_entry_authors author ON author.id = affiliation.entry_author_id
+                 WHERE author.entry_id = ?1 AND author.author_order = 2",
+                [entry_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+        complete_run(&conn, search.id, run_id).unwrap();
+        let entries = list_search_entries(&conn, search.id).unwrap();
+        assert_eq!(entries[0].structured_authors.len(), 2);
+        assert_eq!(entries[0].structured_authors[0].author_order, 1);
+        assert_eq!(
+            entries[0].structured_authors[1].orcid.as_deref(),
+            Some("0000-0002-1825-0097")
+        );
+        assert_eq!(
+            entries[0].structured_authors[1].affiliations,
+            vec!["Institute B", "Hospital C"]
+        );
     }
 
     fn finish_item(
@@ -3104,6 +3849,21 @@ mod tests {
         assert_eq!(
             records[0].authors.as_deref(),
             Some("Qian Li, Alice Beth Smith")
+        );
+        assert_eq!(records[0].structured_authors.len(), 2);
+        assert_eq!(records[0].structured_authors[0].author_order, 1);
+        assert_eq!(
+            records[0].structured_authors[0].affiliations,
+            vec!["Institute A"]
+        );
+        assert_eq!(records[0].structured_authors[1].author_order, 2);
+        assert_eq!(
+            records[0].structured_authors[1].orcid.as_deref(),
+            Some("0000-0002-1825-0097")
+        );
+        assert_eq!(
+            records[0].structured_authors[1].affiliations,
+            vec!["Institute B", "Hospital C"]
         );
         assert_eq!(records[0].publication_date.as_deref(), Some("2026-07"));
         assert_eq!(
@@ -3356,7 +4116,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_run_does_not_replace_last_successful_snapshot() {
+    fn partial_run_merges_successes_without_removing_previous_snapshot() {
         let conn = search_db();
         let search = create_search(&conn, "Sepsis", None, "sepsis").unwrap();
         let first_run = begin_run(&conn, search.id).unwrap();
@@ -3365,9 +4125,16 @@ mod tests {
         complete_run(&conn, search.id, first_run).unwrap();
 
         let partial_run = begin_run(&conn, search.id).unwrap();
-        snapshot_run_items(&conn, partial_run, &["2".to_string()]).unwrap();
+        snapshot_run_items(&conn, partial_run, &["2".to_string(), "3".to_string()]).unwrap();
         let (second_entry, _) = finish_item(&conn, partial_run, search.id, &record("2", "Two"));
-        finalize_run_error(&conn, partial_run, "partial", "interrupted").unwrap();
+        mark_run_item_failed(&conn, partial_run, "3", "EFetch 未返回该 PMID").unwrap();
+        finalize_partial_run(
+            &conn,
+            search.id,
+            partial_run,
+            "部分 PMID 获取失败，可继续重试",
+        )
+        .unwrap();
 
         let first_current: i64 = conn
             .query_row(
@@ -3384,7 +4151,134 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first_current, 1);
-        assert_eq!(second_current, 0);
+        assert_eq!(second_current, 1);
+
+        let search = get_search(&conn, search.id).unwrap();
+        assert_eq!(search.total_entries, 2);
+        assert_eq!(search.last_result_count, 2);
+    }
+
+    #[test]
+    fn first_partial_run_publishes_usable_snapshot() {
+        let conn = search_db();
+        let search = create_search(&conn, "Sepsis", None, "sepsis").unwrap();
+        let run = begin_run(&conn, search.id).unwrap();
+        snapshot_run_items(&conn, run, &["1".to_string(), "2".to_string()]).unwrap();
+        let (entry_id, _) = finish_item(&conn, run, search.id, &record("1", "One"));
+        mark_run_item_failed(&conn, run, "2", "EFetch 未返回该 PMID").unwrap();
+
+        finalize_partial_run(&conn, search.id, run, "部分 PMID 获取失败，可继续重试").unwrap();
+
+        let current: i64 = conn
+            .query_row(
+                "SELECT is_current_match FROM pubmed_search_entries
+                 WHERE search_id = ?1 AND entry_id = ?2",
+                params![search.id, entry_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (last_success_at, last_result_count): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT last_success_at, last_result_count FROM pubmed_searches WHERE id = ?1",
+                [search.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let (status, failed_count): (String, i64) = conn
+            .query_row(
+                "SELECT status, failed_count FROM pubmed_search_runs WHERE id = ?1",
+                [run],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(current, 1);
+        assert!(last_success_at.is_some());
+        assert_eq!(last_result_count, 1);
+        assert_eq!(status, "partial");
+        assert_eq!(failed_count, 1);
+    }
+
+    #[test]
+    fn pubmed_record_persistence_skips_failed_record_and_keeps_rest() {
+        let conn = search_db();
+        conn.execute_batch(
+            "
+            CREATE TRIGGER reject_bad_pubmed_entry
+            BEFORE INSERT ON entries
+            WHEN NEW.title = 'Bad PubMed entry'
+            BEGIN
+                SELECT RAISE(FAIL, 'forced PubMed entry failure');
+            END;
+            ",
+        )
+        .unwrap();
+
+        let search = create_search(&conn, "Sepsis", None, "sepsis").unwrap();
+        let run = begin_run(&conn, search.id).unwrap();
+        let pmids = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+        snapshot_run_items(&conn, run, &pmids).unwrap();
+
+        persist_pubmed_records(
+            &conn,
+            search.id,
+            run,
+            &pmids,
+            vec![
+                record("1", "One"),
+                record("2", "Bad PubMed entry"),
+                record("3", "Three"),
+            ],
+        )
+        .unwrap();
+        finalize_partial_run(&conn, search.id, run, "部分 PMID 获取失败，可继续重试").unwrap();
+
+        let visible = list_search_entries(&conn, search.id).unwrap();
+        assert_eq!(visible.len(), 2);
+        assert!(visible
+            .iter()
+            .any(|entry| entry.pmid.as_deref() == Some("1")));
+        assert!(visible
+            .iter()
+            .any(|entry| entry.pmid.as_deref() == Some("3")));
+        let failed_message: String = conn
+            .query_row(
+                "SELECT error_message FROM pubmed_search_run_items
+                 WHERE run_id = ?1 AND pmid = '2'",
+                [run],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(failed_message.contains("forced PubMed entry failure"));
+    }
+
+    #[test]
+    fn list_searches_repairs_stale_first_partial_snapshot() {
+        let conn = search_db();
+        let search = create_search(&conn, "Sepsis", None, "sepsis").unwrap();
+        let run = begin_run(&conn, search.id).unwrap();
+        snapshot_run_items(&conn, run, &["1".to_string(), "2".to_string()]).unwrap();
+        finish_item(&conn, run, search.id, &record("1", "One"));
+        mark_run_item_failed(&conn, run, "2", "EFetch 未返回该 PMID").unwrap();
+        finalize_run_error(&conn, run, "partial", "interrupted").unwrap();
+
+        let repaired = list_searches(&conn).unwrap();
+        let repaired = repaired
+            .iter()
+            .find(|candidate| candidate.id == search.id)
+            .unwrap();
+
+        assert_eq!(repaired.total_entries, 1);
+        assert_eq!(repaired.last_result_count, 1);
+        assert!(repaired.last_success_at.is_some());
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM pubmed_search_runs WHERE id = ?1",
+                [run],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "partial");
     }
 
     #[test]
@@ -3434,9 +4328,11 @@ mod tests {
         let target = create_search(&conn, "Target", None, "immune").unwrap();
         let target_run = begin_run(&conn, target.id).unwrap();
         snapshot_run_items(&conn, target_run, &["1".to_string()]).unwrap();
-        assert!(reuse_local_run_items(&conn, target.id, target_run, &["1".to_string()])
-            .unwrap()
-            .is_empty());
+        assert!(
+            reuse_local_run_items(&conn, target.id, target_run, &["1".to_string()])
+                .unwrap()
+                .is_empty()
+        );
         conn.execute(
             "DELETE FROM pubmed_search_entries WHERE search_id = ?1 AND entry_id = ?2",
             params![target.id, entry_id],
