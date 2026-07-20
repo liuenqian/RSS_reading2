@@ -35,11 +35,25 @@ const PREVIEW_SAMPLE_POPULATION_LIMIT: usize = 10_000;
 const ASSESSMENT_BATCH_SIZE: usize = 20;
 const ASSESSMENT_MAX_CONCURRENT: usize = 3;
 const FETCH_BATCH_SIZE: usize = 100;
+const FETCH_ISOLATION_REQUEST_LIMIT: usize = 24;
 const SEARCH_PAGE_SIZE: usize = 1_000;
 const PUBMED_MAX_RESULT_WINDOW: usize = 10_000;
 const PROGRESS_EVENT: &str = "pubmed-search-progress";
+const RUN_CANCELLED_MESSAGE: &str = "用户取消";
 
 static LAST_REQUEST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+#[derive(Debug)]
+enum PubmedFetchBatch {
+    Records {
+        pmids: Vec<String>,
+        records: Vec<PubmedArticleRecord>,
+    },
+    Failed {
+        pmids: Vec<String>,
+        error: String,
+    },
+}
 
 pub async fn preview_query(
     query: &str,
@@ -854,6 +868,108 @@ pub async fn fetch_records(
     parse_pubmed_records(&xml)
 }
 
+async fn fetch_records_with_isolated_skips(
+    client: &reqwest::Client,
+    pmids: &[String],
+    cancel_flag: &AtomicBool,
+) -> Result<Vec<PubmedFetchBatch>, String> {
+    match fetch_records(client, pmids).await {
+        Ok(records) => Ok(vec![PubmedFetchBatch::Records {
+            pmids: pmids.to_vec(),
+            records,
+        }]),
+        Err(error) => isolate_failed_fetch_batch(client, pmids.to_vec(), error, cancel_flag).await,
+    }
+}
+
+async fn isolate_failed_fetch_batch(
+    client: &reqwest::Client,
+    pmids: Vec<String>,
+    first_error: String,
+    cancel_flag: &AtomicBool,
+) -> Result<Vec<PubmedFetchBatch>, String> {
+    if pmids.len() <= 1 || is_batch_wide_fetch_error(&first_error) {
+        return Ok(vec![PubmedFetchBatch::Failed {
+            pmids,
+            error: first_error,
+        }]);
+    }
+
+    warn!(
+        pmids = pmids.len(),
+        error = %first_error,
+        "PubMed 批量获取失败，尝试二分隔离坏 PMID"
+    );
+
+    let mut fetched_batches = Vec::new();
+    let mut pending = VecDeque::from([(pmids, first_error)]);
+    let mut requests_used = 0usize;
+    while let Some((batch, batch_error)) = pending.pop_front() {
+        if cancel_flag.load(Ordering::SeqCst) {
+            return Err(RUN_CANCELLED_MESSAGE.to_string());
+        }
+        if batch.len() <= 1 || is_batch_wide_fetch_error(&batch_error) {
+            fetched_batches.push(PubmedFetchBatch::Failed {
+                pmids: batch,
+                error: batch_error,
+            });
+            continue;
+        }
+        if requests_used >= FETCH_ISOLATION_REQUEST_LIMIT {
+            fetched_batches.push(PubmedFetchBatch::Failed {
+                pmids: batch,
+                error: format!("隔离坏 PMID 的请求预算已用尽: {batch_error}"),
+            });
+            continue;
+        }
+
+        let mid = batch.len() / 2;
+        let halves = [batch[..mid].to_vec(), batch[mid..].to_vec()];
+        for half in halves {
+            if half.is_empty() {
+                continue;
+            }
+            if cancel_flag.load(Ordering::SeqCst) {
+                return Err(RUN_CANCELLED_MESSAGE.to_string());
+            }
+            if requests_used >= FETCH_ISOLATION_REQUEST_LIMIT {
+                fetched_batches.push(PubmedFetchBatch::Failed {
+                    pmids: half,
+                    error: format!("隔离坏 PMID 的请求预算已用尽: {batch_error}"),
+                });
+                continue;
+            }
+            requests_used += 1;
+            match fetch_records(client, &half).await {
+                Ok(records) => fetched_batches.push(PubmedFetchBatch::Records {
+                    pmids: half,
+                    records,
+                }),
+                Err(error) if half.len() <= 1 || is_batch_wide_fetch_error(&error) => {
+                    fetched_batches.push(PubmedFetchBatch::Failed { pmids: half, error });
+                }
+                Err(error) => {
+                    warn!(
+                        pmids = half.len(),
+                        error = %error,
+                        "PubMed 小批获取失败，继续二分隔离"
+                    );
+                    pending.push_back((half, error));
+                }
+            }
+        }
+    }
+    Ok(fetched_batches)
+}
+
+fn is_batch_wide_fetch_error(error: &str) -> bool {
+    error.contains("请求 PubMed EFetch 失败")
+        || error.contains("读取 PubMed EFetch 响应失败")
+        || error.contains("PubMed EFetch 返回 HTTP 408")
+        || error.contains("PubMed EFetch 返回 HTTP 429")
+        || error.contains("PubMed EFetch 返回 HTTP 5")
+}
+
 pub fn create_search(
     conn: &Connection,
     name: &str,
@@ -1129,21 +1245,31 @@ async fn run_search_inner(
             return Ok(result);
         }
 
-        match fetch_records(&client, chunk).await {
-            Ok(records) => {
+        let fetched_batches = match fetch_records_with_isolated_skips(&client, chunk, cancel_flag)
+            .await
+        {
+            Ok(batches) => batches,
+            Err(error) if error == RUN_CANCELLED_MESSAGE => {
                 let conn = state.conn.lock().map_err(|e| e.to_string())?;
-                persist_pubmed_records(&conn, search_id, run_id, chunk, records)?;
+                finalize_run_error(&conn, run_id, "cancelled", RUN_CANCELLED_MESSAGE)?;
+                let result = run_result(&conn, run_id, Some(RUN_CANCELLED_MESSAGE.to_string()))?;
+                emit_result_progress(app, &result);
+                return Ok(result);
             }
-            Err(error) => {
-                warn!(
-                    search_id,
-                    run_id,
-                    pmids = chunk.len(),
-                    error = %error,
-                    "PubMed 批量获取失败，跳过本批继续后续批次"
-                );
-                let conn = state.conn.lock().map_err(|e| e.to_string())?;
-                mark_fetch_batch_failed(&conn, run_id, chunk, &error)?;
+            Err(error) => return Err(error),
+        };
+
+        {
+            let conn = state.conn.lock().map_err(|e| e.to_string())?;
+            for fetched_batch in fetched_batches {
+                match fetched_batch {
+                    PubmedFetchBatch::Records { pmids, records } => {
+                        persist_pubmed_records(&conn, search_id, run_id, &pmids, records)?;
+                    }
+                    PubmedFetchBatch::Failed { pmids, error } => {
+                        mark_fetch_batch_failed(&conn, run_id, &pmids, &error)?;
+                    }
+                }
             }
         }
         let conn = state.conn.lock().map_err(|e| e.to_string())?;
@@ -3013,11 +3139,17 @@ pub fn parse_pubmed_records(xml: &str) -> Result<Vec<PubmedArticleRecord>, Strin
     };
     let document = Document::parse_with_options(xml, options)
         .map_err(|e| format!("解析 PubMed XML 失败: {}", e))?;
-    document
+    let mut records = Vec::new();
+    for article in document
         .descendants()
         .filter(|node| node.has_tag_name("PubmedArticle"))
-        .map(parse_article)
-        .collect()
+    {
+        match parse_article(article) {
+            Ok(record) => records.push(record),
+            Err(error) => warn!(error = %error, "跳过无法解析的 PubMed 记录"),
+        }
+    }
+    Ok(records)
 }
 
 fn parse_article(article: Node<'_, '_>) -> Result<PubmedArticleRecord, String> {
@@ -3614,6 +3746,48 @@ mod tests {
             )
             .unwrap();
         assert!(message.contains("已跳过"));
+    }
+
+    #[test]
+    fn batch_wide_fetch_errors_are_not_isolated() {
+        assert!(is_batch_wide_fetch_error(
+            "请求 PubMed EFetch 失败: operation timed out"
+        ));
+        assert!(is_batch_wide_fetch_error(
+            "PubMed EFetch 返回 HTTP 429 Too Many Requests"
+        ));
+        assert!(is_batch_wide_fetch_error(
+            "PubMed EFetch 返回 HTTP 500 Internal Server Error"
+        ));
+
+        assert!(!is_batch_wide_fetch_error(
+            "PubMed EFetch 返回 HTTP 400 Bad Request"
+        ));
+        assert!(!is_batch_wide_fetch_error("解析 PubMed XML 失败"));
+    }
+
+    #[test]
+    fn pubmed_xml_parser_skips_bad_article_and_keeps_rest() {
+        let xml = r#"<?xml version="1.0"?>
+        <PubmedArticleSet>
+          <PubmedArticle>
+            <MedlineCitation>
+              <PMID>1</PMID>
+              <Article><ArticleTitle>Good article</ArticleTitle></Article>
+            </MedlineCitation>
+          </PubmedArticle>
+          <PubmedArticle>
+            <MedlineCitation>
+              <Article><ArticleTitle>Missing PMID</ArticleTitle></Article>
+            </MedlineCitation>
+          </PubmedArticle>
+        </PubmedArticleSet>"#;
+
+        let records = parse_pubmed_records(xml).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].pmid, "1");
+        assert_eq!(records[0].title, "Good article");
     }
 
     #[test]
