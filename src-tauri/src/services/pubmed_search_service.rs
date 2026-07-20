@@ -35,25 +35,11 @@ const PREVIEW_SAMPLE_POPULATION_LIMIT: usize = 10_000;
 const ASSESSMENT_BATCH_SIZE: usize = 20;
 const ASSESSMENT_MAX_CONCURRENT: usize = 3;
 const FETCH_BATCH_SIZE: usize = 100;
-const FETCH_FALLBACK_LINEAR_THRESHOLD: usize = 8;
 const SEARCH_PAGE_SIZE: usize = 1_000;
 const PUBMED_MAX_RESULT_WINDOW: usize = 10_000;
 const PROGRESS_EVENT: &str = "pubmed-search-progress";
-const RUN_CANCELLED_MESSAGE: &str = "用户取消";
 
 static LAST_REQUEST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
-
-#[derive(Debug)]
-enum PubmedFetchBatch {
-    Records {
-        pmids: Vec<String>,
-        records: Vec<PubmedArticleRecord>,
-    },
-    Failed {
-        pmids: Vec<String>,
-        error: String,
-    },
-}
 
 pub async fn preview_query(
     query: &str,
@@ -868,147 +854,6 @@ pub async fn fetch_records(
     parse_pubmed_records(&xml)
 }
 
-async fn fetch_records_with_fast_fallback(
-    client: &reqwest::Client,
-    pmids: &[String],
-    cancel_flag: &AtomicBool,
-) -> Result<Vec<PubmedFetchBatch>, String> {
-    match fetch_records(client, pmids).await {
-        Ok(records) => Ok(vec![PubmedFetchBatch::Records {
-            pmids: pmids.to_vec(),
-            records,
-        }]),
-        Err(error) if is_batch_wide_fetch_error(&error) => {
-            retry_batch_once(client, pmids, error).await
-        }
-        Err(error) => split_fetch_records(client, pmids.to_vec(), error, cancel_flag).await,
-    }
-}
-
-async fn retry_batch_once(
-    client: &reqwest::Client,
-    pmids: &[String],
-    first_error: String,
-) -> Result<Vec<PubmedFetchBatch>, String> {
-    warn!(
-        pmids = pmids.len(),
-        error = %first_error,
-        "PubMed 批量获取失败，先快速重试同一批"
-    );
-    match fetch_records(client, pmids).await {
-        Ok(records) => Ok(vec![PubmedFetchBatch::Records {
-            pmids: pmids.to_vec(),
-            records,
-        }]),
-        Err(retry_error) => {
-            warn!(
-                pmids = pmids.len(),
-                error = %retry_error,
-                "PubMed 批量获取快速重试仍失败，保留为本批失败"
-            );
-            Ok(vec![PubmedFetchBatch::Failed {
-                pmids: pmids.to_vec(),
-                error: format!("批量获取失败: {first_error}; 快速重试失败: {retry_error}"),
-            }])
-        }
-    }
-}
-
-async fn split_fetch_records(
-    client: &reqwest::Client,
-    pmids: Vec<String>,
-    first_error: String,
-    cancel_flag: &AtomicBool,
-) -> Result<Vec<PubmedFetchBatch>, String> {
-    warn!(
-        pmids = pmids.len(),
-        error = %first_error,
-        "PubMed 批量获取失败，拆分为更小批次重试"
-    );
-
-    let mut fetched_batches = Vec::new();
-    let mut pending = VecDeque::from([(pmids, first_error)]);
-    while let Some((batch, batch_error)) = pending.pop_front() {
-        if cancel_flag.load(Ordering::SeqCst) {
-            return Err(RUN_CANCELLED_MESSAGE.to_string());
-        }
-        if batch.len() <= FETCH_FALLBACK_LINEAR_THRESHOLD {
-            append_single_record_fetches(
-                client,
-                batch,
-                batch_error,
-                cancel_flag,
-                &mut fetched_batches,
-            )
-            .await?;
-            continue;
-        }
-
-        let mid = batch.len() / 2;
-        let halves = [batch[..mid].to_vec(), batch[mid..].to_vec()];
-        for half in halves {
-            if cancel_flag.load(Ordering::SeqCst) {
-                return Err(RUN_CANCELLED_MESSAGE.to_string());
-            }
-            match fetch_records(client, &half).await {
-                Ok(records) => fetched_batches.push(PubmedFetchBatch::Records {
-                    pmids: half,
-                    records,
-                }),
-                Err(error) if is_batch_wide_fetch_error(&error) => {
-                    fetched_batches.extend(retry_batch_once(client, &half, error).await?);
-                }
-                Err(error) => {
-                    warn!(
-                        pmids = half.len(),
-                        error = %error,
-                        "PubMed 小批获取失败，继续拆分重试"
-                    );
-                    pending.push_back((half, error));
-                }
-            }
-        }
-    }
-    Ok(fetched_batches)
-}
-
-async fn append_single_record_fetches(
-    client: &reqwest::Client,
-    pmids: Vec<String>,
-    batch_error: String,
-    cancel_flag: &AtomicBool,
-    fetched_batches: &mut Vec<PubmedFetchBatch>,
-) -> Result<(), String> {
-    warn!(
-        pmids = pmids.len(),
-        error = %batch_error,
-        "PubMed 小批获取失败，逐篇确认"
-    );
-    for pmid in pmids {
-        if cancel_flag.load(Ordering::SeqCst) {
-            return Err(RUN_CANCELLED_MESSAGE.to_string());
-        }
-        match fetch_records(client, std::slice::from_ref(&pmid)).await {
-            Ok(records) => fetched_batches.push(PubmedFetchBatch::Records {
-                pmids: vec![pmid],
-                records,
-            }),
-            Err(error) => fetched_batches.push(PubmedFetchBatch::Failed {
-                pmids: vec![pmid],
-                error: format!("批量获取失败: {batch_error}; 单篇重试失败: {error}"),
-            }),
-        }
-    }
-    Ok(())
-}
-
-fn is_batch_wide_fetch_error(error: &str) -> bool {
-    error.contains("请求 PubMed EFetch 失败")
-        || error.contains("读取 PubMed EFetch 响应失败")
-        || error.contains("PubMed EFetch 返回 HTTP 429")
-        || error.contains("PubMed EFetch 返回 HTTP 5")
-}
-
 pub fn create_search(
     conn: &Connection,
     name: &str,
@@ -1284,33 +1129,21 @@ async fn run_search_inner(
             return Ok(result);
         }
 
-        let fetched_batches = match fetch_records_with_fast_fallback(&client, chunk, cancel_flag)
-            .await
-        {
-            Ok(batches) => batches,
-            Err(error) if error == RUN_CANCELLED_MESSAGE => {
+        match fetch_records(&client, chunk).await {
+            Ok(records) => {
                 let conn = state.conn.lock().map_err(|e| e.to_string())?;
-                finalize_run_error(&conn, run_id, "cancelled", RUN_CANCELLED_MESSAGE)?;
-                let result = run_result(&conn, run_id, Some(RUN_CANCELLED_MESSAGE.to_string()))?;
-                emit_result_progress(app, &result);
-                return Ok(result);
+                persist_pubmed_records(&conn, search_id, run_id, chunk, records)?;
             }
-            Err(error) => return Err(error),
-        };
-
-        {
-            let conn = state.conn.lock().map_err(|e| e.to_string())?;
-            for fetched_batch in fetched_batches {
-                match fetched_batch {
-                    PubmedFetchBatch::Records { pmids, records } => {
-                        persist_pubmed_records(&conn, search_id, run_id, &pmids, records)?;
-                    }
-                    PubmedFetchBatch::Failed { pmids, error } => {
-                        for pmid in pmids {
-                            mark_run_item_failed(&conn, run_id, &pmid, &error)?;
-                        }
-                    }
-                }
+            Err(error) => {
+                warn!(
+                    search_id,
+                    run_id,
+                    pmids = chunk.len(),
+                    error = %error,
+                    "PubMed 批量获取失败，跳过本批继续后续批次"
+                );
+                let conn = state.conn.lock().map_err(|e| e.to_string())?;
+                mark_fetch_batch_failed(&conn, run_id, chunk, &error)?;
             }
         }
         let conn = state.conn.lock().map_err(|e| e.to_string())?;
@@ -1755,6 +1588,23 @@ fn persist_pubmed_records(
     }
     tx.commit()
         .map_err(|e| format!("提交 PubMed 批次失败: {}", e))
+}
+
+fn mark_fetch_batch_failed(
+    conn: &Connection,
+    run_id: i64,
+    pmids: &[String],
+    error: &str,
+) -> Result<(), String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("开始 PubMed 跳过批次事务失败: {}", e))?;
+    let message = format!("批量获取失败，已跳过: {error}");
+    for pmid in pmids {
+        mark_run_item_failed(&tx, run_id, pmid, &message)?;
+    }
+    tx.commit()
+        .map_err(|e| format!("提交 PubMed 跳过批次失败: {}", e))
 }
 
 fn upsert_search_record(
@@ -3744,24 +3594,26 @@ mod tests {
     }
 
     #[test]
-    fn batch_wide_fetch_errors_use_fast_retry_path() {
-        assert!(is_batch_wide_fetch_error(
-            "请求 PubMed EFetch 失败: operation timed out"
-        ));
-        assert!(is_batch_wide_fetch_error(
-            "读取 PubMed EFetch 响应失败: connection reset"
-        ));
-        assert!(is_batch_wide_fetch_error(
-            "PubMed EFetch 返回 HTTP 429 Too Many Requests"
-        ));
-        assert!(is_batch_wide_fetch_error(
-            "PubMed EFetch 返回 HTTP 500 Internal Server Error"
-        ));
+    fn failed_fetch_batch_is_marked_failed_and_skipped() {
+        let conn = search_db();
+        let search = create_search(&conn, "Sepsis", None, "sepsis").unwrap();
+        let run = begin_run(&conn, search.id).unwrap();
+        let pmids = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+        snapshot_run_items(&conn, run, &pmids).unwrap();
 
-        assert!(!is_batch_wide_fetch_error(
-            "PubMed EFetch 返回 HTTP 400 Bad Request"
-        ));
-        assert!(!is_batch_wide_fetch_error("解析 PubMed EFetch XML 失败"));
+        mark_fetch_batch_failed(&conn, run, &pmids, "PubMed EFetch 返回 HTTP 400").unwrap();
+
+        let failed = count_run_status(&conn, run, "failed").unwrap();
+        assert_eq!(failed, 3);
+        let message: String = conn
+            .query_row(
+                "SELECT error_message FROM pubmed_search_run_items
+                 WHERE run_id = ?1 AND pmid = '2'",
+                [run],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(message.contains("已跳过"));
     }
 
     #[test]
