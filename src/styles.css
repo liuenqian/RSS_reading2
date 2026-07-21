@@ -9445,14 +9445,40 @@ body.screening-window-mode #app {
 
 .review-stage-run-status[data-type="running"]::after,
 [data-review-strategy-status][data-type="running"]::after {
-  width: 34%;
+  width: 6%;
   background: var(--accent);
-  animation: review-progress-indeterminate 1.35s ease-in-out infinite;
+  animation: review-progress-grow 75s cubic-bezier(0.12, 0.62, 0.24, 1) forwards;
 }
 
 .review-stage-run-status[data-type="success"],
 [data-review-strategy-status][data-type="success"] {
+  padding-bottom: 9px;
   color: var(--color-success);
+}
+
+.review-stage-run-status[data-type="success"]::before,
+.review-stage-run-status[data-type="success"]::after,
+[data-review-strategy-status][data-type="success"]::before,
+[data-review-strategy-status][data-type="success"]::after {
+  position: absolute;
+  bottom: 1px;
+  left: 0;
+  height: 3px;
+  border-radius: 2px;
+  content: '';
+}
+
+.review-stage-run-status[data-type="success"]::before,
+[data-review-strategy-status][data-type="success"]::before {
+  width: 100%;
+  background: var(--border-hair);
+}
+
+.review-stage-run-status[data-type="success"]::after,
+[data-review-strategy-status][data-type="success"]::after {
+  width: 100%;
+  background: var(--color-success);
+  animation: review-progress-complete 180ms ease-out;
 }
 
 .review-stage-run-status[data-type="error"],
@@ -9460,9 +9486,22 @@ body.screening-window-mode #app {
   color: var(--color-error);
 }
 
-@keyframes review-progress-indeterminate {
-  from { transform: translateX(-105%); }
-  to { transform: translateX(300%); }
+@keyframes review-progress-grow {
+  from { width: 6%; }
+  to { width: 92%; }
+}
+
+@keyframes review-progress-complete {
+  from { width: 92%; }
+  to { width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .review-stage-run-status[data-type="running"]::after,
+  [data-review-strategy-status][data-type="running"]::after {
+    width: 55%;
+    animation: none;
+  }
 }
 
 .review-stage-artifact {

@@ -227,7 +227,9 @@ test('工作台通过结构化命令生成策略并把预览留给显式操作',
   assert.match(workspace, /setWritingStatus\([^\n]+, 'running'\)/);
   assert.match(workspace, /setJournalStatus\([^\n]+, 'running'\)/);
   assert.match(workspace, /setStrategyStatus\([^\n]+, 'running'\)/);
-  assert.match(fs.readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8'), /review-progress-indeterminate/);
+  const styles = fs.readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+  assert.match(styles, /review-progress-grow/);
+  assert.doesNotMatch(styles, /review-progress-indeterminate/);
   assert.match(workspace, /reading_note_count/);
   assert.doesNotMatch(workspace, /stageExecutionMarkup\(project, 'writing'\)/);
   assert.match(main, /pendingSciReviewProjectId/);
