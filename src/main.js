@@ -5,16 +5,19 @@ import {
 import { normalizeEntrySortMode, sortEntries } from './entry_sort.js';
 import { shortJournalDisplayName } from './journal_name.js';
 import { buildPubmedSearchUrl, feedSourceLink } from './source_link.js';
+import { normalizeBriefingReferencesMarkdown } from './briefing_references.js';
 import {
   groupPmcFiguresByArticle,
   isPmcFigureNumber,
   mergePmcGalleryResults,
+  sortPmcArticleGroupsByQuality,
 } from './pmc_gallery.js';
 import {
   AUTHOR_IDENTITY_META,
   assessAuthorFingerprintStability,
   buildAuthorFingerprint,
   buildAuthorIdentityClusters,
+  getAuthorNodeCandidates,
   recommendAuthorSeedCandidates,
 } from './author_identity.js';
 import {
@@ -31,6 +34,7 @@ import {
   toggleScreeningTableSort,
 } from './screening_table_state.js';
 import { renderScreeningTable } from './screening_table_view.js';
+import { SCI_REVIEW_STAGES, SciReviewWorkspace } from './sci_review_workspace.js';
 const { invoke } = window.__TAURI__.core;
 const markdownitFactory = globalThis.markdownit;
 const markdownitTaskLists = globalThis.markdownitTaskLists;
@@ -136,7 +140,55 @@ function decorateMarkdownHtml(html) {
     wrap.appendChild(table);
   });
 
+  decorateBriefingReferenceLists(template.content);
+
   return template.innerHTML;
+}
+
+function decorateBriefingReferenceLists(root) {
+  root.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach(heading => {
+    if (heading.textContent.trim() !== '参考文献') return;
+    heading.classList.add('briefing-reference-heading');
+    const list = heading.nextElementSibling;
+    if (!list?.matches('ul, ol')) return;
+    list.classList.add('briefing-reference-list');
+
+    list.querySelectorAll(':scope > li').forEach(item => {
+      const match = item.textContent.match(/^\s*\[(\d+)\]\s*/u);
+      if (!match) return;
+      const firstText = [...item.childNodes]
+        .find(node => node.nodeType === 3 && node.textContent.trim());
+      if (firstText) {
+        firstText.textContent = firstText.textContent.replace(/^\s*\[\d+\]\s*/u, '');
+      }
+
+      const number = document.createElement('span');
+      number.className = 'briefing-reference-number';
+      number.textContent = `[${match[1]}]`;
+      const content = document.createElement('div');
+      content.className = 'briefing-reference-content';
+      while (item.firstChild) content.appendChild(item.firstChild);
+      item.append(number, content);
+      item.classList.add('briefing-reference-item');
+
+      const title = [...content.children].find(element => element.tagName === 'A');
+      if (!title) return;
+      title.classList.add('briefing-reference-title');
+      const meta = document.createElement('div');
+      meta.className = 'briefing-reference-meta';
+      let sibling = title.nextSibling;
+      while (sibling) {
+        const next = sibling.nextSibling;
+        meta.appendChild(sibling);
+        sibling = next;
+      }
+      const firstMetaText = [...meta.childNodes].find(node => node.nodeType === 3);
+      if (firstMetaText) {
+        firstMetaText.textContent = firstMetaText.textContent.replace(/^\s*[—–-]\s*/u, '');
+      }
+      if (meta.textContent.trim()) content.appendChild(meta);
+    });
+  });
 }
 
 // ── DOM refs ──────────────────────────────────────
@@ -167,6 +219,7 @@ let entrySortSelect, entrySortDirection, entryMetricIfFilter, entryMetricQFilter
 let entryMetricFilterSummaryCount;
 let entryBulkActions, entryBulkCount, btnEntrySelectMode, btnEntryBulkSelectAll, btnEntryBulkSelectUnnoted, btnEntryBulkSelectNoted, btnEntryBulkInvert, btnEntryBulkDeselect, entryBulkExportFormat, btnEntryBulkExport, entryBulkExistingMode, btnEntryBulkGenerate, btnEntryBulkClear;
 let detailPanelEl, paperChatPanelEl, briefingDetailEl;
+let sciReviewWorkspaceEl;
 let sidebarResizerEl, listResizerEl, paperChatResizerEl;
 let detailEmpty, detailContent, detailTitle, detailJournal, detailAffiliation;
 let detailIdentifierStrip;
@@ -220,7 +273,10 @@ let currentAccent = 'coral';
 let currentFontScale = 'md';
 let selectedFeedId = null;
 let abstractLang = 'zh';
-let mode = 'feed';              // 'feed' | 'pubmed' | 'kept' | 'briefing'
+let mode = 'feed';              // 'feed' | 'pubmed' | 'kept' | 'briefing' | 'review'
+let sciReviewWorkspace = null;
+let sciSkillSpecs = [];
+let pendingSciReviewProjectId = null;
 let selectedBriefingId = null;
 let literatureSearchTimer = null;
 let literatureSearchRequestId = 0;
@@ -244,7 +300,7 @@ let wordFrequencyBusy = false;
 let wordFrequencyRequestId = 0;
 let wordFrequencyTranslations = {};
 let pmcGalleryResult = null;
-let pmcGalleryView = 'all';
+let pmcGalleryView = 'graphical';
 let pmcGalleryFigureNumber = 1;
 let pmcGalleryRequestId = 0;
 let pmcGalleryBusy = false;
@@ -1423,7 +1479,7 @@ function showMain() {
   btnSidebar.title = '侧栏';
   if (!sidebarCollapsed) btnSidebar.classList.add('active');
   document.body.classList.remove('settings-mode');
-  setToolbarSubtitle(mode === 'briefing' ? 'briefing' : (mode === 'search' ? 'search' : 'main'));
+  setToolbarSubtitle(mode === 'review' ? 'review' : (mode === 'briefing' ? 'briefing' : (mode === 'search' ? 'search' : 'main')));
   if (pubmedPreviewSettingsReturnPending && pubmedPreview) {
     document.getElementById('pubmed-search-modal')?.classList.remove('hidden');
   }
@@ -1441,6 +1497,15 @@ function setToolbarSubtitle(context) {
       <span>AI 简报</span>
       <span class="ts-meta">·</span>
       <span class="ts-tertiary">${BRIEFINGS.length} 份</span>
+    `;
+    return;
+  }
+  if (context === 'review') {
+    const project = sciReviewWorkspace?.activeProject;
+    toolbarSubtitle.innerHTML = `
+      <span class="ts-accent">◇</span>
+      <span>SCI 综述</span>
+      ${project ? `<span class="ts-meta">·</span><span class="ts-tertiary">${escapeHtml(project.name)}</span>` : ''}
     `;
     return;
   }
@@ -2743,9 +2808,10 @@ function extractAuthorSearchIdentity(source) {
   };
 }
 
-function openPubmedSearchModal({ source = null, editing = false, creationTarget = 'search' } = {}) {
+function openPubmedSearchModal({ source = null, editing = false, creationTarget = 'search', reviewProjectId = null } = {}) {
   const modal = document.getElementById('pubmed-search-modal');
   if (!modal) return;
+  pendingSciReviewProjectId = reviewProjectId || null;
   const authorIdentity = editing ? extractAuthorSearchIdentity(source) : null;
   pubmedCreationTarget = creationTarget === 'feed' ? 'feed' : 'search';
   pubmedEditingSearchId = editing ? source?.id || null : null;
@@ -2826,11 +2892,12 @@ async function buildPubmedAuthorQuery() {
   }
 }
 
-function closePubmedSearchModal() {
+function closePubmedSearchModal({ preserveReviewLink = false } = {}) {
   document.getElementById('pubmed-search-modal')?.classList.add('hidden');
   pubmedEditingSearchId = null;
   pubmedCreationTarget = 'search';
   pubmedPreviewSettingsReturnPending = false;
+  if (!preserveReviewLink) pendingSciReviewProjectId = null;
 }
 
 async function generatePubmedQuery() {
@@ -3046,6 +3113,10 @@ async function retryPubmedPreviewAssessment() {
     status.textContent = isAuthorMode ? '请先填写作者姓名' : '请先填写研究问题';
     return;
   }
+  if (isAuthorMode && (!currentPubmedSearch || !loadAuthorIdentityState(currentPubmedSearch.id).seedIds.length)) {
+    status.textContent = '请先确认至少 1 篇种子论文，再运行复杂 AI 作者评估';
+    return;
+  }
 
   button.disabled = true;
   status.textContent = `${isAuthorMode ? 'AI 正在重新评估作者归属' : 'AI 正在重新评估'} ${pubmedPreview.entries.length} 篇样本…`;
@@ -3110,6 +3181,8 @@ async function previewPubmedSearch() {
       ? question
       : authorName)
       && document.getElementById('pubmed-preview-ai-enabled')?.checked
+      && (pubmedSearchBuilderMode !== 'author'
+        || (currentPubmedSearch && loadAuthorIdentityState(currentPubmedSearch.id).seedIds.length > 0))
       && (pubmedPreview.entries || []).length > 0;
     if (shouldAssess) {
       const isAuthorMode = pubmedSearchBuilderMode === 'author';
@@ -3138,15 +3211,17 @@ async function previewPubmedSearch() {
         status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇 · ${isAuthorMode ? '作者评估' : 'AI 初判'}失败`;
       }
     } else {
-      const assessmentHint = pubmedSearchBuilderMode === 'topic'
-        && document.getElementById('pubmed-preview-ai-enabled')?.checked
-        && !question
-        ? ' · 填写研究问题后可进行 AI 初判'
-        : (pubmedSearchBuilderMode === 'author'
-          && document.getElementById('pubmed-preview-ai-enabled')?.checked
-          && !authorName
-          ? ' · 填写作者姓名后可进行作者归属评估'
-          : '');
+      const aiAssessmentEnabled = document.getElementById('pubmed-preview-ai-enabled')?.checked;
+      let assessmentHint = '';
+      if (pubmedSearchBuilderMode === 'topic' && aiAssessmentEnabled && !question) {
+        assessmentHint = ' · 填写研究问题后可进行 AI 初判';
+      } else if (pubmedSearchBuilderMode === 'author' && aiAssessmentEnabled && !authorName) {
+        assessmentHint = ' · 填写作者姓名后可进行作者归属评估';
+      } else if (pubmedSearchBuilderMode === 'author'
+        && aiAssessmentEnabled
+        && (!currentPubmedSearch || !loadAuthorIdentityState(currentPubmedSearch.id).seedIds.length)) {
+        assessmentHint = ' · 确认种子论文后才可进行复杂 AI 作者评估';
+      }
       status.textContent = `命中 ${pubmedPreview.total_count.toLocaleString('zh-CN')} 篇${assessmentHint}`;
     }
   } catch (e) {
@@ -3213,10 +3288,18 @@ async function createAndRunPubmedSearch() {
           options,
         })
       : await invoke('create_pubmed_search', { name, question: question || null, query, options });
-    closePubmedSearchModal();
+    const reviewProjectId = pendingSciReviewProjectId;
+    closePubmedSearchModal({ preserveReviewLink: !!reviewProjectId });
+    if (reviewProjectId) {
+      sciReviewWorkspace?.linkPubmedSearch(reviewProjectId, search.id);
+    }
     await loadPubmedSearches();
     await selectPubmedSearch(search.id);
     await runCurrentPubmedSearch();
+    if (reviewProjectId) {
+      pendingSciReviewProjectId = null;
+      enterSciReviewMode(reviewProjectId);
+    }
   } catch (e) {
     status.textContent = `${pubmedEditingSearchId ? '保存' : '创建'}失败：${e}`;
     button.disabled = false;
@@ -3421,6 +3504,7 @@ async function loadPubmedSearches() {
     renderPubmedSearchList();
     setGlobalStatus('加载 PubMed 检索失败: ' + e, 'error');
   }
+  sciReviewWorkspace?.refresh();
 }
 
 function renderPubmedSearchList() {
@@ -3647,6 +3731,23 @@ function normalizeAuthorIdentityState(value = {}) {
     const label = String(item || '').trim().slice(0, 300);
     if (label) aliases.set(label.toLocaleLowerCase(), label);
   });
+  const normalizeCandidate = candidate => {
+    const query = String(candidate?.query || '').trim();
+    if (!query) return null;
+    return {
+      label: String(candidate?.label || '扩展方案').trim().slice(0, 100),
+      query: query.slice(0, 8000),
+      rationale: String(candidate?.rationale || '').trim().slice(0, 500),
+    };
+  };
+  const seedAuthorSelections = {};
+  Object.entries(value.seedAuthorSelections || {}).forEach(([entryId, authorOrder]) => {
+    const normalizedEntryId = Number(entryId);
+    const normalizedAuthorOrder = Number(authorOrder);
+    if (Number.isFinite(normalizedEntryId) && Number.isFinite(normalizedAuthorOrder)) {
+      seedAuthorSelections[String(normalizedEntryId)] = normalizedAuthorOrder;
+    }
+  });
   return {
     seedIds: ids('seedIds'),
     confirmedIds: ids('confirmedIds'),
@@ -3655,6 +3756,14 @@ function normalizeAuthorIdentityState(value = {}) {
     sameNameIds: ids('sameNameIds'),
     affiliationAliases: [...aliases.values()].slice(0, 50),
     decisions: value.decisions && typeof value.decisions === 'object' ? value.decisions : {},
+    profileVersion: Math.max(1, Number(value.profileVersion) || 1),
+    queryGenerationState: ['current', 'generation_required', 'pending'].includes(value.queryGenerationState)
+      ? value.queryGenerationState
+      : 'generation_required',
+    pendingExpansionCandidates: (Array.isArray(value.pendingExpansionCandidates) ? value.pendingExpansionCandidates : [])
+      .map(normalizeCandidate).filter(Boolean).slice(0, 3),
+    activeExpansionQuery: normalizeCandidate(value.activeExpansionQuery),
+    seedAuthorSelections,
   };
 }
 
@@ -3713,6 +3822,7 @@ function authorIdentityFingerprint(entries = allEntries, state = null) {
     identity?.authorName || '',
     currentPubmedSearch.query,
     [identity?.affiliation || '', ...identityState.affiliationAliases],
+    identityState.seedAuthorSelections,
   );
 }
 
@@ -3759,6 +3869,15 @@ async function applyAuthorIdentityClusterStatus(searchId, cluster, status) {
     ];
   }
   next.decisions[cluster.key] = status;
+  if (status === 'confirmed') {
+    next.profileVersion += 1;
+    next.queryGenerationState = 'generation_required';
+    next.pendingExpansionCandidates = [];
+  } else {
+    next.activeExpansionQuery = null;
+    next.queryGenerationState = 'generation_required';
+    next.pendingExpansionCandidates = [];
+  }
   await saveAuthorIdentityState(searchId, next);
 
   const screeningStatus = { confirmed: 'keep', likely: 'keep', review: 'maybe', same_name: 'exclude' }[status];
@@ -3795,6 +3914,7 @@ async function openAuthorIdentityReview() {
       ? currentSelection
       : seedCandidates.filter(item => item.recommended).map(item => Number(item.entry.id));
   const modalSeedIds = new Set(initialSeedIds);
+  const modalSeedAuthorSelections = { ...state.seedAuthorSelections };
   const overlay = document.createElement('div');
   overlay.className = 'pubmed-modal';
   overlay.innerHTML = `
@@ -3821,14 +3941,27 @@ async function openAuthorIdentityReview() {
           ? `<span class="author-fingerprint-stability ${stability.level}">指纹稳定度 ${stability.score} · ${stability.label}${stability.missing.length ? ` · 待补：${escapeHtml(stability.missing.join('、'))}` : ''}</span>`
           : `<span>系统推荐 ${seedCandidates.filter(item => item.recommended).length} 篇，最多可确认 10 篇</span>`}
       </div>
+      ${state.seedIds.length ? `<div class="author-expansion-panel">
+        <div class="author-expansion-heading">
+          <div><strong>第二轮受控扩展</strong><span>${state.activeExpansionQuery ? '已启用扩展检索；指纹变化后需重新生成' : '根据已确认姓名、目标作者单位和稳定共同作者补查'}</span></div>
+          <button class="btn btn-secondary btn-sm" data-generate-expansion type="button">${state.queryGenerationState === 'generation_required' ? '生成更新后的检索式' : '重新生成候选'}</button>
+        </div>
+        ${state.activeExpansionQuery ? `<div class="author-expansion-active"><b>当前启用：${escapeHtml(state.activeExpansionQuery.label)}</b><code>${escapeHtml(state.activeExpansionQuery.query)}</code></div>` : ''}
+        ${state.pendingExpansionCandidates.map((candidate, index) => `<div class="author-expansion-candidate">
+          <div><strong>${escapeHtml(candidate.label)}</strong><span>${escapeHtml(candidate.rationale)}</span><code>${escapeHtml(candidate.query)}</code></div>
+          <button class="btn btn-primary btn-sm" data-activate-expansion="${index}" type="button">启用此方案</button>
+        </div>`).join('')}
+      </div>` : ''}
       ${!state.seedIds.length ? `<div class="author-seed-picker">
         <div class="author-seed-picker-header"><strong>推荐种子候选</strong><span>确认属于目标作者的论文</span></div>
         ${seedCandidates.map(item => {
           const entry = item.entry;
+          const authorNodes = getAuthorNodeCandidates(entry, identity?.authorName || '', currentPubmedSearch.query);
+          const selectedAuthorOrder = modalSeedAuthorSelections[String(entry.id)];
           const year = String(entry.publication_date || entry.publication_date_raw || entry.published_at || '').match(/\b(19|20)\d{2}\b/)?.[0] || '年份未知';
           return `<label class="author-seed-candidate">
             <input type="checkbox" data-seed-entry="${Number(entry.id)}" ${modalSeedIds.has(Number(entry.id)) ? 'checked' : ''}>
-            <span class="author-seed-candidate-main"><strong>${escapeHtml(entry.title)}</strong><span>${escapeHtml(year)} · ${escapeHtml(entry.affiliation || entry.authors || '单位信息不足')}</span></span>
+            <span class="author-seed-candidate-main"><strong>${escapeHtml(entry.title)}</strong><span>${escapeHtml(year)} · ${escapeHtml(entry.affiliation || entry.authors || '单位信息不足')}</span>${authorNodes.length > 1 ? `<select data-seed-author="${Number(entry.id)}" aria-label="选择目标作者"><option value="">选择目标作者节点</option>${authorNodes.map(node => `<option value="${node.authorOrder}" ${Number(selectedAuthorOrder) === node.authorOrder ? 'selected' : ''}>${escapeHtml(node.displayName)}${node.affiliations.length ? ` · ${escapeHtml(node.affiliations.join('；'))}` : ''}</option>`).join('')}</select>` : ''}</span>
             <span class="author-seed-candidate-evidence">${item.recommended ? '<b>推荐</b>' : ''}<span>${item.score} · ${escapeHtml(item.reasons.join('、'))}</span></span>
           </label>`;
         }).join('') || '<div class="author-identity-empty">当前候选缺少足够的作者信息，请补充 PMID、DOI 或已知论文标题。</div>'}
@@ -3888,6 +4021,9 @@ async function openAuthorIdentityReview() {
     await saveAuthorIdentityState(searchId, {
       ...state,
       affiliationAliases: [...state.affiliationAliases, alias],
+      profileVersion: state.profileVersion + 1,
+      queryGenerationState: 'generation_required',
+      pendingExpansionCandidates: [],
     });
     close();
     renderEntryList(allEntries);
@@ -3906,6 +4042,10 @@ async function openAuthorIdentityReview() {
       await saveAuthorIdentityState(searchId, {
         ...state,
         affiliationAliases: state.affiliationAliases.filter(value => value !== alias),
+        profileVersion: state.profileVersion + 1,
+        queryGenerationState: 'generation_required',
+        pendingExpansionCandidates: [],
+        activeExpansionQuery: null,
       });
       close();
       renderEntryList(allEntries);
@@ -3915,7 +4055,12 @@ async function openAuthorIdentityReview() {
   const seedButton = overlay.querySelector('[data-use-seeds]');
   const updateSeedButton = () => {
     seedButton.textContent = `用选中的 ${modalSeedIds.size} 篇建立作者指纹`;
-    seedButton.disabled = modalSeedIds.size < 1 || modalSeedIds.size > 10;
+    const unresolved = [...modalSeedIds].some(entryId => {
+      const candidate = seedCandidates.find(item => Number(item.entry.id) === entryId);
+      return getAuthorNodeCandidates(candidate?.entry, identity?.authorName || '', currentPubmedSearch.query).length > 1
+        && !modalSeedAuthorSelections[String(entryId)];
+    });
+    seedButton.disabled = modalSeedIds.size < 1 || modalSeedIds.size > 10 || unresolved;
   };
   overlay.querySelectorAll('[data-seed-entry]').forEach(checkbox => {
     checkbox.addEventListener('change', () => {
@@ -3930,10 +4075,24 @@ async function openAuthorIdentityReview() {
       updateSeedButton();
     });
   });
+  overlay.querySelectorAll('[data-seed-author]').forEach(select => {
+    select.addEventListener('change', () => {
+      const value = Number(select.value);
+      if (value) modalSeedAuthorSelections[String(select.dataset.seedAuthor)] = value;
+      else delete modalSeedAuthorSelections[String(select.dataset.seedAuthor)];
+      updateSeedButton();
+    });
+  });
   updateSeedButton();
   overlay.querySelector('[data-use-seeds]')?.addEventListener('click', async () => {
     await saveAuthorIdentityState(searchId, {
+      ...state,
       seedIds: [...modalSeedIds], confirmedIds: [], likelyIds: [], reviewIds: [], sameNameIds: [], decisions: {},
+      profileVersion: state.profileVersion + 1,
+      queryGenerationState: 'generation_required',
+      pendingExpansionCandidates: [],
+      activeExpansionQuery: null,
+      seedAuthorSelections: modalSeedAuthorSelections,
     });
     close();
     renderEntryList(allEntries);
@@ -3944,6 +4103,46 @@ async function openAuthorIdentityReview() {
     close();
     renderEntryList(allEntries);
     await openAuthorIdentityReview();
+  });
+  overlay.querySelector('[data-generate-expansion]')?.addEventListener('click', async event => {
+    const currentFingerprint = authorIdentityFingerprint(allEntries, state);
+    if (!currentFingerprint) return;
+    event.currentTarget.disabled = true;
+    try {
+      const result = await invoke('build_pubmed_author_expansion_queries', {
+        authorName: identity?.authorName || currentFingerprint.targetAuthor,
+        confirmedNames: currentFingerprint.nameVariants,
+        confirmedAffiliations: currentFingerprint.affiliationLabels,
+        stableCoauthors: currentFingerprint.stableCoauthors,
+        seedCount: currentFingerprint.seedIds.length,
+      });
+      loadCostSummary();
+      await saveAuthorIdentityState(searchId, {
+        ...state,
+        pendingExpansionCandidates: result?.candidates || [],
+        queryGenerationState: 'pending',
+      });
+      close();
+      await openAuthorIdentityReview();
+    } catch (error) {
+      event.currentTarget.disabled = false;
+      setGlobalStatus(`生成扩展检索式失败: ${error}`, 'error');
+    }
+  });
+  overlay.querySelectorAll('[data-activate-expansion]').forEach(button => {
+    button.addEventListener('click', async () => {
+      const candidate = state.pendingExpansionCandidates[Number(button.dataset.activateExpansion)];
+      if (!candidate) return;
+      button.disabled = true;
+      await saveAuthorIdentityState(searchId, {
+        ...state,
+        activeExpansionQuery: candidate,
+        pendingExpansionCandidates: [],
+        queryGenerationState: 'current',
+      });
+      close();
+      setGlobalStatus('扩展检索式已启用；下次检查更新将合并第一轮与第二轮结果', 'success');
+    });
   });
   overlay.querySelectorAll('[data-cluster-key] [data-status]').forEach(button => {
     button.addEventListener('click', async event => {
@@ -3993,6 +4192,7 @@ async function enterKeptMode(options = {}) {
 }
 
 function enterLiteratureMode() {
+  leaveSciReviewMode();
   briefingListEl.classList.add('hidden');
   briefingDetailEl.classList.add('hidden');
   entryListEl.classList.remove('hidden');
@@ -4001,6 +4201,257 @@ function enterLiteratureMode() {
   applyPaperChatPanelWidth(loadPaperChatPanelWidth());
   syncPaperChatResizerVisibility();
   syncEntryFilterControls();
+}
+
+function leaveSciReviewMode() {
+  sciReviewWorkspaceEl?.classList.add('hidden');
+  listResizerEl?.classList.remove('hidden');
+  document.body.classList.remove('sci-review-mode');
+}
+
+function enterSciReviewMode(projectId) {
+  cancelLiteratureSearchForNavigation();
+  clearEntrySelection({ render: false, syncPaperChat: false });
+  mode = 'review';
+  currentPubmedSearch = null;
+  selectedFeedId = null;
+  document.body.classList.remove('pubmed-mode');
+  document.body.classList.add('sci-review-mode');
+  pubmedBatchHeader?.classList.add('hidden');
+  entryListEl?.classList.add('hidden');
+  detailPanelEl?.classList.add('hidden');
+  briefingListEl?.classList.add('hidden');
+  briefingDetailEl?.classList.add('hidden');
+  listResizerEl?.classList.add('hidden');
+  sciReviewWorkspaceEl?.classList.remove('hidden');
+  document.querySelectorAll('.feed-item').forEach(element => element.classList.remove('selected'));
+  sciReviewWorkspace?.open(projectId);
+  syncEntryFilterControls();
+  syncPaperChatResizerVisibility();
+  setToolbarSubtitle('review');
+}
+
+async function openSciReviewScreening(searchId) {
+  if (!searchId) return;
+  await selectPubmedSearch(searchId);
+  btnScreeningTableToggle?.click();
+}
+
+function openSciReviewReadingNotes() {
+  enterFeedMode();
+  selectedFeedId = null;
+  entryFilterValue = 'reading-notes';
+  persistEntryFilter();
+  syncEntryFilterControls();
+  setToolbarSubtitle('main');
+  loadEntries(null);
+}
+
+async function generateSciReviewStrategy(project) {
+  const strategy = await invoke('generate_sci_review_search_strategy', {
+    direction: project.direction,
+    keywords: project.keywords,
+    targetTier: project.targetTier || '待定',
+  });
+  loadCostSummary();
+  return strategy;
+}
+
+async function previewSciReviewStrategy(project) {
+  const previews = {};
+  for (const option of project.searchStrategy?.options || []) {
+    const preview = await invoke('preview_pubmed_search', {
+      query: option.pubmed_query,
+      options: {
+        scope: 'all',
+        limit: null,
+        date_from: null,
+        date_to: null,
+        sort: 'relevance',
+      },
+    });
+    previews[option.id] = {
+      totalCount: Number(preview.total_count || 0),
+      samples: (preview.entries || []).slice(0, 3).map(entry => ({
+        pmid: entry.pmid || '',
+        title: entry.title || '',
+        journal: entry.journal || '',
+      })),
+    };
+  }
+  return previews;
+}
+
+function sciReviewStageRecords(entries, stage) {
+  const ordered = [...entries].sort((a, b) => (Number(a.pubmed_rank) || Number.MAX_SAFE_INTEGER) - (Number(b.pubmed_rank) || Number.MAX_SAFE_INTEGER));
+  if (stage === 'screening') {
+    const pending = ordered.filter(entry => entry.screening_status === 'unreviewed');
+    return (pending.length ? pending : ordered).slice(0, 80);
+  }
+  if (['reading', 'framework', 'writing'].includes(stage)) {
+    const retained = ordered.filter(entry => ['keep', 'maybe'].includes(entry.screening_status));
+    return (retained.length ? retained : ordered).slice(0, 80);
+  }
+  if (stage === 'figures') {
+    const withPmc = ordered.filter(entry => entry.pmcid);
+    return (withPmc.length ? withPmc : ordered.filter(entry => ['keep', 'maybe'].includes(entry.screening_status))).slice(0, 80);
+  }
+  return ordered.slice(0, 80);
+}
+
+async function runSciReviewStage(project, stage) {
+  const search = allPubmedSearches.find(item => Number(item.id) === Number(project.linkedPubmedSearchId));
+  let entries = [];
+  if (project.linkedPubmedSearchId) {
+    entries = await invoke('list_pubmed_search_entries', { searchId: project.linkedPubmedSearchId });
+  }
+  const records = sciReviewStageRecords(entries, stage).map(entry => ({
+    entry_id: Number(entry.entry_id),
+    title: entry.title || '',
+    abstract_text: entry.summary || null,
+    authors: entry.authors || null,
+    journal: entry.journal || null,
+    publication_date: entry.publication_date || entry.published_at || null,
+    pmid: entry.pmid || null,
+    pmcid: entry.pmcid || null,
+    doi: entry.doi || null,
+    screening_status: entry.screening_status || 'unreviewed',
+    has_free_fulltext: Boolean(entry.has_free_fulltext),
+    has_reading_note: Boolean(entry.has_reading_note),
+  }));
+  const stageIndex = SCI_REVIEW_STAGES.findIndex(item => item.id === stage);
+  const upstreamArtifacts = SCI_REVIEW_STAGES.slice(1, Math.max(1, stageIndex))
+    .map(item => project.stageArtifacts?.[item.id]?.markdown)
+    .filter(Boolean)
+    .slice(-4);
+  const artifact = await invoke('run_sci_review_stage', {
+    input: {
+      stage,
+      project_name: project.name,
+      direction: project.direction,
+      keywords: project.keywords,
+      target_tier: project.targetTier || '待定',
+      linked_search_name: search?.name || null,
+      pubmed_query: search?.query || null,
+      total_records: entries.length || Number(search?.total_entries) || 0,
+      records,
+      upstream_artifacts: upstreamArtifacts,
+      target_journal: project.targetJournal || null,
+    },
+  });
+  loadCostSummary();
+  return artifact;
+}
+
+async function recommendSciReviewJournals(project) {
+  if (!project.linkedPubmedSearchId) throw new Error('请先关联 PubMed 文献池');
+  const entries = await invoke('list_pubmed_search_entries', { searchId: project.linkedPubmedSearchId });
+  const retained = entries.filter(entry => ['keep', 'maybe'].includes(entry.screening_status));
+  const source = retained.length ? retained : entries;
+  const distribution = new Map();
+  source.forEach(entry => {
+    const journal = String(entry.journal || '').trim();
+    if (journal) distribution.set(journal, (distribution.get(journal) || 0) + 1);
+  });
+  const journalDistribution = [...distribution.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 30)
+    .map(([journalName, articleCount]) => ({ journal_name: journalName, article_count: articleCount }));
+  const draft = project.draft || project.stageArtifacts?.writing?.markdown || '';
+  const recommendation = await invoke('recommend_sci_review_journals', {
+    input: {
+      project_name: project.name,
+      direction: project.direction,
+      keywords: project.keywords,
+      target_tier: project.targetTier || '待定',
+      article_type: project.articleType,
+      oa_preference: project.oaPreference,
+      apc_preference: project.apcPreference,
+      timeline_preference: project.timelinePreference,
+      draft_excerpt: draft.slice(0, 12_000),
+      journal_distribution: journalDistribution,
+    },
+  });
+  loadCostSummary();
+  return recommendation;
+}
+
+async function writeSciReviewSection(project, sectionId) {
+  if (!project.linkedPubmedSearchId) throw new Error('请先关联 PubMed 文献池');
+  const entries = await invoke('list_pubmed_search_entries', { searchId: project.linkedPubmedSearchId });
+  const retained = entries.filter(entry => ['keep', 'maybe'].includes(entry.screening_status));
+  const source = (retained.length ? retained : entries)
+    .sort((a, b) => Number(Boolean(b.has_reading_note)) - Number(Boolean(a.has_reading_note))
+      || (Number(a.pubmed_rank) || Number.MAX_SAFE_INTEGER) - (Number(b.pubmed_rank) || Number.MAX_SAFE_INTEGER))
+    .slice(0, 24);
+  const evidence = await Promise.all(source.map(async entry => {
+    let noteContent = null;
+    if (entry.has_reading_note) {
+      try {
+        const notes = await invoke('list_reading_notes', { entryId: entry.entry_id });
+        noteContent = notes[0]?.content || null;
+      } catch {}
+    }
+    return {
+      entry_id: Number(entry.entry_id),
+      title: entry.title || '',
+      abstract_text: entry.summary || null,
+      pmid: entry.pmid || null,
+      doi: entry.doi || null,
+      note_content: noteContent,
+    };
+  }));
+  const previousSections = sectionId === 'body'
+    ? [project.writingSections?.introduction?.markdown].filter(Boolean)
+    : (sectionId === 'synthesis'
+      ? [project.writingSections?.introduction?.markdown, project.writingSections?.body?.markdown].filter(Boolean)
+      : []);
+  const section = await invoke('write_sci_review_section', {
+    input: {
+      project_id: project.id,
+      section_id: sectionId,
+      project_name: project.name,
+      direction: project.direction,
+      keywords: project.keywords,
+      framework: project.framework || project.stageArtifacts?.framework?.markdown || '',
+      figure_plan: project.stageArtifacts?.figures?.markdown || '',
+      previous_sections: previousSections,
+      evidence,
+    },
+  });
+  loadCostSummary();
+  return section;
+}
+
+async function confirmSciReviewWritingGates(project, section) {
+  return invoke('confirm_sci_review_writing_quality_gates', {
+    projectId: project.id,
+    sectionId: section.section_id,
+    skillId: section.skill_id,
+    skillVersion: section.skill_version,
+  });
+}
+
+async function loadSciSkillSpecs() {
+  try {
+    sciSkillSpecs = await invoke('list_sci_skill_specs');
+    sciReviewWorkspace?.refresh();
+  } catch (error) {
+    sciSkillSpecs = [];
+    console.warn('加载 SCI Skill 规范失败', error);
+  }
+}
+
+function useSciReviewStrategy({ project, option, pubmedQuery }) {
+  openPubmedSearchModal({ reviewProjectId: project.id });
+  document.getElementById('pubmed-search-name').value = `【综述｜${project.name}】`;
+  document.getElementById('pubmed-question').value = project.direction;
+  document.getElementById('pubmed-batch-query-input').value = pubmedQuery;
+  invalidatePubmedPreview();
+  const status = document.getElementById('pubmed-preview-status');
+  if (status) {
+    status.textContent = `${option?.label || '自定义方案'}已载入；请点击预览结果，确认后再保存正式检索`;
+  }
 }
 
 function updatePubmedBatchHeader() {
@@ -4190,6 +4641,7 @@ function syncLiteratureSearchUi() {
 }
 
 function enterLiteratureSearchMode({ preservePubmedSearch = false } = {}) {
+  leaveSciReviewMode();
   clearEntrySelection({ render: false, syncPaperChat: false });
   mode = 'search';
   if (!preservePubmedSearch) currentPubmedSearch = null;
@@ -4343,6 +4795,7 @@ function clearLiteratureSearch() {
 function updateToolbarFeedInfo(feed) {
   if (!toolbarSubtitle) return;
   if (!settingsView.classList.contains('hidden')) return;
+  if (mode === 'review') { setToolbarSubtitle('review'); return; }
   if (mode === 'briefing') { setToolbarSubtitle('briefing'); return; }
   if (mode === 'search') { setToolbarSubtitle('search'); return; }
   if (!feed) { toolbarSubtitle.innerHTML = ''; return; }
@@ -9613,7 +10066,7 @@ const DEFAULT_BRIEFING_PROMPT =
 
 6. **参考文献**（一个 \`## \` 小节，放在正文最末）：按 \`[n]\` 编号顺序列出本期被引用过的全部文献，使用 Markdown 链接 \`[原文标题](URL)\` 形式直跳原文。格式示例：
    - \`[1] [原文标题](https://...) — 期刊名\`
-   每条 1 行，不要重复摘要内容。URL 严格使用用户提供数据中的"链接"字段，禁止编造或猜测。
+   每条必须以 \`- [n]\` 开头，作为独立 Markdown 列表项；不要把多条参考文献写在同一段。每条 1 行，不要重复摘要内容。URL 严格使用用户提供数据中的"链接"字段，禁止编造或猜测。
 
 ## 风格要求
 
@@ -9644,6 +10097,7 @@ async function loadBriefings() {
 }
 
 function enterBriefingMode(options = {}) {
+  leaveSciReviewMode();
   const preserveSearch = !!options.preserveSearch;
   if (!preserveSearch) cancelLiteratureSearchForNavigation();
   mode = 'briefing';
@@ -9672,6 +10126,7 @@ function enterBriefingMode(options = {}) {
 }
 
 function enterFeedMode() {
+  leaveSciReviewMode();
   mode = 'feed';
   currentPubmedSearch = null;
   document.body.classList.remove('pubmed-mode');
@@ -9809,7 +10264,7 @@ function renderBriefingMarkdown(md) {
   if (!markdownRenderer) {
     return `<div class="briefing-md"><p>${escapeHtml(md)}</p></div>`;
   }
-  const rendered = markdownRenderer.render(md);
+  const rendered = markdownRenderer.render(normalizeBriefingReferencesMarkdown(md));
   return `<div class="briefing-md">${decorateMarkdownHtml(rendered)}</div>`;
 }
 
@@ -11572,6 +12027,7 @@ async function loadPmcGalleryHistory() {
   }
   renderPmcGallerySidebarList();
   renderPmcGalleryNameHistory();
+  sciReviewWorkspace?.refresh();
 }
 
 function renderPmcGalleryNameHistory() {
@@ -11929,11 +12385,25 @@ function pmcGalleryArticleGroupMarkup(group, kind) {
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
       </button>`
     : '';
+  const qualityBadges = [
+    group.impact_factor ? `<span class="pmc-gallery-quality-badge">IF ${escapeHtml(group.impact_factor)}</span>` : '',
+    group.jcr_quartile ? `<span class="pmc-gallery-quality-badge">${escapeHtml(group.jcr_quartile)}</span>` : '',
+    group.cas_partition ? `<span class="pmc-gallery-quality-badge">${escapeHtml(group.cas_partition)}</span>` : '',
+    group.is_top ? '<span class="pmc-gallery-quality-badge is-top">Top</span>' : '',
+  ].filter(Boolean).join('');
   return `<section class="pmc-gallery-article-group">
     <header class="pmc-gallery-article-header">
-      <button class="pmc-gallery-article-link" type="button" data-pmc-gallery-open="${escapeHtmlAttribute(group.article_url)}">${escapeHtml(group.article_title || group.pmcid)}</button>
+      <div class="pmc-gallery-article-heading">
+        <button class="pmc-gallery-article-link" type="button" data-pmc-gallery-open="${escapeHtmlAttribute(group.article_url)}">${escapeHtml(group.article_title || group.pmcid)}</button>
+        <div class="pmc-gallery-article-quality">
+          ${group.journal ? `<span class="pmc-gallery-journal-name">${escapeHtml(shortJournalDisplayName(group.journal))}</span>` : ''}
+          ${qualityBadges}
+          ${group.publication_year ? `<span>${escapeHtml(group.publication_year)}</span>` : ''}
+          <span>${escapeHtml(group.pmcid)}</span>
+        </div>
+      </div>
       <div class="pmc-gallery-article-meta">
-        <span>${escapeHtml(group.pmcid)}</span>
+        <button class="pmc-gallery-source-link" type="button" data-pmc-gallery-open="${escapeHtmlAttribute(group.article_url)}">原文</button>
         <span>${figureIndex + 1} / ${figureCount}</span>
       </div>
     </header>
@@ -11956,7 +12426,7 @@ function renderPmcGallerySection(kind, gridId, countId, emptyId) {
       ? figures.filter(figure => isPmcFigureNumber(figure, pmcGalleryFigureNumber))
       : [];
   }
-  const groups = groupPmcFiguresByArticle(figures);
+  const groups = sortPmcArticleGroupsByQuality(groupPmcFiguresByArticle(figures));
   grid.innerHTML = groups.map(group => pmcGalleryArticleGroupMarkup(group, kind)).join('');
   grid.classList.toggle('hidden', figures.length === 0);
   empty.classList.toggle('hidden', figures.length > 0);
@@ -11983,11 +12453,13 @@ function renderPmcGallery() {
   }
 
   const graphicalSection = document.getElementById('pmc-gallery-graphical-section');
+  const figureSection = document.getElementById('pmc-gallery-figure-section');
   const figureTitle = document.getElementById('pmc-gallery-figure-title');
   const figureEmpty = document.getElementById('pmc-gallery-figure-empty');
   const extractingFigure = pmcGalleryView === 'figure-number';
   const figureLabel = `Figure ${pmcGalleryFigureNumber}`;
   graphicalSection?.classList.toggle('hidden', extractingFigure);
+  figureSection?.classList.toggle('hidden', pmcGalleryView === 'graphical');
   if (figureTitle) figureTitle.textContent = extractingFigure ? figureLabel : '正文图';
   if (figureEmpty) figureEmpty.textContent = extractingFigure ? `当前检索结果中未找到 ${figureLabel}` : '未找到正文图';
   renderPmcGallerySection(
@@ -12013,6 +12485,7 @@ async function openPmcGalleryModal(historyId = '') {
   const queryInput = document.getElementById('pmc-gallery-query');
   if (!modal || !queryInput) return;
   pmcGalleryResult = null;
+  pmcGalleryView = 'graphical';
   pmcGalleryNextOffset = 0;
   pmcGalleryHasMore = false;
   pmcGalleryActiveMetricFilters = null;
@@ -12151,7 +12624,7 @@ async function searchPmcGallery(loadMore = false) {
 }
 
 function setPmcGalleryView(view) {
-  if (!['all', 'figure-number'].includes(view)) return;
+  if (!['graphical', 'all', 'figure-number'].includes(view)) return;
   pmcGalleryView = view;
   renderPmcGallery();
 }
@@ -12175,6 +12648,7 @@ window.addEventListener('DOMContentLoaded', () => {
   settingsView = document.getElementById('settings-view');
   mainView     = document.getElementById('main-view');
   contentArea  = document.getElementById('content-area');
+  sciReviewWorkspaceEl = document.getElementById('sci-review-workspace');
   toolbarSubtitle = document.getElementById('toolbar-subtitle');
   toolbarApiPicker = document.getElementById('toolbar-api-picker');
   toolbarApiButton = document.getElementById('toolbar-api-button');
@@ -12376,6 +12850,45 @@ window.addEventListener('DOMContentLoaded', () => {
   paperGraphCounts     = document.getElementById('paper-graph-counts');
   briefingDetailEmpty  = document.getElementById('briefing-detail-empty');
   briefingDetailContent = document.getElementById('briefing-detail-content');
+
+  sciReviewWorkspace = new SciReviewWorkspace({
+    projectList: document.getElementById('sci-review-project-list'),
+    workspace: sciReviewWorkspaceEl,
+    modal: document.getElementById('sci-review-project-modal'),
+    getPubmedSearches: () => allPubmedSearches,
+    getPmcSearches: () => pmcGalleryHistory,
+    getSkillSpecs: () => sciSkillSpecs,
+    callbacks: {
+      onOpenProject: enterSciReviewMode,
+      onProjectChanged: () => {
+        if (mode === 'review') setToolbarSubtitle('review');
+      },
+      onProjectDeleted: () => {
+        enterFeedMode();
+        selectedFeedId = null;
+        restoreCurrentFilterScope();
+        loadEntries(null);
+      },
+      onNewPubmed: () => openPubmedSearchModal(),
+      onOpenPubmed: searchId => selectPubmedSearch(searchId),
+      onGenerateStrategy: generateSciReviewStrategy,
+      onPreviewStrategy: previewSciReviewStrategy,
+      onUseStrategy: useSciReviewStrategy,
+      onRunStage: runSciReviewStage,
+      onRecommendJournals: recommendSciReviewJournals,
+      onWriteSection: writeSciReviewSection,
+      onConfirmWritingGates: confirmSciReviewWritingGates,
+      onOpenWos: () => openUrl('https://www.webofscience.com/'),
+      onOpenScreening: openSciReviewScreening,
+      onOpenReading: openSciReviewReadingNotes,
+      onNewPmc: () => openPmcGalleryModal(),
+      onOpenPmc: searchId => openPmcGalleryModal(searchId),
+    },
+  });
+  loadSciSkillSpecs();
+  document.getElementById('btn-new-sci-review-project')?.addEventListener('click', () => {
+    sciReviewWorkspace.openCreateModal();
+  });
 
   setupSidebarResizer();
   setupSidebarSectionToggles();

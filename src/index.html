@@ -10,12 +10,12 @@
             href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Noto+Serif+SC:wght@400;500;600;700&display=swap"
             rel="stylesheet"
         />
-        <link rel="stylesheet" href="styles.css?v=20260719-pmc-full-preview" />
+        <link rel="stylesheet" href="styles.css?v=20260720-sci-review-auto-link" />
         <script src="/vendor/markdown-it.js"></script>
         <script src="/vendor/markdown-it-task-lists.js"></script>
         <script src="/vendor/markdown-it-footnote.js"></script>
         <script src="/vendor/purify.js"></script>
-        <script type="module" src="/main.js?v=20260719-pmc-full-preview" defer></script>
+        <script type="module" src="/main.js?v=20260720-sci-review-auto-link" defer></script>
     </head>
 
     <body data-theme="light" data-accent="coral" data-font-scale="md">
@@ -2284,6 +2284,25 @@
                     </div>
 
                     <div class="sidebar-source-sections">
+                        <section class="sidebar-source-section sci-review-sidebar-section" data-sidebar-source-section="sci-review">
+                            <div class="feed-section-label">
+                                <button
+                                    class="sidebar-section-toggle"
+                                    type="button"
+                                    data-sidebar-section-toggle="sci-review"
+                                    aria-expanded="true"
+                                    aria-controls="sci-review-project-list"
+                                    title="折叠 SCI 综述项目"
+                                >
+                                    <svg class="sidebar-section-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
+                                    <span>SCI 综述项目</span>
+                                </button>
+                                <button id="btn-new-sci-review-project" class="sidebar-section-action" type="button" title="新建 SCI 综述项目" aria-label="新建 SCI 综述项目">
+                                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                                </button>
+                            </div>
+                            <ul id="sci-review-project-list" class="review-project-list sidebar-section-list"></ul>
+                        </section>
                         <section class="sidebar-source-section" data-sidebar-source-section="pmc-gallery">
                             <div class="feed-section-label">
                                 <button
@@ -2358,6 +2377,7 @@
 
                 <!-- Content area -->
                 <div id="content-area" class="content-area">
+                    <section id="sci-review-workspace" class="sci-review-workspace hidden" aria-label="SCI 综述工作台"></section>
                     <!-- Entry list (feed mode) -->
                     <section id="entry-list" class="entry-list" tabindex="0">
                         <div class="entry-list-header chrome">
@@ -3567,6 +3587,26 @@
         </div>
         <!-- /#app -->
 
+        <div id="sci-review-project-modal" class="pubmed-modal review-project-modal hidden" role="dialog" aria-modal="true" aria-labelledby="sci-review-project-modal-title">
+            <div class="pubmed-modal-backdrop" data-review-modal-close></div>
+            <section class="pubmed-modal-panel review-project-modal-panel">
+                <header class="pubmed-modal-header">
+                    <div>
+                        <h2 id="sci-review-project-modal-title">新建 SCI 综述项目</h2>
+                        <p>先记录最少的项目起始信息，后续阶段可以随时补充。</p>
+                    </div>
+                    <button class="pubmed-modal-close" type="button" data-review-modal-close title="关闭" aria-label="关闭">×</button>
+                </header>
+                <form class="review-project-modal-form">
+                    <label class="review-field"><span>项目名称 <em>必填</em></span><input id="review-project-name" name="name" maxlength="100" required placeholder="例如：心肌缺血与纤维化综述"></label>
+                    <label class="review-field"><span>研究方向 <em>必填</em></span><input name="direction" maxlength="300" required placeholder="概括计划回答的研究问题"></label>
+                    <label class="review-field"><span>研究关键词 <em>必填</em></span><input name="keywords" maxlength="600" required placeholder="中文、英文或混合关键词，用逗号分隔"></label>
+                    <label class="review-field"><span>目标分区</span><input name="targetTier" maxlength="100" placeholder="例如：中科院一区 / JCR Q1 / 待定"></label>
+                    <footer><button class="btn btn-secondary" type="button" data-review-modal-close>取消</button><button class="btn btn-primary" type="submit">创建项目</button></footer>
+                </form>
+            </section>
+        </div>
+
         <div id="pmc-gallery-modal" class="pubmed-modal pmc-gallery-modal hidden" role="dialog" aria-modal="true" aria-labelledby="pmc-gallery-title">
             <div class="pubmed-modal-backdrop" data-pmc-gallery-close></div>
             <section class="pubmed-modal-panel pmc-gallery-panel">
@@ -3674,7 +3714,8 @@
                     </div>
                     <div class="pmc-gallery-toolbar">
                         <div class="segmented-control" role="group" aria-label="图库提取模式">
-                            <button class="seg-btn active" type="button" data-pmc-gallery-view="all">全部图片</button>
+                            <button class="seg-btn active" type="button" data-pmc-gallery-view="graphical">图形摘要</button>
+                            <button class="seg-btn" type="button" data-pmc-gallery-view="all">全部图片</button>
                             <button class="seg-btn" type="button" data-pmc-gallery-view="figure-number">按图号提取</button>
                         </div>
                         <label id="pmc-gallery-figure-number-control" class="pmc-gallery-figure-number-control hidden">

@@ -1,5 +1,5 @@
 use crate::db::DbState;
-use crate::models::PubmedAuthorQueryResult;
+use crate::models::{PubmedAuthorQueryResult, SciReviewSearchStrategy};
 use crate::services::{cost_service, pubmed_service, settings_service};
 use tauri::State;
 
@@ -86,4 +86,30 @@ pub async fn natural_to_pubmed_query(
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
     let _ = cost_service::record_usage(&conn, &settings.provider, &settings.model, &usage);
     query_result.map_err(|error| format!("AI 生成的检索式不完整：{}。请重新生成", error))
+}
+
+#[tauri::command]
+pub async fn generate_sci_review_search_strategy(
+    state: State<'_, DbState>,
+    direction: String,
+    keywords: String,
+    target_tier: String,
+) -> Result<SciReviewSearchStrategy, String> {
+    let settings = {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        settings_service::get_settings(&conn)
+    };
+    if settings.api_key.trim().is_empty() {
+        return Err("请先在设置中配置当前 AI 服务的 API Key".to_string());
+    }
+    let (strategy, usage) = pubmed_service::generate_sci_review_search_strategy(
+        &settings,
+        &direction,
+        &keywords,
+        &target_tier,
+    )
+    .await?;
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    let _ = cost_service::record_usage(&conn, &settings.provider, &settings.model, &usage);
+    Ok(strategy)
 }

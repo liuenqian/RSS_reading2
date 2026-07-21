@@ -21,6 +21,8 @@ pub mod pubmed_search_service;
 pub mod pubmed_service;
 pub mod reading_service;
 pub mod scheduler;
+pub mod sci_review_service;
+pub mod sci_skill_service;
 pub mod screening_scope_service;
 pub mod screening_state_service;
 pub mod screening_xlsx_service;

@@ -7,7 +7,8 @@ mod services;
 use commands::{
     briefing_cmd, entry_cmd, feed_cmd, fetch_cmd, nature_download_cmd, opml_cmd, paper_chat_cmd,
     paper_graph_cmd, pmc_gallery_cmd, pubmed_cmd, pubmed_conversion_cmd, pubmed_search_cmd,
-    reading_cmd, screening_cmd, settings_cmd, translate_cmd, tray_cmd, update_cmd,
+    reading_cmd, sci_review_cmd, sci_skill_cmd, screening_cmd, settings_cmd, translate_cmd,
+    tray_cmd, update_cmd,
 };
 use services::scheduler;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
@@ -166,6 +167,13 @@ pub fn run() {
             pubmed_cmd::build_pubmed_author_query,
             pubmed_cmd::build_pubmed_author_expansion_queries,
             pubmed_cmd::natural_to_pubmed_query,
+            pubmed_cmd::generate_sci_review_search_strategy,
+            sci_review_cmd::run_sci_review_stage,
+            sci_review_cmd::recommend_sci_review_journals,
+            sci_review_cmd::write_sci_review_section,
+            sci_review_cmd::confirm_sci_review_writing_quality_gates,
+            sci_skill_cmd::list_sci_skill_specs,
+            sci_skill_cmd::get_sci_skill_spec,
             pubmed_conversion_cmd::convert_pubmed_feed_to_search,
             pubmed_conversion_cmd::convert_pubmed_search_to_feed,
             pubmed_search_cmd::preview_pubmed_search,

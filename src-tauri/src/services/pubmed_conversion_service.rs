@@ -204,6 +204,11 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT, search_id INTEGER NOT NULL,
                 status TEXT NOT NULL, added_count INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE pubmed_search_run_items (
+                run_id INTEGER NOT NULL, pmid TEXT NOT NULL, rank INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', entry_id INTEGER, error_message TEXT,
+                PRIMARY KEY(run_id, pmid)
+            );
             CREATE TABLE pubmed_search_entries (
                 search_id INTEGER NOT NULL REFERENCES pubmed_searches(id) ON DELETE CASCADE,
                 entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,

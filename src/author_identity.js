@@ -37,6 +37,7 @@ function structuredAuthorNodes(entry) {
     ? entry.structured_authors
     : (Array.isArray(entry?.structuredAuthors) ? entry.structuredAuthors : []);
   return records.map(record => ({
+    authorOrder: Number(record?.author_order ?? record?.authorOrder ?? 0),
     displayName: record?.display_name || record?.displayName
       || [record?.fore_name || record?.foreName, record?.last_name || record?.lastName].filter(Boolean).join(' ')
       || record?.collective_name || record?.collectiveName || '',
@@ -45,10 +46,19 @@ function structuredAuthorNodes(entry) {
   })).filter(node => node.displayName);
 }
 
-function targetAuthorNode(entry, identityNames = []) {
+function targetAuthorNode(entry, identityNames = [], selectedOrder = null) {
   const requested = identityNames.map(normalize).filter(Boolean);
   if (!requested.length) return null;
-  return structuredAuthorNodes(entry).find(node => requested.some(name => namesProbablyMatch(node.displayName, name))) || null;
+  const matches = structuredAuthorNodes(entry).filter(node => requested.some(name => namesProbablyMatch(node.displayName, name)));
+  if (selectedOrder != null) return matches.find(node => node.authorOrder === Number(selectedOrder)) || null;
+  return matches.length === 1 ? matches[0] : null;
+}
+
+export function getAuthorNodeCandidates(entry, targetAuthor = '', query = '') {
+  const requested = [targetAuthor, ...queryAuthorVariants(query)].filter(Boolean);
+  return structuredAuthorNodes(entry)
+    .filter(node => requested.some(value => namesProbablyMatch(node.displayName, value)))
+    .map(node => ({ ...node }));
 }
 
 function topicTokens(entry) {
@@ -61,10 +71,12 @@ function affiliationTokens(entry) {
 
 function targetAffiliationTokenSets(entry, identityNames = []) {
   const target = targetAuthorNode(entry, identityNames);
+  const hasStructuredAuthors = structuredAuthorNodes(entry).length > 0;
   const structured = target?.affiliations
     .map(value => tokens(value, GENERIC_AFFILIATION_WORDS))
     .filter(value => value.length) || [];
-  return structured.length ? structured : [affiliationTokens(entry)].filter(value => value.length);
+  if (structured.length) return structured;
+  return hasStructuredAuthors ? [] : [affiliationTokens(entry)].filter(value => value.length);
 }
 
 function targetAffiliationTokens(entry, identityNames = []) {
@@ -73,7 +85,8 @@ function targetAffiliationTokens(entry, identityNames = []) {
 
 function targetAffiliationLabel(entry, identityNames = []) {
   const target = targetAuthorNode(entry, identityNames);
-  return target?.affiliations?.find(Boolean) || entry?.affiliation || '';
+  if (structuredAuthorNodes(entry).length) return target?.affiliations?.find(Boolean) || '';
+  return entry?.affiliation || '';
 }
 
 function publicationYear(entry) {
@@ -93,6 +106,16 @@ function mostFrequent(values, limit = 8) {
   const counts = new Map();
   values.filter(Boolean).forEach(value => counts.set(value, (counts.get(value) || 0) + 1));
   return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
+    .map(([value]) => value);
+}
+
+function mostFrequentWithMinimum(values, minimum, limit = 8) {
+  const counts = new Map();
+  values.filter(Boolean).forEach(value => counts.set(value, (counts.get(value) || 0) + 1));
+  return [...counts.entries()]
+    .filter(([, count]) => count >= minimum)
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .slice(0, limit)
     .map(([value]) => value);
@@ -175,26 +198,37 @@ export function recommendAuthorSeedCandidates(
   return fallback.map((item, index) => ({ ...item, recommended: index < recommendedCount }));
 }
 
-export function buildAuthorFingerprint(entries, seedIds, targetAuthor = '', query = '', affiliationAliases = []) {
+export function buildAuthorFingerprint(entries, seedIds, targetAuthor = '', query = '', affiliationAliases = [], authorSelections = {}) {
   const ids = new Set(seedIds.map(Number));
   const seeds = entries.filter(entry => ids.has(Number(entry.id)));
   if (!seeds.length) return null;
 
   const anchors = fingerprintAnchorNames(seeds, targetAuthor, query);
   const isAnchor = name => anchors.some(anchor => namesProbablyMatch(name, anchor));
-  const targetNodes = seeds.map(seed => targetAuthorNode(seed, anchors)).filter(Boolean);
+  const targetNodes = seeds.map(seed => targetAuthorNode(seed, anchors, authorSelections[String(seed.id)])).filter(Boolean);
   const years = seeds.map(publicationYear).filter(Boolean).map(Number);
+  const rawAffiliations = [
+    ...seeds.flatMap(seed => targetAuthorNode(seed, anchors, authorSelections[String(seed.id)])?.affiliations || []),
+    ...(Array.isArray(affiliationAliases) ? affiliationAliases : [affiliationAliases]),
+  ].map(value => String(value || '').trim()).filter(Boolean);
+  const seedCoauthors = seeds.flatMap(authorNames).filter(name => !isAnchor(name));
   return {
     seedIds: seeds.map(entry => Number(entry.id)),
     targetAuthor: normalize(targetAuthor),
     anchors,
+    nameVariants: anchors,
     affiliations: [
-      ...seeds.flatMap(seed => targetAffiliationTokenSets(seed, anchors)),
+      ...seeds.flatMap(seed => {
+        const target = targetAuthorNode(seed, anchors, authorSelections[String(seed.id)]);
+        return target?.affiliations?.map(value => tokens(value, GENERIC_AFFILIATION_WORDS)) || targetAffiliationTokenSets(seed, anchors);
+      }),
       ...(Array.isArray(affiliationAliases) ? affiliationAliases : [affiliationAliases])
         .map(value => tokens(value, GENERIC_AFFILIATION_WORDS)),
     ].filter(list => list.length),
+    affiliationLabels: mostFrequent(rawAffiliations, 20),
     orcids: mostFrequent(targetNodes.map(node => node.orcid), 8),
-    coauthors: mostFrequent(seeds.flatMap(authorNames).filter(name => !isAnchor(name)), 30),
+    coauthors: mostFrequent(seedCoauthors, 30),
+    stableCoauthors: mostFrequentWithMinimum(seedCoauthors, 2, 30),
     topics: mostFrequent(seeds.flatMap(topicTokens), 40),
     yearRange: years.length ? [Math.min(...years), Math.max(...years)] : null,
   };

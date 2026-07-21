@@ -13,12 +13,13 @@
 //      `{"rss_feed_url": "https://pubmed.ncbi.nlm.nih.gov/rss/search/<token>/?…"}`.
 
 use crate::models::{
-    DeepSeekSettings, PubmedAuthorQueryCandidate, PubmedAuthorQueryResult, TokenUsage,
+    DeepSeekSettings, PubmedAuthorQueryCandidate, PubmedAuthorQueryResult, SciReviewQueryOption,
+    SciReviewSearchStrategy, SciReviewTermEvidence, TokenUsage,
 };
 use crate::services::pubmed_author_query_service::{
     validate_author_query, AuthorQueryEvidence, AuthorQueryPhase,
 };
-use crate::services::translate_service;
+use crate::services::{sci_skill_service, translate_service};
 use reqwest::Client;
 use serde::Deserialize;
 
@@ -546,6 +547,7 @@ fn normalize_optional_date(value: Option<&str>, label: &str) -> Result<Option<St
     Ok(Some(parts.join("/")))
 }
 
+#[cfg(test)]
 fn escape_pubmed_phrase(value: &str) -> String {
     value.replace('"', "")
 }
@@ -591,6 +593,237 @@ pub async fn natural_language_to_query(
     )
     .await?;
     Ok((output.content, output.usage))
+}
+
+const SCI_REVIEW_QUERY_PROMPT: &str = r#"
+You are the search-strategy engine for a reproducible biomedical SCI review workflow.
+Based only on the supplied research direction, keywords, and target tier, decompose the topic
+into 2-5 searchable concepts, calibrate Chinese terms into database-recognizable English terms,
+and create broad, moderate, and precise queries for both PubMed and Web of Science.
+
+Rules:
+- Do not mechanically translate Chinese keywords. Use standard biomedical academic wording.
+- Use OR within each concept block and AND between concept blocks.
+- PubMed free text must use [Title/Abstract]. Use [MeSH Terms] only for established concepts.
+- WOS queries must use TS= and readable parentheses.
+- Do not invent hit counts, live database observations, or claim that a term was checked online.
+- Every evidence field must explicitly say either "AI术语校准，待PubMed预览核查" or
+  "需要人工核查". WOS evidence must mention that institutional WOS access is required.
+- Broad maximizes recall, moderate balances recall and precision, precise reduces screening noise.
+- Return exactly three options with ids broad, moderate, precise, in that order.
+- Recommend one of broad, moderate, precise. Usually moderate is the practical default.
+- Keep all Chinese explanations concise. Return strict JSON only without markdown fences.
+
+JSON shape:
+{
+  "direction":"...",
+  "keywords":"...",
+  "target_tier":"...",
+  "core_concepts":["..."],
+  "manual_checks":["..."],
+  "term_evidence":[{
+    "chinese_concept":"...",
+    "concept_breakdown":"...",
+    "recommended_terms":["..."],
+    "term_type":"standard|free-text|mixed",
+    "variants":["..."],
+    "mesh_evidence":"AI术语校准，待PubMed预览核查",
+    "pubmed_evidence":"AI术语校准，待PubMed预览核查",
+    "wos_evidence":"需要机构登录后人工核查",
+    "inclusion_decision":"...",
+    "risk":"..."
+  }],
+  "options":[{
+    "id":"broad|moderate|precise",
+    "label":"宽泛版|适量版|精准版",
+    "pubmed_query":"...",
+    "wos_query":"TS=(...)",
+    "purpose":"...",
+    "recall":"...",
+    "precision":"...",
+    "use_case":"...",
+    "risk":"..."
+  }],
+  "recommended_option":"moderate",
+  "recommendation_reason":"..."
+}
+"#;
+
+pub async fn generate_sci_review_search_strategy(
+    settings: &DeepSeekSettings,
+    direction: &str,
+    keywords: &str,
+    target_tier: &str,
+) -> Result<(SciReviewSearchStrategy, TokenUsage), String> {
+    let direction = direction.trim();
+    let keywords = keywords.trim();
+    if direction.is_empty() {
+        return Err("请先填写研究方向".to_string());
+    }
+    if keywords.is_empty() {
+        return Err("请先填写研究关键词".to_string());
+    }
+    let target_tier = target_tier.trim();
+    let request = format!(
+        "研究方向：{}\n研究关键词：{}\n目标分区：{}",
+        direction,
+        keywords,
+        if target_tier.is_empty() {
+            "待定"
+        } else {
+            target_tier
+        }
+    );
+    let skill_spec = sci_skill_service::get_spec("sci-search-query-generator")?;
+    let skill_text = sci_skill_service::get_skill_text("sci-search-query-generator")?;
+    let system_prompt = format!(
+        "{}\n\n# 必须严格执行的 Skill 原文\n\n{}\n\n严格按该 Skill 的 Required Inputs、Core Workflow、Outputs、Quality Gates 和 Prohibited Actions 执行。无法联网核查的内容必须写入人工核查项。",
+        SCI_REVIEW_QUERY_PROMPT, skill_text
+    );
+    let output =
+        translate_service::complete_with_prompts(settings, &system_prompt, &request, 0.1, 6_000)
+            .await?;
+    let mut strategy =
+        parse_sci_review_strategy(&output.content, direction, keywords, target_tier)?;
+    strategy.skill_id = skill_spec.skill_id;
+    strategy.skill_version = skill_spec.skill_version;
+    strategy.quality_gates = skill_spec.quality_gates;
+    Ok((strategy, output.usage))
+}
+
+fn parse_sci_review_strategy(
+    raw: &str,
+    direction: &str,
+    keywords: &str,
+    target_tier: &str,
+) -> Result<SciReviewSearchStrategy, String> {
+    let cleaned = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let mut strategy: SciReviewSearchStrategy = serde_json::from_str(cleaned)
+        .map_err(|error| format!("AI 返回的 SCI 检索策略不是有效 JSON：{}", error))?;
+
+    strategy.direction = direction.trim().to_string();
+    strategy.keywords = keywords.trim().to_string();
+    strategy.target_tier = if target_tier.trim().is_empty() {
+        "待定".to_string()
+    } else {
+        target_tier.trim().to_string()
+    };
+    strategy.core_concepts = clean_string_list(strategy.core_concepts, 5, 120);
+    strategy.manual_checks = clean_string_list(strategy.manual_checks, 12, 300);
+    if strategy.core_concepts.len() < 2 {
+        return Err("AI 返回的检索主题拆解不足 2 个概念，请重新生成".to_string());
+    }
+    if strategy.term_evidence.is_empty() {
+        return Err("AI 未返回术语证据表，请重新生成".to_string());
+    }
+    strategy.term_evidence = strategy
+        .term_evidence
+        .into_iter()
+        .take(12)
+        .map(normalize_sci_term_evidence)
+        .collect();
+
+    let mut ordered = Vec::with_capacity(3);
+    for expected in ["broad", "moderate", "precise"] {
+        let option = strategy
+            .options
+            .iter()
+            .find(|option| option.id.trim().eq_ignore_ascii_case(expected))
+            .cloned()
+            .ok_or_else(|| format!("AI 未返回 {} 检索方案，请重新生成", expected))?;
+        ordered.push(normalize_sci_query_option(option, expected)?);
+    }
+    strategy.options = ordered;
+    strategy.recommended_option = strategy.recommended_option.trim().to_ascii_lowercase();
+    if !matches!(
+        strategy.recommended_option.as_str(),
+        "broad" | "moderate" | "precise"
+    ) {
+        strategy.recommended_option = "moderate".to_string();
+    }
+    strategy.recommendation_reason = strategy
+        .recommendation_reason
+        .trim()
+        .chars()
+        .take(500)
+        .collect();
+    if !strategy
+        .manual_checks
+        .iter()
+        .any(|item| item.contains("WOS") || item.contains("Web of Science"))
+    {
+        strategy
+            .manual_checks
+            .push("Web of Science 主题词与命中数量需在机构登录后核查".to_string());
+    }
+    Ok(strategy)
+}
+
+fn normalize_sci_term_evidence(mut value: SciReviewTermEvidence) -> SciReviewTermEvidence {
+    value.chinese_concept = value.chinese_concept.trim().chars().take(120).collect();
+    value.concept_breakdown = value.concept_breakdown.trim().chars().take(300).collect();
+    value.recommended_terms = clean_string_list(value.recommended_terms, 12, 160);
+    value.term_type = value.term_type.trim().chars().take(80).collect();
+    value.variants = clean_string_list(value.variants, 20, 160);
+    value.mesh_evidence = evidence_or_manual_check(&value.mesh_evidence, "MeSH 需要人工核查");
+    value.pubmed_evidence =
+        evidence_or_manual_check(&value.pubmed_evidence, "PubMed 用词需要预览核查");
+    value.wos_evidence =
+        evidence_or_manual_check(&value.wos_evidence, "WOS 需要机构登录后人工核查");
+    value.inclusion_decision = value.inclusion_decision.trim().chars().take(300).collect();
+    value.risk = value.risk.trim().chars().take(300).collect();
+    value
+}
+
+fn evidence_or_manual_check(value: &str, fallback: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return fallback.to_string();
+    }
+    value.chars().take(300).collect()
+}
+
+fn normalize_sci_query_option(
+    mut option: SciReviewQueryOption,
+    expected_id: &str,
+) -> Result<SciReviewQueryOption, String> {
+    option.id = expected_id.to_string();
+    option.label = match expected_id {
+        "broad" => "宽泛版",
+        "precise" => "精准版",
+        _ => "适量版",
+    }
+    .to_string();
+    option.pubmed_query = validate_query_syntax(&option.pubmed_query)?;
+    option.wos_query = option.wos_query.trim().chars().take(8_000).collect();
+    if !option.wos_query.to_ascii_uppercase().starts_with("TS=") {
+        return Err(format!("{} WOS 检索式必须以 TS= 开头", option.label));
+    }
+    option.purpose = option.purpose.trim().chars().take(300).collect();
+    option.recall = option.recall.trim().chars().take(200).collect();
+    option.precision = option.precision.trim().chars().take(200).collect();
+    option.use_case = option.use_case.trim().chars().take(300).collect();
+    option.risk = option.risk.trim().chars().take(300).collect();
+    Ok(option)
+}
+
+fn clean_string_list(values: Vec<String>, limit: usize, item_limit: usize) -> Vec<String> {
+    let mut cleaned = Vec::new();
+    for value in values {
+        let value: String = value.trim().chars().take(item_limit).collect();
+        if !value.is_empty() && !cleaned.contains(&value) {
+            cleaned.push(value);
+        }
+        if cleaned.len() >= limit {
+            break;
+        }
+    }
+    cleaned
 }
 
 pub fn validate_query_syntax(query: &str) -> Result<String, String> {
@@ -713,7 +946,8 @@ mod urlencoding {
 mod tests {
     use super::{
         build_author_ai_request, build_author_date_clause, build_author_query,
-        parse_author_ai_response, parse_author_expansion_ai_response, validate_query_syntax,
+        parse_author_ai_response, parse_author_expansion_ai_response, parse_sci_review_strategy,
+        validate_query_syntax,
     };
 
     #[test]
@@ -911,5 +1145,50 @@ mod tests {
                 "accepted {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn parses_and_orders_structured_sci_review_queries() {
+        let raw = r#"{
+          "direction":"ignored",
+          "keywords":"ignored",
+          "target_tier":"ignored",
+          "core_concepts":["心肌缺血","纤维化"],
+          "manual_checks":[],
+          "term_evidence":[{
+            "chinese_concept":"心肌缺血",
+            "concept_breakdown":"疾病状态",
+            "recommended_terms":["myocardial ischemia"],
+            "term_type":"mixed",
+            "variants":["cardiac ischemia"],
+            "mesh_evidence":"AI术语校准，待PubMed预览核查",
+            "pubmed_evidence":"AI术语校准，待PubMed预览核查",
+            "wos_evidence":"需要机构登录后人工核查",
+            "inclusion_decision":"全部版本",
+            "risk":"新文献可能未完成MeSH标引"
+          }],
+          "options":[
+            {"id":"precise","label":"x","pubmed_query":"myocardial ischemia[Title/Abstract] AND fibrosis[Title/Abstract]","wos_query":"TS=(\"myocardial ischemia\" AND fibrosis)","purpose":"降噪","recall":"低","precision":"高","use_case":"小范围","risk":"漏检"},
+            {"id":"broad","label":"x","pubmed_query":"myocardial ischemia[Title/Abstract]","wos_query":"TS=(\"myocardial ischemia\")","purpose":"查全","recall":"高","precision":"低","use_case":"初检","risk":"噪声"},
+            {"id":"moderate","label":"x","pubmed_query":"myocardial ischemia[Title/Abstract] AND (fibrosis[Title/Abstract] OR remodeling[Title/Abstract])","wos_query":"TS=(\"myocardial ischemia\" AND (fibrosis OR remodeling))","purpose":"平衡","recall":"中","precision":"中","use_case":"默认","risk":"需预览"}
+          ],
+          "recommended_option":"moderate",
+          "recommendation_reason":"兼顾查全与筛选工作量"
+        }"#;
+
+        let strategy = parse_sci_review_strategy(raw, "方向", "关键词", "JCR Q1").unwrap();
+        assert_eq!(strategy.direction, "方向");
+        assert_eq!(
+            strategy
+                .options
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["broad", "moderate", "precise"]
+        );
+        assert!(strategy
+            .manual_checks
+            .iter()
+            .any(|item| item.contains("Web of Science")));
     }
 }

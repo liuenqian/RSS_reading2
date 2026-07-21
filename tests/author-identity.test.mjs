@@ -6,6 +6,7 @@ import {
   assessAuthorFingerprintStability,
   buildAuthorFingerprint,
   buildAuthorIdentityClusters,
+  getAuthorNodeCandidates,
   recommendAuthorSeedCandidates,
   scoreAuthorCandidate,
 } from '../src/author_identity.js';
@@ -25,6 +26,7 @@ test('builds an author fingerprint from known seed papers', () => {
   const fingerprint = buildAuthorFingerprint(entries, [1, 2], 'Ji Jiansong');
   assert.deepEqual(fingerprint.anchors, ['ji jiansong']);
   assert.ok(fingerprint.coauthors.includes('zhang wei'));
+  assert.ok(fingerprint.stableCoauthors.includes('zhang wei'));
   assert.ok(fingerprint.coauthors.includes('li ming'));
   assert.ok(fingerprint.affiliations.length === 2);
 });
@@ -93,6 +95,23 @@ test('uses only the target author affiliations from structured PubMed authors', 
   assert.ok(!fingerprint.affiliations.flat().includes('stanford'));
 });
 
+test('requires an explicit target node when one paper has duplicate matching authors', () => {
+  const ambiguous = [{
+    id: 20,
+    title: 'Two matching author nodes',
+    structured_authors: [
+      { author_order: 1, display_name: 'Ji Jiansong', affiliations: ['Hospital A'] },
+      { author_order: 2, display_name: 'Ji Jiansong', affiliations: ['Hospital B'] },
+    ],
+  }];
+
+  assert.equal(getAuthorNodeCandidates(ambiguous[0], 'Ji Jiansong').length, 2);
+  assert.deepEqual(buildAuthorFingerprint(ambiguous, [20], 'Ji Jiansong').affiliations, []);
+  const selected = buildAuthorFingerprint(ambiguous, [20], 'Ji Jiansong', '', [], { 20: 2 });
+  assert.ok(selected.affiliationLabels.includes('Hospital B'));
+  assert.ok(!selected.affiliationLabels.includes('Hospital A'));
+});
+
 test('uses coauthors and topics to retain papers after an affiliation change', () => {
   const fingerprint = buildAuthorFingerprint(entries, [1, 2], 'Ji Jiansong');
   const changedInstitution = scoreAuthorCandidate(entries[2], fingerprint);
@@ -134,6 +153,12 @@ test('wires seed selection and cluster review into PubMed author searches', () =
   assert.match(source, /研究方向/);
   assert.match(source, /function authorIdentityGroupLabel\(index\)/);
   assert.match(source, /authorIdentityStatusMap\(allEntries\)/);
+  assert.match(source, /build_pubmed_author_expansion_queries/);
+  assert.match(source, /pendingExpansionCandidates/);
+  assert.match(source, /activeExpansionQuery/);
+  assert.match(source, /data-activate-expansion/);
+  assert.match(source, /data-seed-author/);
+  assert.match(source, /seedAuthorSelections/);
   assert.match(styles, /\.author-identity-panel/);
   assert.match(styles, /\.author-identity-grid/);
   assert.match(styles, /\.author-seed-candidate/);

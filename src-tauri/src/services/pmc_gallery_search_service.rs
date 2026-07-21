@@ -240,14 +240,36 @@ pub fn cache_result(
     for (position, figure) in result.figures.iter().enumerate() {
         tx.execute(
             "INSERT INTO pmc_gallery_figures
-             (search_id, pmcid, article_title, article_url, label, caption, image_url, license, figure_kind, position)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             (search_id, pmcid, article_title, article_url, label, caption, image_url, license,
+              figure_kind, journal, publication_year, impact_factor, jcr_quartile, cas_partition,
+              is_top, position)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(search_id, image_url) DO UPDATE SET
              pmcid = excluded.pmcid, article_title = excluded.article_title,
              article_url = excluded.article_url, label = excluded.label,
              caption = excluded.caption, license = excluded.license,
-             figure_kind = excluded.figure_kind, position = excluded.position",
-            params![id, figure.pmcid, figure.article_title, figure.article_url, figure.label, figure.caption, figure.image_url, figure.license, figure.figure_kind, position_base + position as i64],
+             figure_kind = excluded.figure_kind, journal = excluded.journal,
+             publication_year = excluded.publication_year, impact_factor = excluded.impact_factor,
+             jcr_quartile = excluded.jcr_quartile, cas_partition = excluded.cas_partition,
+             is_top = excluded.is_top, position = excluded.position",
+            params![
+                id,
+                figure.pmcid,
+                figure.article_title,
+                figure.article_url,
+                figure.label,
+                figure.caption,
+                figure.image_url,
+                figure.license,
+                figure.figure_kind,
+                figure.journal,
+                figure.publication_year,
+                figure.impact_factor,
+                figure.jcr_quartile,
+                figure.cas_partition,
+                figure.is_top,
+                position_base + position as i64
+            ],
         )
         .map_err(|error| format!("保存 PMC 图库图片链接失败: {}", error))?;
     }
@@ -289,7 +311,12 @@ pub fn cache_result(
 pub fn load_cached_result(conn: &Connection, id: i64) -> Result<PmcGallerySearchResult, String> {
     let search = get_search(conn, id)?;
     let mut statement = conn
-        .prepare("SELECT pmcid, article_title, article_url, label, caption, image_url, license, figure_kind FROM pmc_gallery_figures WHERE search_id = ?1 ORDER BY position, id")
+        .prepare(
+            "SELECT pmcid, article_title, article_url, label, caption, image_url, license,
+                         figure_kind, journal, publication_year, impact_factor, jcr_quartile,
+                         cas_partition, is_top
+                  FROM pmc_gallery_figures WHERE search_id = ?1 ORDER BY position, id",
+        )
         .map_err(|error| format!("查询 PMC 图库缓存失败: {}", error))?;
     let figures = statement
         .query_map([id], |row| {
@@ -302,6 +329,12 @@ pub fn load_cached_result(conn: &Connection, id: i64) -> Result<PmcGallerySearch
                 image_url: row.get(5)?,
                 license: row.get(6)?,
                 figure_kind: row.get(7)?,
+                journal: row.get(8)?,
+                publication_year: row.get(9)?,
+                impact_factor: row.get(10)?,
+                jcr_quartile: row.get(11)?,
+                cas_partition: row.get(12)?,
+                is_top: row.get(13)?,
             })
         })
         .map_err(|error| format!("查询 PMC 图库缓存失败: {}", error))?

@@ -35,11 +35,25 @@ const PREVIEW_SAMPLE_POPULATION_LIMIT: usize = 10_000;
 const ASSESSMENT_BATCH_SIZE: usize = 20;
 const ASSESSMENT_MAX_CONCURRENT: usize = 3;
 const FETCH_BATCH_SIZE: usize = 100;
+const FETCH_ISOLATION_REQUEST_LIMIT: usize = 24;
 const SEARCH_PAGE_SIZE: usize = 1_000;
 const PUBMED_MAX_RESULT_WINDOW: usize = 10_000;
 const PROGRESS_EVENT: &str = "pubmed-search-progress";
+const RUN_CANCELLED_MESSAGE: &str = "用户取消";
 
 static LAST_REQUEST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+#[derive(Debug)]
+enum PubmedFetchBatch {
+    Records {
+        pmids: Vec<String>,
+        records: Vec<PubmedArticleRecord>,
+    },
+    Failed {
+        pmids: Vec<String>,
+        error: String,
+    },
+}
 
 pub async fn preview_query(
     query: &str,
@@ -854,6 +868,108 @@ pub async fn fetch_records(
     parse_pubmed_records(&xml)
 }
 
+async fn fetch_records_with_isolated_skips(
+    client: &reqwest::Client,
+    pmids: &[String],
+    cancel_flag: &AtomicBool,
+) -> Result<Vec<PubmedFetchBatch>, String> {
+    match fetch_records(client, pmids).await {
+        Ok(records) => Ok(vec![PubmedFetchBatch::Records {
+            pmids: pmids.to_vec(),
+            records,
+        }]),
+        Err(error) => isolate_failed_fetch_batch(client, pmids.to_vec(), error, cancel_flag).await,
+    }
+}
+
+async fn isolate_failed_fetch_batch(
+    client: &reqwest::Client,
+    pmids: Vec<String>,
+    first_error: String,
+    cancel_flag: &AtomicBool,
+) -> Result<Vec<PubmedFetchBatch>, String> {
+    if pmids.len() <= 1 || is_batch_wide_fetch_error(&first_error) {
+        return Ok(vec![PubmedFetchBatch::Failed {
+            pmids,
+            error: first_error,
+        }]);
+    }
+
+    warn!(
+        pmids = pmids.len(),
+        error = %first_error,
+        "PubMed 批量获取失败，尝试二分隔离坏 PMID"
+    );
+
+    let mut fetched_batches = Vec::new();
+    let mut pending = VecDeque::from([(pmids, first_error)]);
+    let mut requests_used = 0usize;
+    while let Some((batch, batch_error)) = pending.pop_front() {
+        if cancel_flag.load(Ordering::SeqCst) {
+            return Err(RUN_CANCELLED_MESSAGE.to_string());
+        }
+        if batch.len() <= 1 || is_batch_wide_fetch_error(&batch_error) {
+            fetched_batches.push(PubmedFetchBatch::Failed {
+                pmids: batch,
+                error: batch_error,
+            });
+            continue;
+        }
+        if requests_used >= FETCH_ISOLATION_REQUEST_LIMIT {
+            fetched_batches.push(PubmedFetchBatch::Failed {
+                pmids: batch,
+                error: format!("隔离坏 PMID 的请求预算已用尽: {batch_error}"),
+            });
+            continue;
+        }
+
+        let mid = batch.len() / 2;
+        let halves = [batch[..mid].to_vec(), batch[mid..].to_vec()];
+        for half in halves {
+            if half.is_empty() {
+                continue;
+            }
+            if cancel_flag.load(Ordering::SeqCst) {
+                return Err(RUN_CANCELLED_MESSAGE.to_string());
+            }
+            if requests_used >= FETCH_ISOLATION_REQUEST_LIMIT {
+                fetched_batches.push(PubmedFetchBatch::Failed {
+                    pmids: half,
+                    error: format!("隔离坏 PMID 的请求预算已用尽: {batch_error}"),
+                });
+                continue;
+            }
+            requests_used += 1;
+            match fetch_records(client, &half).await {
+                Ok(records) => fetched_batches.push(PubmedFetchBatch::Records {
+                    pmids: half,
+                    records,
+                }),
+                Err(error) if half.len() <= 1 || is_batch_wide_fetch_error(&error) => {
+                    fetched_batches.push(PubmedFetchBatch::Failed { pmids: half, error });
+                }
+                Err(error) => {
+                    warn!(
+                        pmids = half.len(),
+                        error = %error,
+                        "PubMed 小批获取失败，继续二分隔离"
+                    );
+                    pending.push_back((half, error));
+                }
+            }
+        }
+    }
+    Ok(fetched_batches)
+}
+
+fn is_batch_wide_fetch_error(error: &str) -> bool {
+    error.contains("请求 PubMed EFetch 失败")
+        || error.contains("读取 PubMed EFetch 响应失败")
+        || error.contains("PubMed EFetch 返回 HTTP 408")
+        || error.contains("PubMed EFetch 返回 HTTP 429")
+        || error.contains("PubMed EFetch 返回 HTTP 5")
+}
+
 pub fn create_search(
     conn: &Connection,
     name: &str,
@@ -1044,15 +1160,34 @@ pub async fn run_search(
     search_id: i64,
     resume_run_id: Option<i64>,
 ) -> Result<PubmedSearchRunResult, String> {
-    let (run_id, search, resume_pmids) = {
+    let (run_id, search, resume_pmids, expansion) = {
         let conn = state.conn.lock().map_err(|e| e.to_string())?;
         if let Some(run_id) = resume_run_id {
             let (run_id, pmids) = prepare_resume(&conn, search_id, run_id)?;
-            (run_id, get_search(&conn, search_id)?, Some(pmids))
+            let search = get_search(&conn, search_id)?;
+            let expansion = active_author_expansion(&conn, search_id)?;
+            let query_count = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pubmed_search_run_queries WHERE run_id = ?1",
+                    [run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| format!("读取 PubMed 查询分支失败: {}", e))?;
+            if query_count == 0 {
+                initialize_run_queries(&conn, run_id, &search.query, expansion.as_ref())?;
+            }
+            (
+                run_id,
+                search,
+                (!pmids.is_empty()).then_some(pmids),
+                expansion,
+            )
         } else {
             let search = get_search(&conn, search_id)?;
             let run_id = begin_run(&conn, search_id)?;
-            (run_id, search, None)
+            let expansion = active_author_expansion(&conn, search_id)?;
+            initialize_run_queries(&conn, run_id, &search.query, expansion.as_ref())?;
+            (run_id, search, None, expansion)
         }
     };
 
@@ -1065,6 +1200,7 @@ pub async fn run_search(
         search_id,
         run_id,
         &search,
+        expansion.as_ref(),
         resume_pmids,
         &cancel_flag,
     )
@@ -1082,6 +1218,7 @@ async fn run_search_inner(
     search_id: i64,
     run_id: i64,
     search: &PubmedSearch,
+    expansion: Option<&ActiveAuthorExpansion>,
     resume_pmids: Option<Vec<String>>,
     cancel_flag: &AtomicBool,
 ) -> Result<PubmedSearchRunResult, String> {
@@ -1089,14 +1226,17 @@ async fn run_search_inner(
     let pmids = if let Some(pmids) = resume_pmids {
         pmids
     } else {
-        match collect_search_pmids(&client, search, cancel_flag).await {
-            Ok(pmids) => {
+        match collect_run_query_pmids(&client, search, expansion, cancel_flag).await {
+            Ok(branches) => {
+                let pmids = merge_query_pmids(&branches);
                 let conn = state.conn.lock().map_err(|e| e.to_string())?;
-                snapshot_run_items(&conn, run_id, &pmids)?;
+                complete_run_queries(&conn, run_id, &branches)?;
+                snapshot_multi_query_run_items(&conn, run_id, &branches, &pmids)?;
                 reuse_local_run_items(&conn, search_id, run_id, &pmids)?
             }
             Err(error) => {
                 let conn = state.conn.lock().map_err(|e| e.to_string())?;
+                mark_failed_run_query(&conn, run_id, &error)?;
                 finalize_run_error(&conn, run_id, "failed", &error)?;
                 return Ok(run_result(&conn, run_id, Some(error))?);
             }
@@ -1129,47 +1269,29 @@ async fn run_search_inner(
             return Ok(result);
         }
 
-        match fetch_records(&client, chunk).await {
-            Ok(records) => {
+        let fetched_batches = match fetch_records_with_isolated_skips(&client, chunk, cancel_flag)
+            .await
+        {
+            Ok(batches) => batches,
+            Err(error) if error == RUN_CANCELLED_MESSAGE => {
                 let conn = state.conn.lock().map_err(|e| e.to_string())?;
-                persist_pubmed_records(&conn, search_id, run_id, chunk, records)?;
+                finalize_run_error(&conn, run_id, "cancelled", RUN_CANCELLED_MESSAGE)?;
+                let result = run_result(&conn, run_id, Some(RUN_CANCELLED_MESSAGE.to_string()))?;
+                emit_result_progress(app, &result);
+                return Ok(result);
             }
-            Err(batch_error) => {
-                warn!(
-                    search_id,
-                    run_id,
-                    pmids = chunk.len(),
-                    error = %batch_error,
-                    "PubMed 批量获取失败，降级为逐篇获取"
-                );
-                for pmid in chunk {
-                    if cancel_flag.load(Ordering::SeqCst) {
-                        let conn = state.conn.lock().map_err(|e| e.to_string())?;
-                        finalize_run_error(&conn, run_id, "cancelled", "用户取消")?;
-                        let result = run_result(&conn, run_id, Some("用户取消".to_string()))?;
-                        emit_result_progress(app, &result);
-                        return Ok(result);
+            Err(error) => return Err(error),
+        };
+
+        {
+            let conn = state.conn.lock().map_err(|e| e.to_string())?;
+            for fetched_batch in fetched_batches {
+                match fetched_batch {
+                    PubmedFetchBatch::Records { pmids, records } => {
+                        persist_pubmed_records(&conn, search_id, run_id, &pmids, records)?;
                     }
-                    match fetch_records(&client, std::slice::from_ref(pmid)).await {
-                        Ok(records) => {
-                            let conn = state.conn.lock().map_err(|e| e.to_string())?;
-                            persist_pubmed_records(
-                                &conn,
-                                search_id,
-                                run_id,
-                                std::slice::from_ref(pmid),
-                                records,
-                            )?;
-                        }
-                        Err(error) => {
-                            let conn = state.conn.lock().map_err(|e| e.to_string())?;
-                            mark_run_item_failed(
-                                &conn,
-                                run_id,
-                                pmid,
-                                &format!("批量获取失败: {batch_error}; 单篇重试失败: {error}"),
-                            )?;
-                        }
+                    PubmedFetchBatch::Failed { pmids, error } => {
+                        mark_fetch_batch_failed(&conn, run_id, &pmids, &error)?;
                     }
                 }
             }
@@ -1201,6 +1323,178 @@ async fn run_search_inner(
     let result = run_result(&conn, run_id, None)?;
     emit_result_progress(app, &result);
     Ok(result)
+}
+
+fn mark_failed_run_query(conn: &Connection, run_id: i64, error: &str) -> Result<(), String> {
+    let kind = if error.starts_with("expansion ") {
+        "expansion"
+    } else {
+        "base"
+    };
+    conn.execute(
+        "UPDATE pubmed_search_run_queries
+         SET status = 'failed', error_message = ?1 WHERE run_id = ?2 AND query_kind = ?3",
+        params![error, run_id, kind],
+    )
+    .map_err(|e| format!("记录 PubMed {} 查询分支失败: {}", kind, e))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ActiveAuthorExpansion {
+    query: String,
+    profile_version: Option<i64>,
+}
+
+#[derive(Debug)]
+struct CollectedRunQuery {
+    kind: &'static str,
+    pmids: Vec<String>,
+}
+
+fn active_author_expansion(
+    conn: &Connection,
+    search_id: i64,
+) -> Result<Option<ActiveAuthorExpansion>, String> {
+    let state_json = get_author_identity_state(conn, search_id)?;
+    let Some(state_json) = state_json else {
+        return Ok(None);
+    };
+    let state: Value = serde_json::from_str(&state_json)
+        .map_err(|e| format!("作者身份状态不是有效 JSON: {}", e))?;
+    let query = state
+        .get("activeExpansionQuery")
+        .or_else(|| state.get("active_expansion_query"))
+        .and_then(|value| value.get("query"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    let query = normalize_query(query)?;
+    let profile_version = state
+        .get("profileVersion")
+        .or_else(|| state.get("profile_version"))
+        .and_then(Value::as_i64);
+    Ok(Some(ActiveAuthorExpansion {
+        query,
+        profile_version,
+    }))
+}
+
+fn initialize_run_queries(
+    conn: &Connection,
+    run_id: i64,
+    base_query: &str,
+    expansion: Option<&ActiveAuthorExpansion>,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO pubmed_search_run_queries (run_id, query_kind, query, status)
+         VALUES (?1, 'base', ?2, 'pending')",
+        params![run_id, base_query],
+    )
+    .map_err(|e| format!("创建 PubMed base 查询分支失败: {}", e))?;
+    if let Some(expansion) = expansion {
+        conn.execute(
+            "INSERT INTO pubmed_search_run_queries
+                (run_id, query_kind, query, profile_version, status)
+             VALUES (?1, 'expansion', ?2, ?3, 'pending')",
+            params![run_id, expansion.query, expansion.profile_version],
+        )
+        .map_err(|e| format!("创建 PubMed expansion 查询分支失败: {}", e))?;
+        conn.execute(
+            "UPDATE pubmed_search_runs SET run_type = 'refresh', profile_version = ?1 WHERE id = ?2",
+            params![expansion.profile_version, run_id],
+        )
+        .map_err(|e| format!("更新 PubMed 多查询运行类型失败: {}", e))?;
+    }
+    Ok(())
+}
+
+async fn collect_run_query_pmids(
+    client: &reqwest::Client,
+    search: &PubmedSearch,
+    expansion: Option<&ActiveAuthorExpansion>,
+    cancel_flag: &AtomicBool,
+) -> Result<Vec<CollectedRunQuery>, String> {
+    let base_pmids = collect_search_pmids(client, search, cancel_flag)
+        .await
+        .map_err(|error| format!("base 检索失败: {}", error))?;
+    let mut branches = vec![CollectedRunQuery {
+        kind: "base",
+        pmids: base_pmids,
+    }];
+    if let Some(expansion) = expansion {
+        let mut expansion_search = search.clone();
+        expansion_search.query = expansion.query.clone();
+        let expansion_pmids = collect_search_pmids(client, &expansion_search, cancel_flag)
+            .await
+            .map_err(|error| format!("expansion 检索失败: {}", error))?;
+        branches.push(CollectedRunQuery {
+            kind: "expansion",
+            pmids: expansion_pmids,
+        });
+    }
+    Ok(branches)
+}
+
+fn merge_query_pmids(branches: &[CollectedRunQuery]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    branches
+        .iter()
+        .flat_map(|branch| branch.pmids.iter())
+        .filter(|pmid| seen.insert((*pmid).clone()))
+        .cloned()
+        .collect()
+}
+
+fn complete_run_queries(
+    conn: &Connection,
+    run_id: i64,
+    branches: &[CollectedRunQuery],
+) -> Result<(), String> {
+    for branch in branches {
+        conn.execute(
+            "UPDATE pubmed_search_run_queries
+             SET status = 'completed', result_count = ?1, error_message = NULL
+             WHERE run_id = ?2 AND query_kind = ?3",
+            params![branch.pmids.len() as i64, run_id, branch.kind],
+        )
+        .map_err(|e| format!("完成 PubMed {} 查询分支失败: {}", branch.kind, e))?;
+    }
+    Ok(())
+}
+
+fn snapshot_multi_query_run_items(
+    conn: &Connection,
+    run_id: i64,
+    branches: &[CollectedRunQuery],
+    pmids: &[String],
+) -> Result<(), String> {
+    snapshot_run_items(conn, run_id, pmids)?;
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("开始保存 PubMed 查询来源失败: {}", e))?;
+    for branch in branches {
+        let run_query_id = tx
+            .query_row(
+                "SELECT id FROM pubmed_search_run_queries WHERE run_id = ?1 AND query_kind = ?2",
+                params![run_id, branch.kind],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| format!("读取 PubMed {} 查询分支失败: {}", branch.kind, e))?;
+        for (rank, pmid) in branch.pmids.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO pubmed_search_run_item_sources (run_id, pmid, run_query_id, rank)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![run_id, pmid, run_query_id, rank as i64 + 1],
+            )
+            .map_err(|e| format!("保存 PubMed {} 命中来源失败: {}", branch.kind, e))?;
+        }
+    }
+    tx.commit()
+        .map_err(|e| format!("提交 PubMed 查询来源失败: {}", e))
 }
 
 async fn collect_search_pmids(
@@ -1616,6 +1910,23 @@ fn persist_pubmed_records(
     }
     tx.commit()
         .map_err(|e| format!("提交 PubMed 批次失败: {}", e))
+}
+
+fn mark_fetch_batch_failed(
+    conn: &Connection,
+    run_id: i64,
+    pmids: &[String],
+    error: &str,
+) -> Result<(), String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("开始 PubMed 跳过批次事务失败: {}", e))?;
+    let message = format!("批量获取失败，已跳过: {error}");
+    for pmid in pmids {
+        mark_run_item_failed(&tx, run_id, pmid, &message)?;
+    }
+    tx.commit()
+        .map_err(|e| format!("提交 PubMed 跳过批次失败: {}", e))
 }
 
 fn upsert_search_record(
@@ -2160,10 +2471,22 @@ fn load_search_entry_structured_authors(
         .map_err(|e| format!("读取结构化作者失败: {}", e))?;
     let mut by_entry: HashMap<i64, Vec<PubmedAuthorRecord>> = HashMap::new();
     for row in rows {
-        let (entry_id, author_order, last_name, fore_name, initials, collective_name, display_name, orcid, affiliation) =
-            row.map_err(|e| format!("解析结构化作者失败: {}", e))?;
+        let (
+            entry_id,
+            author_order,
+            last_name,
+            fore_name,
+            initials,
+            collective_name,
+            display_name,
+            orcid,
+            affiliation,
+        ) = row.map_err(|e| format!("解析结构化作者失败: {}", e))?;
         let authors = by_entry.entry(entry_id).or_default();
-        if authors.last().is_none_or(|author| author.author_order != author_order) {
+        if authors
+            .last()
+            .is_none_or(|author| author.author_order != author_order)
+        {
             authors.push(PubmedAuthorRecord {
                 author_order,
                 last_name,
@@ -3012,11 +3335,17 @@ pub fn parse_pubmed_records(xml: &str) -> Result<Vec<PubmedArticleRecord>, Strin
     };
     let document = Document::parse_with_options(xml, options)
         .map_err(|e| format!("解析 PubMed XML 失败: {}", e))?;
-    document
+    let mut records = Vec::new();
+    for article in document
         .descendants()
         .filter(|node| node.has_tag_name("PubmedArticle"))
-        .map(parse_article)
-        .collect()
+    {
+        match parse_article(article) {
+            Ok(record) => records.push(record),
+            Err(error) => warn!(error = %error, "跳过无法解析的 PubMed 记录"),
+        }
+    }
+    Ok(records)
 }
 
 fn parse_article(article: Node<'_, '_>) -> Result<PubmedArticleRecord, String> {
@@ -3528,7 +3857,8 @@ mod tests {
                 started_at TEXT NOT NULL DEFAULT (datetime('now')), completed_at TEXT,
                 status TEXT NOT NULL, matched_count INTEGER NOT NULL DEFAULT 0,
                 added_count INTEGER NOT NULL DEFAULT 0, reused_count INTEGER NOT NULL DEFAULT 0,
-                failed_count INTEGER NOT NULL DEFAULT 0, error_message TEXT
+                failed_count INTEGER NOT NULL DEFAULT 0, error_message TEXT,
+                run_type TEXT NOT NULL DEFAULT 'standard', profile_version INTEGER
             );
             CREATE TABLE pubmed_search_entries (
                 search_id INTEGER NOT NULL REFERENCES pubmed_searches(id) ON DELETE CASCADE,
@@ -3544,6 +3874,22 @@ mod tests {
                 run_id INTEGER NOT NULL REFERENCES pubmed_search_runs(id) ON DELETE CASCADE,
                 pmid TEXT NOT NULL, rank INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
                 entry_id INTEGER, error_message TEXT, PRIMARY KEY(run_id, pmid)
+            );
+            CREATE TABLE pubmed_search_run_queries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES pubmed_search_runs(id) ON DELETE CASCADE,
+                query_kind TEXT NOT NULL, query TEXT NOT NULL, profile_version INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending', result_count INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT, UNIQUE(run_id, query_kind)
+            );
+            CREATE TABLE pubmed_search_run_item_sources (
+                run_id INTEGER NOT NULL,
+                pmid TEXT NOT NULL,
+                run_query_id INTEGER NOT NULL REFERENCES pubmed_search_run_queries(id) ON DELETE CASCADE,
+                rank INTEGER NOT NULL,
+                PRIMARY KEY(run_query_id, pmid),
+                FOREIGN KEY(run_id, pmid)
+                    REFERENCES pubmed_search_run_items(run_id, pmid) ON DELETE CASCADE
             );
             CREATE TABLE pubmed_author_identity_states (
                 search_id INTEGER PRIMARY KEY REFERENCES pubmed_searches(id) ON DELETE CASCADE,
@@ -3593,6 +3939,71 @@ mod tests {
     }
 
     #[test]
+    fn failed_fetch_batch_is_marked_failed_and_skipped() {
+        let conn = search_db();
+        let search = create_search(&conn, "Sepsis", None, "sepsis").unwrap();
+        let run = begin_run(&conn, search.id).unwrap();
+        let pmids = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+        snapshot_run_items(&conn, run, &pmids).unwrap();
+
+        mark_fetch_batch_failed(&conn, run, &pmids, "PubMed EFetch 返回 HTTP 400").unwrap();
+
+        let failed = count_run_status(&conn, run, "failed").unwrap();
+        assert_eq!(failed, 3);
+        let message: String = conn
+            .query_row(
+                "SELECT error_message FROM pubmed_search_run_items
+                 WHERE run_id = ?1 AND pmid = '2'",
+                [run],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(message.contains("已跳过"));
+    }
+
+    #[test]
+    fn batch_wide_fetch_errors_are_not_isolated() {
+        assert!(is_batch_wide_fetch_error(
+            "请求 PubMed EFetch 失败: operation timed out"
+        ));
+        assert!(is_batch_wide_fetch_error(
+            "PubMed EFetch 返回 HTTP 429 Too Many Requests"
+        ));
+        assert!(is_batch_wide_fetch_error(
+            "PubMed EFetch 返回 HTTP 500 Internal Server Error"
+        ));
+
+        assert!(!is_batch_wide_fetch_error(
+            "PubMed EFetch 返回 HTTP 400 Bad Request"
+        ));
+        assert!(!is_batch_wide_fetch_error("解析 PubMed XML 失败"));
+    }
+
+    #[test]
+    fn pubmed_xml_parser_skips_bad_article_and_keeps_rest() {
+        let xml = r#"<?xml version="1.0"?>
+        <PubmedArticleSet>
+          <PubmedArticle>
+            <MedlineCitation>
+              <PMID>1</PMID>
+              <Article><ArticleTitle>Good article</ArticleTitle></Article>
+            </MedlineCitation>
+          </PubmedArticle>
+          <PubmedArticle>
+            <MedlineCitation>
+              <Article><ArticleTitle>Missing PMID</ArticleTitle></Article>
+            </MedlineCitation>
+          </PubmedArticle>
+        </PubmedArticleSet>"#;
+
+        let records = parse_pubmed_records(xml).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].pmid, "1");
+        assert_eq!(records[0].title, "Good article");
+    }
+
+    #[test]
     fn author_assessment_uses_identity_clustering_evidence() {
         let mut candidate = record("123", "Cardiac imaging after infarction");
         candidate.authors = Some("Ji-Song Ji; Wei Zhang".to_string());
@@ -3618,6 +4029,53 @@ mod tests {
         assert!(context.contains("同名作者"));
         assert!(context.contains("Cardiac imaging research"));
         assert!(!context.contains("不得作为作者归属依据"));
+    }
+
+    #[test]
+    fn pubmed_multi_query_run_merges_pmids_and_preserves_sources() {
+        let conn = search_db();
+        let search = create_search(&conn, "Author", None, "Base[Title]").unwrap();
+        let run_id = begin_run(&conn, search.id).unwrap();
+        let expansion = ActiveAuthorExpansion {
+            query: "Expansion[Title]".to_string(),
+            profile_version: Some(2),
+        };
+        initialize_run_queries(&conn, run_id, &search.query, Some(&expansion)).unwrap();
+        let branches = vec![
+            CollectedRunQuery {
+                kind: "base",
+                pmids: vec!["1".to_string(), "2".to_string()],
+            },
+            CollectedRunQuery {
+                kind: "expansion",
+                pmids: vec!["2".to_string(), "3".to_string()],
+            },
+        ];
+
+        let merged = merge_query_pmids(&branches);
+        assert_eq!(merged, vec!["1", "2", "3"]);
+        complete_run_queries(&conn, run_id, &branches).unwrap();
+        snapshot_multi_query_run_items(&conn, run_id, &branches, &merged).unwrap();
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM pubmed_search_run_items WHERE run_id = ?1",
+                [run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM pubmed_search_run_item_sources
+                 WHERE run_id = ?1 AND pmid = '2'",
+                [run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
     }
 
     #[test]

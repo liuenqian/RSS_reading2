@@ -3,6 +3,7 @@ use reqwest::{Client, Url};
 use roxmltree::Node;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -22,6 +23,12 @@ pub struct PmcGalleryFigure {
     pub image_url: String,
     pub license: String,
     pub figure_kind: String,
+    pub journal: String,
+    pub publication_year: Option<i32>,
+    pub impact_factor: Option<String>,
+    pub jcr_quartile: Option<String>,
+    pub cas_partition: Option<String>,
+    pub is_top: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -86,6 +93,17 @@ struct ArticleMetadata {
     media_urls: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArticleQuality {
+    id: String,
+    journal: String,
+    publication_year: Option<i32>,
+    impact_factor: Option<String>,
+    jcr_quartile: Option<String>,
+    cas_partition: Option<String>,
+    is_top: Option<bool>,
+}
+
 pub async fn search_gallery(
     query: &str,
     article_limit: usize,
@@ -136,14 +154,16 @@ pub async fn search_gallery(
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     let returned_articles = ids.len();
-    let (ids, filtered_articles) = filter_ids_by_metrics(&client, ids, metric_filters).await?;
+    let (mut articles, filtered_articles) =
+        filter_ids_by_metrics(&client, ids, metric_filters).await?;
+    articles.sort_by(compare_article_quality);
 
     let mut figures = Vec::new();
     let mut scanned_articles = 0;
     let mut skipped_articles = 0;
     let mut first_error = None;
-    for id in ids {
-        match fetch_article_figures(&client, &id).await {
+    for article in articles {
+        match fetch_article_figures(&client, &article).await {
             Ok(mut article_figures) => {
                 scanned_articles += 1;
                 figures.append(&mut article_figures);
@@ -441,9 +461,9 @@ async fn filter_ids_by_metrics(
     client: &Client,
     ids: Vec<String>,
     filters: &PmcGalleryMetricFilters,
-) -> Result<(Vec<String>, usize), String> {
-    if ids.is_empty() || !has_active_metric_filters(filters) {
-        return Ok((ids, 0));
+) -> Result<(Vec<ArticleQuality>, usize), String> {
+    if ids.is_empty() {
+        return Ok((Vec::new(), 0));
     }
     let id_list = ids.join(",");
     let response = client
@@ -481,7 +501,7 @@ async fn filter_ids_by_metrics(
         if matches_journal_filter(summary, filters)
             && matches_metric_filters(metric.as_ref(), filters)
         {
-            kept.push(id);
+            kept.push(article_quality(id, summary, metric.as_ref()));
         } else {
             filtered += 1;
         }
@@ -489,17 +509,79 @@ async fn filter_ids_by_metrics(
     Ok((kept, filtered))
 }
 
-fn has_active_metric_filters(filters: &PmcGalleryMetricFilters) -> bool {
-    [
-        filters.journal.as_deref(),
-        filters.impact_factor.as_deref(),
-        filters.jcr_quartile.as_deref(),
-        filters.cas_partition.as_deref(),
-        filters.top.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|value| !value.is_empty() && value != "all")
+fn article_quality(
+    id: String,
+    summary: Option<&Value>,
+    metric: Option<&journal_metrics_service::JournalMetric>,
+) -> ArticleQuality {
+    let journal = summary
+        .and_then(|item| item.get("fulljournalname").and_then(Value::as_str))
+        .or_else(|| summary.and_then(|item| item.get("source").and_then(Value::as_str)))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let publication_year = summary
+        .and_then(|item| item.get("pubdate").and_then(Value::as_str))
+        .and_then(parse_publication_year);
+    ArticleQuality {
+        id,
+        journal,
+        publication_year,
+        impact_factor: visible_metric(metric.and_then(|item| item.impact_factor.as_deref()))
+            .map(ToOwned::to_owned),
+        jcr_quartile: visible_metric(metric.and_then(|item| item.q.as_deref()))
+            .map(ToOwned::to_owned),
+        cas_partition: visible_metric(metric.and_then(|item| item.b.as_deref()))
+            .map(ToOwned::to_owned),
+        is_top: metric
+            .and_then(|item| item.top.as_deref())
+            .and_then(|value| match value {
+                "1" => Some(true),
+                "0" => Some(false),
+                _ => None,
+            }),
+    }
+}
+
+fn compare_article_quality(left: &ArticleQuality, right: &ArticleQuality) -> Ordering {
+    right
+        .is_top
+        .unwrap_or(false)
+        .cmp(&left.is_top.unwrap_or(false))
+        .then_with(|| {
+            partition_rank(right.cas_partition.as_deref(), 'B')
+                .cmp(&partition_rank(left.cas_partition.as_deref(), 'B'))
+        })
+        .then_with(|| {
+            partition_rank(right.jcr_quartile.as_deref(), 'Q')
+                .cmp(&partition_rank(left.jcr_quartile.as_deref(), 'Q'))
+        })
+        .then_with(|| {
+            metric_sort_value(right.impact_factor.as_deref())
+                .total_cmp(&metric_sort_value(left.impact_factor.as_deref()))
+        })
+        .then_with(|| right.publication_year.cmp(&left.publication_year))
+}
+
+fn partition_rank(value: Option<&str>, prefix: char) -> u8 {
+    value
+        .and_then(|value| value.strip_prefix(prefix))
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|value| (1..=4).contains(value))
+        .map(|value| 5 - value)
+        .unwrap_or(0)
+}
+
+fn metric_sort_value(value: Option<&str>) -> f64 {
+    value.and_then(parse_metric_number).unwrap_or(-1.0)
+}
+
+fn parse_publication_year(value: &str) -> Option<i32> {
+    value
+        .split(|character: char| !character.is_ascii_digit())
+        .find(|part| part.len() == 4)
+        .and_then(|part| part.parse::<i32>().ok())
+        .filter(|year| (1800..=2200).contains(year))
 }
 
 fn matches_journal_filter(summary: Option<&Value>, filters: &PmcGalleryMetricFilters) -> bool {
@@ -589,9 +671,9 @@ fn normalize_query(query: &str) -> Result<String, String> {
 
 async fn fetch_article_figures(
     client: &Client,
-    numeric_pmc_id: &str,
+    article: &ArticleQuality,
 ) -> Result<Vec<PmcGalleryFigure>, String> {
-    let pmcid = format!("PMC{}", numeric_pmc_id.trim_start_matches("PMC"));
+    let pmcid = format!("PMC{}", article.id.trim_start_matches("PMC"));
     let prefix = resolve_latest_version_prefix(client, &pmcid).await?;
     let version_name = prefix.trim_end_matches('/');
     let metadata_url = s3_object_url(&format!("{prefix}{version_name}.json"))?;
@@ -611,7 +693,16 @@ async fn fetch_article_figures(
         .await
         .map_err(|error| format!("读取 {} JATS XML 失败: {}", pmcid, error))?;
     let metadata = parse_article_metadata(&metadata_payload)?;
-    parse_article_figures(&xml, &metadata)
+    let mut figures = parse_article_figures(&xml, &metadata)?;
+    for figure in &mut figures {
+        figure.journal.clone_from(&article.journal);
+        figure.publication_year = article.publication_year;
+        figure.impact_factor.clone_from(&article.impact_factor);
+        figure.jcr_quartile.clone_from(&article.jcr_quartile);
+        figure.cas_partition.clone_from(&article.cas_partition);
+        figure.is_top = article.is_top;
+    }
+    Ok(figures)
 }
 
 async fn resolve_latest_version_prefix(client: &Client, pmcid: &str) -> Result<String, String> {
@@ -777,6 +868,12 @@ fn parse_article_figures(
                 image_url: image_url.clone(),
                 license: metadata.license.clone(),
                 figure_kind: figure_kind.to_string(),
+                journal: String::new(),
+                publication_year: None,
+                impact_factor: None,
+                jcr_quartile: None,
+                cas_partition: None,
+                is_top: None,
             });
         }
     }
@@ -888,6 +985,47 @@ mod tests {
     }
 
     #[test]
+    fn sorts_top_partition_if_and_year_before_fetching_figures() {
+        let mut articles = vec![
+            ArticleQuality {
+                id: "low".to_string(),
+                journal: "Low".to_string(),
+                publication_year: Some(2026),
+                impact_factor: Some("18.0".to_string()),
+                jcr_quartile: Some("Q1".to_string()),
+                cas_partition: Some("B1".to_string()),
+                is_top: Some(false),
+            },
+            ArticleQuality {
+                id: "top".to_string(),
+                journal: "Top".to_string(),
+                publication_year: Some(2024),
+                impact_factor: Some("8.0".to_string()),
+                jcr_quartile: Some("Q1".to_string()),
+                cas_partition: Some("B1".to_string()),
+                is_top: Some(true),
+            },
+            ArticleQuality {
+                id: "q2".to_string(),
+                journal: "Q2".to_string(),
+                publication_year: Some(2026),
+                impact_factor: Some("30.0".to_string()),
+                jcr_quartile: Some("Q2".to_string()),
+                cas_partition: Some("B2".to_string()),
+                is_top: Some(false),
+            },
+        ];
+        articles.sort_by(compare_article_quality);
+        assert_eq!(
+            articles
+                .iter()
+                .map(|article| article.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["top", "low", "q2"]
+        );
+    }
+
+    #[test]
     fn matches_journal_name_or_abbreviation_before_fetching_figures() {
         let summary: Value = serde_json::from_str(
             r#"{"fulljournalname":"Journal of Cardiovascular Research","source":"J Cardiovasc Res"}"#,
@@ -935,7 +1073,12 @@ mod tests {
             filter_ids_by_metrics(&client, vec!["4376775".to_string()], &filters)
                 .await
                 .unwrap();
-        assert_eq!(kept, vec!["4376775".to_string()]);
+        assert_eq!(
+            kept.iter()
+                .map(|article| article.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["4376775"]
+        );
         assert_eq!(filtered, 0);
     }
 }

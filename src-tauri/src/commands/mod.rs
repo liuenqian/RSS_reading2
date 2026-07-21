@@ -11,6 +11,8 @@ pub mod pubmed_cmd;
 pub mod pubmed_conversion_cmd;
 pub mod pubmed_search_cmd;
 pub mod reading_cmd;
+pub mod sci_review_cmd;
+pub mod sci_skill_cmd;
 pub mod screening_cmd;
 pub mod settings_cmd;
 pub mod translate_cmd;

@@ -32,6 +32,8 @@ test('PubMed preview enables formal retrieval before optional AI assessment', ()
   assert.doesNotMatch(html.match(/<input[^>]*id="pubmed-preview-ai-enabled"[^>]*>/u)?.[0] || '', /checked/);
   assert.match(source, /document\.getElementById\('pubmed-preview-ai-enabled'\)\?\.checked/);
   assert.match(source, /document\.getElementById\('pubmed-preview-ai-enabled'\)\.checked = false/);
+  assert.match(source, /确认种子论文后才可进行复杂 AI 作者评估/);
+  assert.match(source, /loadAuthorIdentityState\(currentPubmedSearch\.id\)\.seedIds\.length/);
   assert.match(source, /data-use-suggested-query/);
   assert.match(source, /查准率估计/);
   assert.match(source, /查全风险/);

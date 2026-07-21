@@ -5,6 +5,7 @@ import {
   groupPmcFiguresByArticle,
   isPmcFigureNumber,
   mergePmcGalleryResults,
+  sortPmcArticleGroupsByQuality,
 } from '../src/pmc_gallery.js';
 
 const main = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
@@ -94,6 +95,23 @@ test('PMC gallery invokes the registered backend command and renders separate fi
   assert.match(lib, /pmc_gallery_cmd::search_pmc_gallery/);
 });
 
+test('PMC gallery defaults to high-quality graphical abstracts and preserves other views', () => {
+  assert.match(html, /class="seg-btn active"[^>]*data-pmc-gallery-view="graphical">图形摘要/);
+  assert.match(html, /data-pmc-gallery-view="all">全部图片/);
+  assert.match(main, /let pmcGalleryView = 'graphical'/);
+  assert.match(main, /sortPmcArticleGroupsByQuality\(groupPmcFiguresByArticle\(figures\)\)/);
+  assert.match(main, /figureSection\?\.classList\.toggle\('hidden', pmcGalleryView === 'graphical'\)/);
+  assert.match(main, /pmc-gallery-quality-badge/);
+  assert.match(main, />原文<\/button>/);
+
+  const sorted = sortPmcArticleGroupsByQuality([
+    { pmcid: 'PMC-low', impact_factor: '18.0', jcr_quartile: 'Q1', cas_partition: 'B1', is_top: false, publication_year: 2026 },
+    { pmcid: 'PMC-top', impact_factor: '8.0', jcr_quartile: 'Q1', cas_partition: 'B1', is_top: true, publication_year: 2024 },
+    { pmcid: 'PMC-q2', impact_factor: '30.0', jcr_quartile: 'Q2', cas_partition: 'B2', is_top: false, publication_year: 2026 },
+  ]);
+  assert.deepEqual(sorted.map(group => group.pmcid), ['PMC-top', 'PMC-low', 'PMC-q2']);
+});
+
 test('PMC gallery filters journal metrics before fetching figures', () => {
   assert.match(html, /<input id="pmc-gallery-journal-filter"[^>]*list="pmc-gallery-journal-options"[^>]*disabled/);
   assert.match(html, /<datalist id="pmc-gallery-journal-options"><\/datalist>/);
@@ -117,6 +135,11 @@ test('PMC gallery filters journal metrics before fetching figures', () => {
   assert.match(styles, /\.pmc-gallery-metric-filters select[\s\S]*appearance: none/);
   assert.match(migrations, /journal_filter\s+TEXT NOT NULL DEFAULT 'all'/);
   assert.match(searchService, /pub journal_filter: &'a str/);
+  assert.match(service, /pub impact_factor: Option<String>/);
+  assert.match(service, /compare_article_quality/);
+  assert.match(searchService, /publication_year, impact_factor, jcr_quartile, cas_partition/);
+  assert.match(migrations, /const PUBMED_SCHEMA_VERSION: i64 = 12/);
+  assert.match(migrations, /ensure_pmc_gallery_figure_metric_columns/);
 });
 
 test('PMC gallery can batch isolate any requested figure number', () => {

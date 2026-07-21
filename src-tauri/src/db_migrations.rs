@@ -1,7 +1,7 @@
 use crate::services::entry_identity_service;
 use rusqlite::{params, Connection, OptionalExtension};
 
-const PUBMED_SCHEMA_VERSION: i64 = 11;
+const PUBMED_SCHEMA_VERSION: i64 = 12;
 
 fn current_schema_version(conn: &Connection) -> Result<i64, String> {
     let version = conn
@@ -71,6 +71,7 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             create_structured_author_tables(conn)?;
             ensure_author_run_columns(conn)?;
             create_pmc_gallery_searches_table(conn)?;
+            ensure_pmc_gallery_figure_metric_columns(conn)?;
             ensure_screening_columns(conn)?;
             backfill_feed_screening_status(conn)?;
             conn.execute(
@@ -90,6 +91,7 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             create_structured_author_tables(conn)?;
             ensure_author_run_columns(conn)?;
             create_pmc_gallery_searches_table(conn)?;
+            ensure_pmc_gallery_figure_metric_columns(conn)?;
             conn.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES ('schema_version', ?1)",
                 [PUBMED_SCHEMA_VERSION.to_string()],
@@ -104,6 +106,7 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("开始 PMC 图库检索迁移失败: {}", e))?;
         let result = (|| -> Result<(), String> {
             create_pmc_gallery_searches_table(conn)?;
+            ensure_pmc_gallery_figure_metric_columns(conn)?;
             create_structured_author_tables(conn)?;
             ensure_author_run_columns(conn)?;
             conn.execute(
@@ -124,8 +127,10 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
                 [],
             )
             .map_err(|e| format!("添加 PMC 期刊筛选字段失败: {}", e))?;
+            ensure_pmc_gallery_figure_metric_columns(conn)?;
             create_structured_author_tables(conn)?;
             ensure_author_run_columns(conn)?;
+            ensure_pmc_gallery_figure_metric_columns(conn)?;
             conn.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES ('schema_version', ?1)",
                 [PUBMED_SCHEMA_VERSION.to_string()],
@@ -150,6 +155,20 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         })();
         return finish_migration(conn, result, "结构化作者");
     }
+    if version == 11 && !rebuild_entries {
+        conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")
+            .map_err(|e| format!("开始 PMC 高分摘要图迁移失败: {}", e))?;
+        let result = (|| -> Result<(), String> {
+            ensure_pmc_gallery_figure_metric_columns(conn)?;
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('schema_version', ?1)",
+                [PUBMED_SCHEMA_VERSION.to_string()],
+            )
+            .map_err(|e| format!("保存数据库版本失败: {}", e))?;
+            Ok(())
+        })();
+        return finish_migration(conn, result, "PMC 高分摘要图");
+    }
     conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")
         .map_err(|e| format!("开始数据库迁移失败: {}", e))?;
 
@@ -164,6 +183,7 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         create_structured_author_tables(conn)?;
         ensure_author_run_columns(conn)?;
         create_pmc_gallery_searches_table(conn)?;
+        ensure_pmc_gallery_figure_metric_columns(conn)?;
         ensure_screening_columns(conn)?;
         backfill_feed_memberships(conn)?;
         backfill_feed_screening_status(conn)?;
@@ -444,6 +464,12 @@ fn create_pmc_gallery_searches_table(conn: &Connection) -> Result<(), String> {
             image_url      TEXT NOT NULL,
             license        TEXT NOT NULL,
             figure_kind    TEXT NOT NULL,
+            journal        TEXT NOT NULL DEFAULT '',
+            publication_year INTEGER,
+            impact_factor  TEXT,
+            jcr_quartile   TEXT,
+            cas_partition  TEXT,
+            is_top         INTEGER,
             position       INTEGER NOT NULL DEFAULT 0,
             UNIQUE(search_id, image_url),
             FOREIGN KEY (search_id) REFERENCES pmc_gallery_searches(id) ON DELETE CASCADE
@@ -453,6 +479,48 @@ fn create_pmc_gallery_searches_table(conn: &Connection) -> Result<(), String> {
         ",
     )
     .map_err(|e| format!("创建 PMC 图库检索表失败: {}", e))
+}
+
+fn ensure_pmc_gallery_figure_metric_columns(conn: &Connection) -> Result<(), String> {
+    let table_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pmc_gallery_figures'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| format!("读取 PMC 图库缓存表结构失败: {}", e))?
+        .is_some();
+    if !table_exists {
+        return Ok(());
+    }
+
+    for (name, definition) in [
+        ("journal", "TEXT NOT NULL DEFAULT ''"),
+        ("publication_year", "INTEGER"),
+        ("impact_factor", "TEXT"),
+        ("jcr_quartile", "TEXT"),
+        ("cas_partition", "TEXT"),
+        ("is_top", "INTEGER"),
+    ] {
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('pmc_gallery_figures') WHERE name = ?1",
+                [name],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| format!("读取 pmc_gallery_figures.{} 结构失败: {}", name, e))?
+            .is_some();
+        if !exists {
+            conn.execute_batch(&format!(
+                "ALTER TABLE pmc_gallery_figures ADD COLUMN {} {};",
+                name, definition
+            ))
+            .map_err(|e| format!("添加 pmc_gallery_figures.{} 失败: {}", name, e))?;
+        }
+    }
+    Ok(())
 }
 
 fn create_screening_state_tables(conn: &Connection) -> Result<(), String> {
@@ -1081,7 +1149,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(run_columns, 2);
-        assert_eq!(current_schema_version(&conn).unwrap(), 11);
+        assert_eq!(current_schema_version(&conn).unwrap(), 12);
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
                 row.get::<_, i64>(0)
@@ -1089,5 +1157,59 @@ mod tests {
             .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn schema_eleven_adds_pmc_quality_fields_without_losing_cached_figures() {
+        let conn = Connection::open_in_memory().expect("open database");
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE entries (id INTEGER PRIMARY KEY, feed_id INTEGER);
+             CREATE TABLE pmc_gallery_figures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                search_id INTEGER NOT NULL,
+                pmcid TEXT NOT NULL,
+                article_title TEXT NOT NULL,
+                article_url TEXT NOT NULL,
+                label TEXT NOT NULL,
+                caption TEXT NOT NULL,
+                image_url TEXT NOT NULL,
+                license TEXT NOT NULL,
+                figure_kind TEXT NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO pmc_gallery_figures
+                (search_id, pmcid, article_title, article_url, label, caption, image_url,
+                 license, figure_kind, position)
+             VALUES
+                (1, 'PMC1', 'Paper', 'https://example.test/PMC1', 'Graphical Abstract',
+                 'Overview', 'https://example.test/ga.jpg', 'CC BY', 'graphical_abstract', 0);
+             INSERT INTO settings (key, value) VALUES ('schema_version', '11');",
+        )
+        .expect("seed schema eleven");
+
+        migrate(&conn).expect("migrate PMC quality fields");
+
+        let metric_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pmc_gallery_figures')
+                 WHERE name IN ('journal', 'publication_year', 'impact_factor', 'jcr_quartile',
+                                'cas_partition', 'is_top')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(metric_columns, 6);
+        assert_eq!(
+            conn.query_row(
+                "SELECT image_url FROM pmc_gallery_figures WHERE id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "https://example.test/ga.jpg"
+        );
+        assert_eq!(current_schema_version(&conn).unwrap(), 12);
     }
 }

@@ -168,6 +168,211 @@ pub struct PubmedSearchPreview {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SciReviewTermEvidence {
+    pub chinese_concept: String,
+    pub concept_breakdown: String,
+    pub recommended_terms: Vec<String>,
+    pub term_type: String,
+    pub variants: Vec<String>,
+    pub mesh_evidence: String,
+    pub pubmed_evidence: String,
+    pub wos_evidence: String,
+    pub inclusion_decision: String,
+    pub risk: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SciReviewQueryOption {
+    pub id: String,
+    pub label: String,
+    pub pubmed_query: String,
+    pub wos_query: String,
+    pub purpose: String,
+    pub recall: String,
+    pub precision: String,
+    pub use_case: String,
+    pub risk: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SciReviewSearchStrategy {
+    #[serde(default)]
+    pub skill_id: String,
+    #[serde(default)]
+    pub skill_version: String,
+    #[serde(default)]
+    pub quality_gates: Vec<String>,
+    pub direction: String,
+    pub keywords: String,
+    pub target_tier: String,
+    pub core_concepts: Vec<String>,
+    pub manual_checks: Vec<String>,
+    pub term_evidence: Vec<SciReviewTermEvidence>,
+    pub options: Vec<SciReviewQueryOption>,
+    pub recommended_option: String,
+    pub recommendation_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SciReviewLiteratureRecord {
+    pub entry_id: i64,
+    pub title: String,
+    pub abstract_text: Option<String>,
+    pub authors: Option<String>,
+    pub journal: Option<String>,
+    pub publication_date: Option<String>,
+    pub pmid: Option<String>,
+    pub pmcid: Option<String>,
+    pub doi: Option<String>,
+    pub screening_status: String,
+    pub has_free_fulltext: bool,
+    pub has_reading_note: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SciReviewStageInput {
+    pub stage: String,
+    pub project_name: String,
+    pub direction: String,
+    pub keywords: String,
+    pub target_tier: String,
+    pub linked_search_name: Option<String>,
+    pub pubmed_query: Option<String>,
+    pub total_records: usize,
+    pub records: Vec<SciReviewLiteratureRecord>,
+    pub upstream_artifacts: Vec<String>,
+    pub target_journal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SciReviewStageArtifact {
+    pub stage: String,
+    pub skill_id: String,
+    pub skill_version: String,
+    pub skill_name: String,
+    pub title: String,
+    pub summary: String,
+    pub markdown: String,
+    pub completion_state: String,
+    pub input_record_count: usize,
+    pub total_record_count: usize,
+    pub manual_checks: Vec<String>,
+    pub quality_gates: Vec<String>,
+    pub next_stage: String,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SciReviewJournalFrequency {
+    pub journal_name: String,
+    pub article_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SciReviewJournalRecommendationInput {
+    pub project_name: String,
+    pub direction: String,
+    pub keywords: String,
+    pub target_tier: String,
+    pub article_type: String,
+    pub oa_preference: String,
+    pub apc_preference: String,
+    pub timeline_preference: String,
+    pub draft_excerpt: String,
+    pub journal_distribution: Vec<SciReviewJournalFrequency>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SciReviewJournalCandidate {
+    pub journal_name: String,
+    pub tier: String,
+    pub fit_score: u8,
+    pub evidence_count: usize,
+    pub reason: String,
+    pub risk: String,
+    pub verification_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SciReviewJournalRecommendation {
+    #[serde(default)]
+    pub skill_id: String,
+    #[serde(default)]
+    pub skill_version: String,
+    #[serde(default)]
+    pub quality_gates: Vec<String>,
+    pub summary: String,
+    pub candidates: Vec<SciReviewJournalCandidate>,
+    pub recommended_journal: String,
+    pub manual_checks: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SciReviewWritingEvidence {
+    pub entry_id: i64,
+    pub title: String,
+    pub abstract_text: Option<String>,
+    pub pmid: Option<String>,
+    pub doi: Option<String>,
+    pub note_content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SciReviewWritingSectionInput {
+    pub project_id: String,
+    pub section_id: String,
+    pub project_name: String,
+    pub direction: String,
+    pub keywords: String,
+    pub framework: String,
+    pub figure_plan: String,
+    pub previous_sections: Vec<String>,
+    pub evidence: Vec<SciReviewWritingEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SciReviewCitationEvidence {
+    pub paragraph_id: String,
+    pub claim: String,
+    pub identifiers: Vec<String>,
+    pub basis: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SciReviewWritingSection {
+    pub skill_id: String,
+    pub skill_version: String,
+    pub section_id: String,
+    pub title: String,
+    pub markdown: String,
+    pub citations: Vec<SciReviewCitationEvidence>,
+    pub evidence_record_count: usize,
+    pub reading_note_count: usize,
+    pub manual_checks: Vec<String>,
+    pub quality_gates: Vec<String>,
+    pub completion_state: String,
+    pub output_files: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SciSkillSpec {
+    pub step: u8,
+    pub skill_id: String,
+    pub skill_name: String,
+    pub description: String,
+    pub skill_path: String,
+    pub skill_version: String,
+    pub available: bool,
+    pub required_inputs: Vec<String>,
+    pub core_workflow: Vec<String>,
+    pub outputs: Vec<String>,
+    pub quality_gates: Vec<String>,
+    pub prohibited_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PubmedAuthorQueryCandidate {
     pub label: String,
     pub query: String,
