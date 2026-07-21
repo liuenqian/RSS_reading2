@@ -93,7 +93,8 @@ struct ParsedBriefing {
 pub fn list_briefings(conn: &Connection) -> Result<Vec<Briefing>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, period, title, lead_in, content, article_count, feed_count, generated_at
+            "SELECT id, period, source_scope, source_name, title, lead_in, content,
+                    article_count, feed_count, generated_at
              FROM briefings
              ORDER BY generated_at DESC, id DESC",
         )
@@ -103,14 +104,16 @@ pub fn list_briefings(conn: &Connection) -> Result<Vec<Briefing>, String> {
             Ok(Briefing {
                 id: row.get(0)?,
                 period: row.get(1)?,
-                title: row.get(2)?,
-                lead_in: row.get(3)?,
-                content: row.get(4)?,
+                source_scope: row.get(2)?,
+                source_name: row.get(3)?,
+                title: row.get(4)?,
+                lead_in: row.get(5)?,
+                content: row.get(6)?,
                 counts: BriefingCounts {
-                    articles: row.get(5)?,
-                    feeds: row.get(6)?,
+                    articles: row.get(7)?,
+                    feeds: row.get(8)?,
                 },
-                generated_at: row.get(7)?,
+                generated_at: row.get(9)?,
             })
         })
         .map_err(|e| format!("查询简报失败: {}", e))?;
@@ -137,6 +140,8 @@ pub async fn generate_briefing(
     state: &DbState,
     custom_guidance: Option<String>,
     expected_frequency: Option<String>,
+    source_scope: Option<String>,
+    source_id: Option<i64>,
 ) -> Result<Briefing, String> {
     // Reject overlapping calls. swap returns the previous value, so if a
     // generation is already in flight we get `true` and bail out without
@@ -149,7 +154,8 @@ pub async fn generate_briefing(
     }
     let _guard = InFlightGuard(&state.briefing_in_flight);
 
-    let (entries, settings, period_label) = {
+    let source_scope = normalize_source_scope(source_scope.as_deref());
+    let (entries, source_name, settings, period_label) = {
         let conn = state.conn.lock().map_err(|e| e.to_string())?;
         let settings = settings_service::get_settings(&conn);
         if settings.api_key.is_empty() {
@@ -170,9 +176,9 @@ pub async fn generate_briefing(
                 }
             }
         }
-        let entries = collect_recent_entries(&conn)?;
+        let (entries, source_name) = collect_recent_entries(&conn, source_scope, source_id)?;
         let label = build_period_label();
-        (entries, settings, label)
+        (entries, source_name, settings, label)
     };
 
     if entries.is_empty() {
@@ -181,9 +187,10 @@ pub async fn generate_briefing(
 
     let feed_count = entries
         .iter()
-        .map(|e| e.feed_id)
+        .filter_map(|e| e.feed_id)
         .collect::<std::collections::HashSet<_>>()
-        .len() as i64;
+        .len() as i64
+        + i64::from(entries.iter().any(|entry| entry.feed_id.is_none()));
     let article_count = entries.len() as i64;
 
     let user_prompt = format_entries_for_prompt(&entries);
@@ -209,10 +216,13 @@ pub async fn generate_briefing(
         let _ =
             cost_service::record_usage(&conn, &settings.provider, &settings.model, &output.usage);
         conn.execute(
-            "INSERT INTO briefings (period, title, lead_in, content, article_count, feed_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO briefings
+                (period, source_scope, source_name, title, lead_in, content, article_count, feed_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 &period_label,
+                source_scope,
+                &source_name,
                 &parsed.title,
                 &parsed.lead_in,
                 &parsed.content,
@@ -227,21 +237,24 @@ pub async fn generate_briefing(
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
     let row = conn
         .query_row(
-            "SELECT id, period, title, lead_in, content, article_count, feed_count, generated_at
+            "SELECT id, period, source_scope, source_name, title, lead_in, content,
+                    article_count, feed_count, generated_at
              FROM briefings WHERE id = ?1",
             [id],
             |row| {
                 Ok(Briefing {
                     id: row.get(0)?,
                     period: row.get(1)?,
-                    title: row.get(2)?,
-                    lead_in: row.get(3)?,
-                    content: row.get(4)?,
+                    source_scope: row.get(2)?,
+                    source_name: row.get(3)?,
+                    title: row.get(4)?,
+                    lead_in: row.get(5)?,
+                    content: row.get(6)?,
                     counts: BriefingCounts {
-                        articles: row.get(5)?,
-                        feeds: row.get(6)?,
+                        articles: row.get(7)?,
+                        feeds: row.get(8)?,
                     },
-                    generated_at: row.get(7)?,
+                    generated_at: row.get(9)?,
                 })
             },
         )
@@ -250,7 +263,7 @@ pub async fn generate_briefing(
 }
 
 struct EntryForBriefing {
-    feed_id: i64,
+    feed_id: Option<i64>,
     title_zh: Option<String>,
     title_en: String,
     journal: Option<String>,
@@ -295,7 +308,51 @@ fn format_remaining(secs: i64) -> String {
     }
 }
 
-fn collect_recent_entries(conn: &Connection) -> Result<Vec<EntryForBriefing>, String> {
+fn normalize_source_scope(value: Option<&str>) -> &'static str {
+    match value.unwrap_or("rss") {
+        "all" => "all",
+        "feed" => "feed",
+        "pubmed" => "pubmed",
+        _ => "rss",
+    }
+}
+
+fn briefing_source_name(
+    conn: &Connection,
+    source_scope: &str,
+    source_id: Option<i64>,
+) -> Result<String, String> {
+    match source_scope {
+        "all" => Ok("全部来源".to_string()),
+        "rss" => Ok("全部 RSS 订阅".to_string()),
+        "feed" => {
+            let id = source_id.ok_or_else(|| "请选择 RSS 订阅".to_string())?;
+            conn.query_row(
+                "SELECT COALESCE(title, url) FROM feeds WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "所选 RSS 订阅不存在".to_string())
+        }
+        "pubmed" => {
+            let id = source_id.ok_or_else(|| "请选择 PubMed 检索".to_string())?;
+            conn.query_row(
+                "SELECT name FROM pubmed_searches WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "所选 PubMed 检索不存在".to_string())
+        }
+        _ => Err("不支持的简报来源范围".to_string()),
+    }
+}
+
+fn collect_recent_entries(
+    conn: &Connection,
+    source_scope: &str,
+    source_id: Option<i64>,
+) -> Result<(Vec<EntryForBriefing>, String), String> {
+    let source_name = briefing_source_name(conn, source_scope, source_id)?;
     let mut stmt = conn
         .prepare(
             "SELECT e.feed_id,
@@ -312,6 +369,23 @@ fn collect_recent_entries(conn: &Connection) -> Result<Vec<EntryForBriefing>, St
                ON t_summary.entry_id = e.id AND t_summary.field = 'summary'
               AND length(trim(t_summary.translated_text)) > 0
              WHERE e.fetched_at >= datetime('now', ?1)
+               AND (
+                    ?3 = 'all'
+                    OR (?3 = 'rss' AND EXISTS (
+                        SELECT 1 FROM entry_feed_memberships membership
+                        WHERE membership.entry_id = e.id
+                    ))
+                    OR (?3 = 'feed' AND EXISTS (
+                        SELECT 1 FROM entry_feed_memberships membership
+                        WHERE membership.entry_id = e.id AND membership.feed_id = ?4
+                    ))
+                    OR (?3 = 'pubmed' AND EXISTS (
+                        SELECT 1 FROM pubmed_search_entries search_entry
+                        WHERE search_entry.entry_id = e.id
+                          AND search_entry.search_id = ?4
+                          AND search_entry.is_current_match = 1
+                    ))
+               )
              ORDER BY e.published_at DESC, e.fetched_at DESC
              LIMIT ?2",
         )
@@ -320,7 +394,12 @@ fn collect_recent_entries(conn: &Connection) -> Result<Vec<EntryForBriefing>, St
     let window = format!("-{} days", BRIEFING_WINDOW_DAYS);
     let rows = stmt
         .query_map(
-            rusqlite::params![window, MAX_ARTICLES_IN_PROMPT as i64],
+            rusqlite::params![
+                window,
+                MAX_ARTICLES_IN_PROMPT as i64,
+                source_scope,
+                source_id
+            ],
             |row| {
                 Ok(EntryForBriefing {
                     feed_id: row.get(0)?,
@@ -333,7 +412,7 @@ fn collect_recent_entries(conn: &Connection) -> Result<Vec<EntryForBriefing>, St
             },
         )
         .map_err(|e| format!("查询近期文章失败: {}", e))?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Ok((rows.filter_map(|r| r.ok()).collect(), source_name))
 }
 
 fn format_entries_for_prompt(entries: &[EntryForBriefing]) -> String {
@@ -415,5 +494,67 @@ fn parse_briefing_json(raw: &str) -> Result<ParsedBriefing, String> {
             warn!(error = %e, "简报 JSON 解析失败");
             Err(format!("简报 JSON 解析失败: {}", e))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_recent_entries;
+    use rusqlite::Connection;
+
+    fn source_database() -> Connection {
+        let conn = Connection::open_in_memory().expect("open database");
+        conn.execute_batch(
+            "CREATE TABLE feeds (id INTEGER PRIMARY KEY, url TEXT NOT NULL, title TEXT);
+             CREATE TABLE pubmed_searches (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE entries (
+                id INTEGER PRIMARY KEY,
+                feed_id INTEGER,
+                title TEXT NOT NULL,
+                source TEXT,
+                link TEXT NOT NULL,
+                published_at TEXT,
+                fetched_at TEXT NOT NULL
+             );
+             CREATE TABLE translations (
+                entry_id INTEGER NOT NULL,
+                field TEXT NOT NULL,
+                translated_text TEXT NOT NULL
+             );
+             CREATE TABLE entry_feed_memberships (
+                entry_id INTEGER NOT NULL,
+                feed_id INTEGER NOT NULL
+             );
+             CREATE TABLE pubmed_search_entries (
+                search_id INTEGER NOT NULL,
+                entry_id INTEGER NOT NULL,
+                is_current_match INTEGER NOT NULL
+             );
+             INSERT INTO feeds VALUES (1, 'https://rss.test/feed', 'RSS A');
+             INSERT INTO pubmed_searches VALUES (2, 'PubMed B');
+             INSERT INTO entries VALUES
+                (10, 1, 'RSS paper', 'Journal A', 'https://rss.test/1', datetime('now'), datetime('now')),
+                (20, NULL, 'PubMed paper', 'Journal B', 'https://pubmed.test/2', datetime('now'), datetime('now'));
+             INSERT INTO entry_feed_memberships VALUES (10, 1);
+             INSERT INTO pubmed_search_entries VALUES (2, 20, 1);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn briefing_source_scopes_do_not_mix_rss_and_pubmed() {
+        let conn = source_database();
+        let (rss, rss_name) = collect_recent_entries(&conn, "rss", None).unwrap();
+        let (pubmed, pubmed_name) = collect_recent_entries(&conn, "pubmed", Some(2)).unwrap();
+        let (all, _) = collect_recent_entries(&conn, "all", None).unwrap();
+
+        assert_eq!(rss.len(), 1);
+        assert_eq!(rss[0].title_en, "RSS paper");
+        assert_eq!(rss_name, "全部 RSS 订阅");
+        assert_eq!(pubmed.len(), 1);
+        assert_eq!(pubmed[0].title_en, "PubMed paper");
+        assert_eq!(pubmed_name, "PubMed B");
+        assert_eq!(all.len(), 2);
     }
 }

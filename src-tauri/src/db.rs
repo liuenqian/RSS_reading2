@@ -85,6 +85,8 @@ fn schema_sql() -> &'static str {
     CREATE TABLE IF NOT EXISTS briefings (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         period        TEXT NOT NULL,
+        source_scope  TEXT NOT NULL DEFAULT 'all',
+        source_name   TEXT NOT NULL DEFAULT '全部来源',
         title         TEXT NOT NULL,
         lead_in       TEXT NOT NULL,
         content       TEXT NOT NULL,

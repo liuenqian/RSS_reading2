@@ -1,7 +1,46 @@
 use crate::services::entry_identity_service;
 use rusqlite::{params, Connection, OptionalExtension};
 
-const PUBMED_SCHEMA_VERSION: i64 = 12;
+const PUBMED_SCHEMA_VERSION: i64 = 13;
+
+fn ensure_briefing_scope_columns(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS briefings (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            period        TEXT NOT NULL,
+            title         TEXT NOT NULL,
+            lead_in       TEXT NOT NULL,
+            content       TEXT NOT NULL,
+            article_count INTEGER NOT NULL,
+            feed_count    INTEGER NOT NULL,
+            generated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );",
+    )
+    .map_err(|error| format!("创建简报表失败: {}", error))?;
+    let columns = conn
+        .prepare("SELECT name FROM pragma_table_info('briefings')")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| format!("读取简报表结构失败: {}", error))?;
+    if !columns.iter().any(|column| column == "source_scope") {
+        conn.execute(
+            "ALTER TABLE briefings ADD COLUMN source_scope TEXT NOT NULL DEFAULT 'all'",
+            [],
+        )
+        .map_err(|error| format!("添加简报来源范围失败: {}", error))?;
+    }
+    if !columns.iter().any(|column| column == "source_name") {
+        conn.execute(
+            "ALTER TABLE briefings ADD COLUMN source_name TEXT NOT NULL DEFAULT '全部来源'",
+            [],
+        )
+        .map_err(|error| format!("添加简报来源名称失败: {}", error))?;
+    }
+    Ok(())
+}
 
 fn current_schema_version(conn: &Connection) -> Result<i64, String> {
     let version = conn
@@ -33,7 +72,18 @@ pub fn needs_migration(conn: &Connection) -> Result<bool, String> {
         .optional()
         .map_err(|e| format!("读取 entries 结构失败: {}", e))?
         .unwrap_or(1);
-    Ok(feed_id_not_null != 0)
+    if feed_id_not_null != 0 {
+        return Ok(true);
+    }
+    let briefing_scope_columns = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('briefings')
+             WHERE name IN ('source_scope', 'source_name')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("读取简报表结构失败: {}", e))?;
+    Ok(briefing_scope_columns != 2)
 }
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -45,6 +95,7 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
 
     let version = current_schema_version(conn)?;
     let rebuild_entries = entries_feed_id_is_not_null(conn)?;
+    ensure_briefing_scope_columns(conn)?;
     if current_schema_version(conn)? == 5 && !rebuild_entries {
         conn.execute_batch(
             "BEGIN IMMEDIATE;
@@ -183,6 +234,7 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         create_structured_author_tables(conn)?;
         ensure_author_run_columns(conn)?;
         create_pmc_gallery_searches_table(conn)?;
+        ensure_briefing_scope_columns(conn)?;
         ensure_pmc_gallery_figure_metric_columns(conn)?;
         ensure_screening_columns(conn)?;
         backfill_feed_memberships(conn)?;
@@ -1004,6 +1056,37 @@ mod tests {
     }
 
     #[test]
+    fn briefing_scope_columns_preserve_existing_rows() {
+        let conn = Connection::open_in_memory().expect("open database");
+        conn.execute_batch(
+            "CREATE TABLE briefings (
+                id INTEGER PRIMARY KEY,
+                period TEXT NOT NULL,
+                title TEXT NOT NULL,
+                lead_in TEXT NOT NULL,
+                content TEXT NOT NULL,
+                article_count INTEGER NOT NULL,
+                feed_count INTEGER NOT NULL,
+                generated_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO briefings
+                (id, period, title, lead_in, content, article_count, feed_count)
+             VALUES (1, '旧周期', '旧简报', '', '正文', 2, 1);",
+        )
+        .unwrap();
+
+        ensure_briefing_scope_columns(&conn).expect("add briefing scope");
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT title, source_scope, source_name FROM briefings WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("旧简报".into(), "all".into(), "全部来源".into()));
+    }
+
+    #[test]
     fn schema_five_uses_fast_pdf_index_migration() {
         let conn = Connection::open_in_memory().expect("open database");
         conn.execute_batch(
@@ -1149,7 +1232,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(run_columns, 2);
-        assert_eq!(current_schema_version(&conn).unwrap(), 12);
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            PUBMED_SCHEMA_VERSION
+        );
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
                 row.get::<_, i64>(0)
@@ -1210,6 +1296,9 @@ mod tests {
             .unwrap(),
             "https://example.test/ga.jpg"
         );
-        assert_eq!(current_schema_version(&conn).unwrap(), 12);
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            PUBMED_SCHEMA_VERSION
+        );
     }
 }

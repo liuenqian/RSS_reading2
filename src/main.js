@@ -748,8 +748,9 @@ function setupWindowDragFallback() {
     if (!(target instanceof Element)) return;
     if (target.closest(DRAG_BLOCK_SELECTOR)) return;
 
-    const region = target.closest('[data-tauri-drag-region]');
-    if (!region || region.getAttribute('data-tauri-drag-region') === 'false') return;
+    // Tauri's built-in drag marker toggles window maximization on double-click.
+    const region = target.closest('[data-window-drag-region]');
+    if (!region) return;
 
     const currentWindow =
       window.__TAURI__?.window?.getCurrentWindow?.()
@@ -3504,6 +3505,7 @@ async function loadPubmedSearches() {
     renderPubmedSearchList();
     setGlobalStatus('加载 PubMed 检索失败: ' + e, 'error');
   }
+  syncBriefingSourceControls();
   sciReviewWorkspace?.refresh();
 }
 
@@ -4483,6 +4485,7 @@ async function loadFeeds() {
     catch { globalEntries = []; }
     renderFeedList(allFeeds);
     updateOverviewCounts();
+    syncBriefingSourceControls();
   } catch (e) {
     setGlobalStatus('加载订阅列表失败: ' + e, 'error');
   }
@@ -10152,6 +10155,7 @@ function briefingMatchesLiteratureSearchQuery(briefing, query) {
     briefing.period,
     briefing.date,
     briefing.content,
+    briefing.source_name,
   ].filter(Boolean).join('\n').toLowerCase();
   return terms.every(term => haystack.includes(term));
 }
@@ -10234,7 +10238,7 @@ function renderBriefingList() {
       <div class="briefing-body">
         <div class="briefing-meta-top">
           <span class="briefing-period">${escapeHtml(b.period || '')}</span>
-          <span class="briefing-counts">${(b.counts?.articles || 0)} 篇 · ${(b.counts?.feeds || 0)} 个来源</span>
+          <span class="briefing-counts">${(b.counts?.articles || 0)} 篇 · ${escapeHtml(b.source_name || '全部来源')}</span>
         </div>
         <div class="briefing-title">${escapeHtml(b.title || '')}</div>
         <div class="briefing-leadin">${escapeHtml(b.lead_in || b.leadIn || '')}</div>
@@ -10297,6 +10301,8 @@ function selectBriefing(id) {
     <span>${escapeHtml(b.period || '')}</span>
     <span style="opacity:0.6">·</span>
     <span>${(b.counts?.articles || 0)} 篇文献</span>
+    <span style="opacity:0.6">·</span>
+    <span>${escapeHtml(b.source_name || '全部来源')}</span>
   `;
   document.getElementById('briefing-detail-title').textContent = b.title || '';
   document.getElementById('briefing-detail-leadin').textContent = b.lead_in || b.leadIn || '';
@@ -10324,7 +10330,30 @@ function selectBriefing(id) {
   const providerMeta = AI_PROVIDER_META[activeProviderId()] || AI_PROVIDER_META.deepseek;
   const modelName = activeModelDisplayName();
   document.getElementById('briefing-detail-footer-text').innerHTML =
-    `<span class="ai-footer-strong">由 ${escapeHtml(providerMeta.label)} · ${escapeHtml(modelName)} 生成</span>，覆盖 ${(b.counts?.feeds || 0)} 个订阅源、${(b.counts?.articles || 0)} 篇文献。可在「AI 简报」设置调整频率与 Prompt。`;
+    `<span class="ai-footer-strong">由 ${escapeHtml(providerMeta.label)} · ${escapeHtml(modelName)} 生成</span>，来源：${escapeHtml(b.source_name || '全部来源')}，共 ${(b.counts?.articles || 0)} 篇文献。`;
+}
+
+function syncBriefingSourceControls() {
+  const scopeSelect = document.getElementById('briefing-source-scope');
+  const sourceSelect = document.getElementById('briefing-source-id');
+  if (!scopeSelect || !sourceSelect) return;
+  const scope = ['rss', 'all', 'feed', 'pubmed'].includes(localStorage.getItem('briefing-source-scope'))
+    ? localStorage.getItem('briefing-source-scope')
+    : 'rss';
+  scopeSelect.value = scope;
+  const sources = scope === 'feed'
+    ? allFeeds.map(feed => ({ id: feed.id, name: feed.title || feed.url }))
+    : (scope === 'pubmed'
+      ? allPubmedSearches.map(search => ({ id: search.id, name: search.name }))
+      : []);
+  const savedId = Number(localStorage.getItem('briefing-source-id')) || null;
+  sourceSelect.innerHTML = sources.map(source => `<option value="${source.id}">${escapeHtml(source.name)}</option>`).join('');
+  sourceSelect.classList.toggle('hidden', !['feed', 'pubmed'].includes(scope));
+  if (sources.some(source => Number(source.id) === savedId)) sourceSelect.value = String(savedId);
+  else if (sources[0]) {
+    sourceSelect.value = String(sources[0].id);
+    localStorage.setItem('briefing-source-id', String(sources[0].id));
+  }
 }
 
 function showBriefingEmpty() {
@@ -10397,8 +10426,12 @@ async function generateBriefingNow() {
   // direction freely without breaking parsing.
   const customPrompt = localStorage.getItem('briefing-prompt') || null;
   const expectedFrequency = localStorage.getItem('briefing-frequency') || 'weekly';
+  const sourceScope = localStorage.getItem('briefing-source-scope') || 'rss';
+  const sourceId = ['feed', 'pubmed'].includes(sourceScope)
+    ? Number(localStorage.getItem('briefing-source-id')) || null
+    : null;
   try {
-    const b = await invoke('generate_briefing', { customPrompt, expectedFrequency });
+    const b = await invoke('generate_briefing', { customPrompt, expectedFrequency, sourceScope, sourceId });
     loadCostSummary();
     setGlobalStatus('简报已生成', 'success');
     await loadBriefings();
@@ -13574,12 +13607,21 @@ window.addEventListener('DOMContentLoaded', () => {
 
   // Generate briefing
   document.getElementById('btn-generate-briefing')?.addEventListener('click', generateBriefingNow);
+  document.getElementById('briefing-source-scope')?.addEventListener('change', event => {
+    localStorage.setItem('briefing-source-scope', event.currentTarget.value);
+    localStorage.removeItem('briefing-source-id');
+    syncBriefingSourceControls();
+  });
+  document.getElementById('briefing-source-id')?.addEventListener('change', event => {
+    localStorage.setItem('briefing-source-id', event.currentTarget.value);
+  });
 
   // Initialize sub-modules
   setupWindowDragFallback();
   initAppearanceControls();
   initPubmedGenerator();
   initBriefingSettings();
+  syncBriefingSourceControls();
   syncAppearanceFromStorage();
   loadJournalMetrics();
   loadReadingProfiles();

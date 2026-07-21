@@ -40,10 +40,17 @@ pub async fn generate_briefing(
     state: State<'_, DbState>,
     custom_prompt: Option<String>,
     expected_frequency: Option<String>,
+    source_scope: Option<String>,
+    source_id: Option<i64>,
 ) -> Result<Briefing, String> {
-    let briefing =
-        briefing_service::generate_briefing(state.inner(), custom_prompt, expected_frequency)
-            .await?;
+    let briefing = briefing_service::generate_briefing(
+        state.inner(),
+        custom_prompt,
+        expected_frequency,
+        source_scope,
+        source_id,
+    )
+    .await?;
 
     // Fire a system banner so the user notices when the briefing is generated
     // in the background by the frontend auto-scheduler (`briefingSchedulerTick`

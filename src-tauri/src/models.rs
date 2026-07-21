@@ -766,6 +766,8 @@ pub struct BriefingCounts {
 pub struct Briefing {
     pub id: i64,
     pub period: String,
+    pub source_scope: String,
+    pub source_name: String,
     pub title: String,
     pub lead_in: String,
     pub content: String,

@@ -21,7 +21,7 @@
     <body data-theme="light" data-accent="coral" data-font-scale="md">
         <!-- ── Toolbar — overlay titlebar, traffic lights at left via OS ── -->
         <!-- padding-left:76px clears the native traffic lights; everything else is ours -->
-        <header class="toolbar chrome" data-tauri-drag-region="deep">
+        <header class="toolbar chrome" data-window-drag-region>
             <div class="toolbar-leading">
                 <div class="capsule-group">
                     <button
@@ -47,8 +47,8 @@
                 </div>
             </div>
 
-            <div class="pubmed-batch-heading" data-tauri-drag-region="deep">
-                <div id="pubmed-batch-meta" class="pubmed-batch-meta" data-tauri-drag-region="deep"></div>
+            <div class="pubmed-batch-heading" data-window-drag-region>
+                <div id="pubmed-batch-meta" class="pubmed-batch-meta" data-window-drag-region></div>
                 <div class="pubmed-batch-actions">
                     <button id="btn-export-pubmed" class="btn btn-secondary btn-sm" type="button" title="导出当前结果">
                         <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2.5v7M5.2 6.8 8 9.6l2.8-2.8M3 12.5h10" /></svg>
@@ -59,8 +59,8 @@
             </div>
 
             <!-- App name shown by native macOS titlebar; only show contextual subtitle here -->
-            <div class="toolbar-title-group" data-tauri-drag-region="deep">
-                <div id="toolbar-subtitle" class="toolbar-subtitle" data-tauri-drag-region="deep"></div>
+            <div class="toolbar-title-group" data-window-drag-region>
+                <div id="toolbar-subtitle" class="toolbar-subtitle" data-window-drag-region></div>
             </div>
 
             <div class="toolbar-trailing">
@@ -689,7 +689,7 @@
                                 AI 简报<sup class="section-title-beta">Beta</sup>
                             </h1>
                             <p class="section-subtitle">
-                                定期把订阅源新增的文献整理成中文简报，bullet
+                                定期把选定来源范围内的新增文献整理成中文简报，bullet
                                 后附原文跳转链接。
                             </p>
                             <p class="section-beta-note">
@@ -2088,7 +2088,7 @@
                      this panel's top via `trafficLightPosition` in
                      tauri.conf.json; the `RSS Reading` brand label sits in the
                      same upper strip below them. -->
-                <aside id="sidebar" class="sidebar" data-tauri-drag-region>
+                <aside id="sidebar" class="sidebar" data-window-drag-region>
                     <div class="sidebar-brand" aria-hidden="true">RSS Reading</div>
                     <div class="literature-search-wrap">
                         <div class="literature-search-row" id="literature-search-row">
@@ -2773,6 +2773,15 @@
                                 <button id="briefing-sort-direction" class="entry-sort-direction" type="button" aria-label="切换简报排序方向" title="切换简报排序方向" aria-pressed="false">
                                     <span class="entry-sort-direction-label">↓</span>
                                 </button>
+                            </div>
+                            <div class="briefing-source-row">
+                                <select id="briefing-source-scope" aria-label="简报来源范围">
+                                    <option value="rss">全部 RSS 订阅</option>
+                                    <option value="all">全部来源</option>
+                                    <option value="feed">指定 RSS 订阅</option>
+                                    <option value="pubmed">指定 PubMed 检索</option>
+                                </select>
+                                <select id="briefing-source-id" class="hidden" aria-label="选择简报来源"></select>
                             </div>
                             <button
                                 class="briefing-gen-btn"
