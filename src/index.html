@@ -3855,6 +3855,12 @@
                             <span>研究问题</span>
                             <textarea id="pubmed-question" rows="3" placeholder="例如：脓毒症后免疫麻痹的单细胞研究"></textarea>
                         </label>
+                        <div class="pubmed-question-history-row">
+                            <select id="pubmed-question-history" class="settings-select" aria-label="历史研究问题">
+                                <option value="">历史输入</option>
+                            </select>
+                            <button id="btn-clear-pubmed-question-history" class="btn btn-ghost" type="button">清空历史</button>
+                        </div>
                         <div class="pubmed-field-action">
                             <button id="btn-generate-pubmed-query" class="btn btn-secondary" type="button">AI 生成检索式</button>
                         </div>

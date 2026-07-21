@@ -79,6 +79,42 @@ jobs:
           releaseDraft: true
           prerelease: false
 
+      - name: Create Windows portable package
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $version = (Get-Content 'src-tauri/tauri.conf.json' | ConvertFrom-Json).version
+          $releaseDir = 'src-tauri/target/${{ matrix.target }}/release'
+          $portableRoot = Join-Path $releaseDir 'portable'
+          $portableDir = Join-Path $portableRoot 'RSS-Reading-Windows-x64'
+          $archive = Join-Path $portableRoot "RSS-Reading_${version}_Windows-x64_Portable.zip"
+          $checksum = "$archive.sha256"
+
+          Remove-Item $portableDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item $portableDir -ItemType Directory -Force | Out-Null
+          Copy-Item (Join-Path $releaseDir 'cento.exe') (Join-Path $portableDir 'RSS Reading.exe')
+          Copy-Item 'src-tauri/resources' (Join-Path $portableDir 'resources') -Recurse
+          Copy-Item 'docs/WINDOWS_PORTABLE.md' (Join-Path $portableDir '使用说明.md')
+
+          Compress-Archive -Path (Join-Path $portableDir '*') -DestinationPath $archive -Force
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path $archive -Leaf)" | Set-Content $checksum -Encoding ascii
+
+      - name: Upload Windows portable package to release
+        if: matrix.platform == 'windows-latest' && github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $portableRoot = 'src-tauri/target/${{ matrix.target }}/release/portable'
+          $archive = Get-ChildItem $portableRoot -Filter '*.zip' | Select-Object -First 1
+          $checksum = Get-ChildItem $portableRoot -Filter '*.sha256' | Select-Object -First 1
+          if (-not $archive -or -not $checksum) {
+            throw 'Windows portable package or checksum is missing'
+          }
+          gh release upload '${{ github.ref_name }}' $archive.FullName $checksum.FullName `
+            --clobber --repo '${{ github.repository }}'
+
       # Also upload the raw binaries as workflow artifacts so we can grab
       # them even if the release upload step had an issue.
       - name: Upload artifacts
@@ -90,4 +126,6 @@ jobs:
             src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
             src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
             src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            src-tauri/target/${{ matrix.target }}/release/portable/*.zip
+            src-tauri/target/${{ matrix.target }}/release/portable/*.sha256
           if-no-files-found: ignore

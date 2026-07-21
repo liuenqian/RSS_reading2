@@ -35,6 +35,10 @@ import {
 } from './screening_table_state.js';
 import { renderScreeningTable } from './screening_table_view.js';
 import { SCI_REVIEW_STAGES, SciReviewWorkspace } from './sci_review_workspace.js';
+import {
+  addPubmedQuestionHistory,
+  normalizePubmedQuestionHistory,
+} from './pubmed_question_history.js';
 const { invoke } = window.__TAURI__.core;
 const markdownitFactory = globalThis.markdownit;
 const markdownitTaskLists = globalThis.markdownitTaskLists;
@@ -2797,6 +2801,50 @@ function renderPubmedSearchNameHistory() {
   });
 }
 
+const PUBMED_QUESTION_HISTORY_STORAGE_KEY = 'pubmed-question-history-v1';
+
+function loadPubmedQuestionHistory() {
+  try {
+    return normalizePubmedQuestionHistory(JSON.parse(localStorage.getItem(PUBMED_QUESTION_HISTORY_STORAGE_KEY) || '[]'));
+  } catch {
+    return [];
+  }
+}
+
+function renderPubmedQuestionHistory() {
+  const select = document.getElementById('pubmed-question-history');
+  const clearButton = document.getElementById('btn-clear-pubmed-question-history');
+  if (!select) return;
+
+  const history = loadPubmedQuestionHistory();
+  select.replaceChildren();
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = history.length ? `历史输入（${history.length}）` : '暂无历史输入';
+  select.appendChild(placeholder);
+  history.forEach(question => {
+    const option = document.createElement('option');
+    option.value = question;
+    option.textContent = question.replace(/\s+/g, ' ');
+    select.appendChild(option);
+  });
+  select.value = '';
+  select.disabled = history.length === 0;
+  if (clearButton) clearButton.disabled = history.length === 0;
+}
+
+function rememberPubmedQuestion(question) {
+  if (pubmedSearchBuilderMode !== 'topic') return;
+  const history = addPubmedQuestionHistory(loadPubmedQuestionHistory(), question);
+  localStorage.setItem(PUBMED_QUESTION_HISTORY_STORAGE_KEY, JSON.stringify(history));
+  renderPubmedQuestionHistory();
+}
+
+function clearPubmedQuestionHistory() {
+  localStorage.removeItem(PUBMED_QUESTION_HISTORY_STORAGE_KEY);
+  renderPubmedQuestionHistory();
+}
+
 function extractAuthorSearchIdentity(source) {
   const question = String(source?.question || '').trim();
   const match = question.match(/作者\s+(.+?)(?:（([^）]+)）)?\s+的\s*PubMed\s*文献/i);
@@ -2849,6 +2897,7 @@ function openPubmedSearchModal({ source = null, editing = false, creationTarget 
   updatePubmedRetrievalUi();
   setPubmedSearchBuilderMode(authorIdentity ? 'author' : 'topic');
   renderPubmedSearchNameHistory();
+  renderPubmedQuestionHistory();
   modal.classList.remove('hidden');
   setTimeout(() => document.getElementById(source ? 'pubmed-batch-query-input' : 'pubmed-question')?.focus(), 0);
 }
@@ -2909,6 +2958,7 @@ async function generatePubmedQuery() {
     status.textContent = '请先填写研究问题';
     return;
   }
+  rememberPubmedQuestion(question);
   button.disabled = true;
   status.textContent = '正在生成检索式…';
   try {
@@ -3157,6 +3207,7 @@ async function previewPubmedSearch() {
     status.textContent = '请输入检索式';
     return;
   }
+  if (question) rememberPubmedQuestion(question);
   const options = {
     scope: 'all',
     limit: null,
@@ -3251,6 +3302,7 @@ async function createAndRunPubmedSearch() {
     status.textContent = '请填写检索名称';
     return;
   }
+  if (question) rememberPubmedQuestion(question);
   if (pubmedCreationTarget === 'feed') {
     const pubmedLimit = clampPubmedLimit(document.getElementById('pubmed-rss-limit').value);
     button.disabled = true;
@@ -13535,6 +13587,15 @@ window.addEventListener('DOMContentLoaded', () => {
     element.addEventListener('click', closePubmedSearchModal);
   });
   document.getElementById('btn-generate-pubmed-query')?.addEventListener('click', generatePubmedQuery);
+  document.getElementById('pubmed-question-history')?.addEventListener('change', event => {
+    const question = event.currentTarget.value;
+    if (!question) return;
+    document.getElementById('pubmed-question').value = question;
+    invalidatePubmedPreview();
+    document.getElementById('pubmed-preview-status').textContent = '已恢复历史研究问题，可继续生成或修改检索式';
+    document.getElementById('pubmed-question').focus();
+  });
+  document.getElementById('btn-clear-pubmed-question-history')?.addEventListener('click', clearPubmedQuestionHistory);
   document.getElementById('btn-build-pubmed-author-query')?.addEventListener('click', buildPubmedAuthorQuery);
   document.querySelectorAll('[data-pubmed-search-mode]').forEach(button => {
     button.addEventListener('click', () => setPubmedSearchBuilderMode(button.dataset.pubmedSearchMode));
@@ -13552,6 +13613,7 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('pubmed-batch-query-input')?.addEventListener('input', () => {
     invalidatePubmedPreview();
   });
+  document.getElementById('pubmed-question')?.addEventListener('input', invalidatePubmedPreview);
   btnRunPubmedSearch?.addEventListener('click', runCurrentPubmedSearch);
   btnExportPubmed?.addEventListener('click', () => exportCurrentPubmedEntries());
   btnEntryBulkExport?.addEventListener('click', () => {

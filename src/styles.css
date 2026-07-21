@@ -2955,6 +2955,17 @@ body.pubmed-mode #btn-pubmed-ai-screen { display: inline-flex; }
 }
 .pubmed-field textarea:focus,
 .pubmed-field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-faint); }
+.pubmed-question-history-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: -2px;
+}
+.pubmed-question-history-row .settings-select {
+  min-width: 0;
+  flex: 1;
+}
+.pubmed-question-history-row .btn { flex: 0 0 auto; }
 
 .pubmed-field-action,
 .pubmed-preview-actions { display: flex; align-items: center; gap: 10px; }
