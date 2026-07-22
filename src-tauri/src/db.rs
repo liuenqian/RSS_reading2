@@ -95,6 +95,25 @@ fn schema_sql() -> &'static str {
         generated_at  TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS briefing_annotations (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        briefing_id     INTEGER NOT NULL,
+        kind            TEXT NOT NULL CHECK(kind IN ('note', 'highlight')),
+        selected_text   TEXT NOT NULL DEFAULT '',
+        anchor_json     TEXT NOT NULL DEFAULT '',
+        color           TEXT NOT NULL DEFAULT 'yellow'
+            CHECK(
+                color IN ('yellow', 'green', 'blue', 'pink', 'purple', 'orange')
+                OR color GLOB '#[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]'
+            ),
+        note            TEXT NOT NULL DEFAULT '',
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (briefing_id) REFERENCES briefings(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_briefing_annotations_briefing
+        ON briefing_annotations(briefing_id, updated_at DESC, id DESC);
+
     CREATE TABLE IF NOT EXISTS reading_notes (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         entry_id      INTEGER NOT NULL,

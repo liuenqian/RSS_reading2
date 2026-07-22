@@ -33,6 +33,16 @@ pub fn list_reading_notes(
 }
 
 #[tauri::command]
+pub fn add_manual_reading_note(
+    state: State<DbState>,
+    entry_id: i64,
+    content: String,
+) -> Result<ReadingNote, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    reading_service::add_manual_reading_note(&conn, entry_id, &content)
+}
+
+#[tauri::command]
 pub fn delete_reading_note(state: State<DbState>, note_id: i64) -> Result<(), String> {
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
     reading_service::delete_reading_note(&conn, note_id)

@@ -1,7 +1,7 @@
 use crate::services::entry_identity_service;
 use rusqlite::{params, Connection, OptionalExtension};
 
-const PUBMED_SCHEMA_VERSION: i64 = 13;
+const PUBMED_SCHEMA_VERSION: i64 = 15;
 
 fn ensure_briefing_scope_columns(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
@@ -40,6 +40,88 @@ fn ensure_briefing_scope_columns(conn: &Connection) -> Result<(), String> {
         .map_err(|error| format!("添加简报来源名称失败: {}", error))?;
     }
     Ok(())
+}
+
+fn ensure_briefing_annotation_table(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS briefing_annotations (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            briefing_id     INTEGER NOT NULL,
+            kind            TEXT NOT NULL CHECK(kind IN ('note', 'highlight')),
+            selected_text   TEXT NOT NULL DEFAULT '',
+            anchor_json     TEXT NOT NULL DEFAULT '',
+            color           TEXT NOT NULL DEFAULT 'yellow'
+                CHECK(
+                    color IN ('yellow', 'green', 'blue', 'pink', 'purple', 'orange')
+                    OR color GLOB '#[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]'
+                ),
+            note            TEXT NOT NULL DEFAULT '',
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (briefing_id) REFERENCES briefings(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_briefing_annotations_briefing
+            ON briefing_annotations(briefing_id, updated_at DESC, id DESC);",
+    )
+    .map_err(|error| format!("创建简报标注表失败: {}", error))?;
+    Ok(())
+}
+
+fn briefing_annotation_colors_are_current(conn: &Connection) -> Result<bool, String> {
+    let schema = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'briefing_annotations'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取简报标注颜色结构失败: {}", error))?;
+    Ok(schema
+        .as_deref()
+        .is_some_and(|sql| sql.contains("color GLOB '#[0-9A-Fa-f]")))
+}
+
+fn ensure_briefing_annotation_color_schema(conn: &Connection) -> Result<(), String> {
+    if briefing_annotation_colors_are_current(conn)? {
+        return Ok(());
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")
+        .map_err(|error| format!("开始简报颜色迁移失败: {}", error))?;
+    let result = conn
+        .execute_batch(
+            "DROP TABLE IF EXISTS briefing_annotations_v2;
+             CREATE TABLE briefing_annotations_v2 (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                briefing_id     INTEGER NOT NULL,
+                kind            TEXT NOT NULL CHECK(kind IN ('note', 'highlight')),
+                selected_text   TEXT NOT NULL DEFAULT '',
+                anchor_json     TEXT NOT NULL DEFAULT '',
+                color           TEXT NOT NULL DEFAULT 'yellow'
+                    CHECK(
+                        color IN ('yellow', 'green', 'blue', 'pink', 'purple', 'orange')
+                        OR color GLOB '#[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]'
+                    ),
+                note            TEXT NOT NULL DEFAULT '',
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (briefing_id) REFERENCES briefings(id) ON DELETE CASCADE
+             );
+             INSERT INTO briefing_annotations_v2 (
+                id, briefing_id, kind, selected_text, anchor_json, color, note,
+                created_at, updated_at
+             )
+             SELECT id, briefing_id, kind, selected_text, anchor_json, color, note,
+                    created_at, updated_at
+             FROM briefing_annotations;
+             DROP TABLE briefing_annotations;
+             ALTER TABLE briefing_annotations_v2 RENAME TO briefing_annotations;
+             CREATE INDEX idx_briefing_annotations_briefing
+                ON briefing_annotations(briefing_id, updated_at DESC, id DESC);",
+        )
+        .map_err(|error| format!("迁移简报颜色失败: {}", error));
+    finish_migration(conn, result, "简报颜色")
 }
 
 fn current_schema_version(conn: &Connection) -> Result<i64, String> {
@@ -83,7 +165,21 @@ pub fn needs_migration(conn: &Connection) -> Result<bool, String> {
             |row| row.get::<_, i64>(0),
         )
         .map_err(|e| format!("读取简报表结构失败: {}", e))?;
-    Ok(briefing_scope_columns != 2)
+    if briefing_scope_columns != 2 {
+        return Ok(true);
+    }
+    let briefing_annotations_exists = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'briefing_annotations'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("读取简报标注表结构失败: {}", e))?;
+    if briefing_annotations_exists != 1 {
+        return Ok(true);
+    }
+    Ok(!briefing_annotation_colors_are_current(conn)?)
 }
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -96,6 +192,18 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     let version = current_schema_version(conn)?;
     let rebuild_entries = entries_feed_id_is_not_null(conn)?;
     ensure_briefing_scope_columns(conn)?;
+    ensure_briefing_annotation_table(conn)?;
+    ensure_briefing_annotation_color_schema(conn)?;
+    if version >= 13 && !rebuild_entries {
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('schema_version', ?1)",
+            [PUBMED_SCHEMA_VERSION.to_string()],
+        )
+        .map_err(|e| format!("保存数据库版本失败: {}", e))?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(|e| format!("启用外键失败: {}", e))?;
+        return Ok(());
+    }
     if current_schema_version(conn)? == 5 && !rebuild_entries {
         conn.execute_batch(
             "BEGIN IMMEDIATE;
@@ -1300,5 +1408,77 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             PUBMED_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn schema_fourteen_preserves_annotations_and_accepts_custom_colors() {
+        let conn = Connection::open_in_memory().expect("open database");
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE entries (id INTEGER PRIMARY KEY, feed_id INTEGER);
+             CREATE TABLE briefings (
+                id INTEGER PRIMARY KEY,
+                period TEXT NOT NULL,
+                title TEXT NOT NULL,
+                lead_in TEXT NOT NULL,
+                content TEXT NOT NULL,
+                article_count INTEGER NOT NULL,
+                feed_count INTEGER NOT NULL,
+                generated_at TEXT NOT NULL,
+                source_scope TEXT NOT NULL DEFAULT 'all',
+                source_name TEXT NOT NULL DEFAULT '全部来源'
+             );
+             CREATE TABLE briefing_annotations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                briefing_id INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('note', 'highlight')),
+                selected_text TEXT NOT NULL DEFAULT '',
+                anchor_json TEXT NOT NULL DEFAULT '',
+                color TEXT NOT NULL DEFAULT 'yellow'
+                    CHECK(color IN ('yellow', 'green', 'blue', 'pink')),
+                note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (briefing_id) REFERENCES briefings(id) ON DELETE CASCADE
+             );
+             INSERT INTO settings (key, value) VALUES ('schema_version', '14');
+             INSERT INTO briefings VALUES
+                (7, '本周', '测试简报', '', '', 1, 1, datetime('now'), 'all', '全部来源');
+             INSERT INTO briefing_annotations
+                (id, briefing_id, kind, selected_text, color, note)
+             VALUES (9, 7, 'highlight', '保留内容', 'blue', '保留备注');",
+        )
+        .expect("seed schema fourteen");
+
+        migrate(&conn).expect("migrate custom briefing colors");
+
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            PUBMED_SCHEMA_VERSION
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT selected_text, color, note FROM briefing_annotations WHERE id = 9",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?
+                )),
+            )
+            .unwrap(),
+            (
+                "保留内容".to_string(),
+                "blue".to_string(),
+                "保留备注".to_string()
+            )
+        );
+        conn.execute(
+            "INSERT INTO briefing_annotations (briefing_id, kind, selected_text, color)
+             VALUES (7, 'highlight', '自定义颜色', '#58a6a6')",
+            [],
+        )
+        .expect("insert custom color");
     }
 }

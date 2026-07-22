@@ -138,7 +138,7 @@ test('PMC gallery filters journal metrics before fetching figures', () => {
   assert.match(service, /pub impact_factor: Option<String>/);
   assert.match(service, /compare_article_quality/);
   assert.match(searchService, /publication_year, impact_factor, jcr_quartile, cas_partition/);
-  assert.match(migrations, /const PUBMED_SCHEMA_VERSION: i64 = 13/);
+  assert.match(migrations, /const PUBMED_SCHEMA_VERSION: i64 = 15/);
   assert.match(migrations, /ensure_pmc_gallery_figure_metric_columns/);
 });
 

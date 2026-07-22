@@ -47,6 +47,43 @@ const DOMPurify = globalThis.DOMPurify;
 const MARKDOWN_LINK_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
 const MARKDOWN_IMAGE_PROTOCOLS = new Set(['http:', 'https:', 'data:']);
 const markdownRenderer = createMarkdownRenderer();
+const READING_HIGHLIGHT_STORAGE_KEY = 'reading-highlights-v1';
+const READING_HIGHLIGHT_LAST_COLOR_KEY = 'reading-highlight-last-color-v1';
+const READING_HIGHLIGHT_COLOR_MEANINGS_KEY = 'reading-highlight-color-meanings-v1';
+const READING_HIGHLIGHT_PALETTE_KEY = 'reading-highlight-palette-v1';
+const READING_HIGHLIGHT_SCOPE_SELECTOR = '[data-highlight-scope]';
+const READING_HIGHLIGHT_MARK_CLASS = 'reading-highlight-mark';
+const READING_SELECT_TEXT_CLASS = 'reading-select-text';
+const READING_ANNOTATION_TOOLS = [
+  { id: 'highlight', label: '高亮' },
+  { id: 'underline', label: '下划线' },
+  { id: 'note', label: '便签' },
+  { id: 'box', label: '框选' },
+  { id: 'pen', label: '画笔' },
+];
+const READING_ANNOTATION_TOOL_IDS = new Set(READING_ANNOTATION_TOOLS.map(tool => tool.id));
+const READING_HIGHLIGHT_COLORS = [
+  { id: 'yellow', label: '黄', value: '#f3d45e' },
+  { id: 'green', label: '绿', value: '#73c78d' },
+  { id: 'blue', label: '蓝', value: '#76aef2' },
+  { id: 'pink', label: '粉', value: '#ee9ab7' },
+  { id: 'purple', label: '紫', value: '#b79af0' },
+  { id: 'orange', label: '橙', value: '#efa25f' },
+];
+const READING_HIGHLIGHT_COLOR_VALUES = Object.fromEntries(
+  READING_HIGHLIGHT_COLORS.map(color => [color.id, color.value]),
+);
+const READING_HIGHLIGHT_COLOR_IDS = new Set(READING_HIGHLIGHT_COLORS.map(color => color.id));
+const READING_ANNOTATION_TYPE_LABELS = {
+  highlight: '高亮',
+  underline: '下划线',
+  note: '便签',
+  box: '框选',
+  pen: '画笔',
+};
+let readingHighlightPopover = null;
+let pendingReadingHighlight = null;
+let readingHighlightMeaningTooltip = null;
 
 function createMarkdownRenderer() {
   if (typeof markdownitFactory !== 'function') return null;
@@ -195,6 +232,1496 @@ function decorateBriefingReferenceLists(root) {
   });
 }
 
+function clampNumber(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function elementFromNode(node) {
+  if (!node) return null;
+  return node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+}
+
+function normalizeReadingHighlightColor(color) {
+  const value = String(color || '').trim().toLowerCase();
+  if (READING_HIGHLIGHT_COLOR_IDS.has(value)) return value;
+  if (/^#[0-9a-f]{6}$/u.test(value)) return value;
+  return 'yellow';
+}
+
+function parseReadingHighlightHexColor(value) {
+  const raw = String(value || '').trim();
+  const color = raw.startsWith('#') ? raw : `#${raw}`;
+  return /^#[0-9a-f]{6}$/iu.test(color) ? color.toLowerCase() : null;
+}
+
+function readingHighlightColorValue(color) {
+  const normalized = normalizeReadingHighlightColor(color);
+  return READING_HIGHLIGHT_COLOR_VALUES[normalized] || normalized;
+}
+
+function readReadingHighlightColorMeanings() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(READING_HIGHLIGHT_COLOR_MEANINGS_KEY) || '{}');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed)
+      .map(([color, meaning]) => [normalizeReadingHighlightColor(color), String(meaning || '').trim().slice(0, 30)])
+      .filter(([, meaning]) => meaning));
+  } catch {
+    return {};
+  }
+}
+
+function saveReadingHighlightColorMeanings(meanings) {
+  const normalized = Object.fromEntries(Object.entries(meanings || {})
+    .map(([color, meaning]) => [normalizeReadingHighlightColor(color), String(meaning || '').trim().slice(0, 30)])
+    .filter(([, meaning]) => meaning));
+  try {
+    localStorage.setItem(READING_HIGHLIGHT_COLOR_MEANINGS_KEY, JSON.stringify(normalized));
+  } catch (error) {
+    console.warn('保存高亮颜色含义失败:', error);
+  }
+  refreshReadingHighlightColorMeanings();
+}
+
+function readingHighlightBaseColorName(color) {
+  const normalized = normalizeReadingHighlightColor(color);
+  const preset = READING_HIGHLIGHT_COLORS.find(item => item.id === normalized);
+  return preset ? `${preset.label}色` : normalized.toUpperCase();
+}
+
+function readingHighlightColorMeaning(color) {
+  return readReadingHighlightColorMeanings()[normalizeReadingHighlightColor(color)] || '';
+}
+
+function readingHighlightColorDisplayName(color) {
+  return readingHighlightColorMeaning(color) || readingHighlightBaseColorName(color);
+}
+
+function usedCustomReadingHighlightColors() {
+  const colors = new Set();
+  Object.values(readReadingHighlightStore()).forEach(records => {
+    if (!Array.isArray(records)) return;
+    records.forEach(record => {
+      const color = normalizeReadingHighlightColor(record?.color);
+      if (!READING_HIGHLIGHT_COLOR_IDS.has(color)) colors.add(color);
+    });
+  });
+  briefingLibraryAnnotations.forEach(annotation => {
+    const color = normalizeReadingHighlightColor(annotation?.color);
+    if (!READING_HIGHLIGHT_COLOR_IDS.has(color)) colors.add(color);
+  });
+  return [...colors].sort();
+}
+
+function readReadingHighlightPalette() {
+  const defaults = READING_HIGHLIGHT_COLORS.map(color => color.id);
+  let parsed = null;
+  try {
+    const raw = localStorage.getItem(READING_HIGHLIGHT_PALETTE_KEY);
+    parsed = raw === null ? null : JSON.parse(raw);
+  } catch {
+    parsed = null;
+  }
+  const requested = Array.isArray(parsed)
+    ? [...parsed, ...usedCustomReadingHighlightColors()]
+    : [...defaults, ...usedCustomReadingHighlightColors()];
+  const palette = [];
+  requested.forEach(color => {
+    const normalized = normalizeReadingHighlightColor(color);
+    if (!palette.includes(normalized)) palette.push(normalized);
+  });
+  defaults.forEach(color => {
+    if (!palette.includes(color)) palette.push(color);
+  });
+  return palette;
+}
+
+function saveReadingHighlightPalette(colors) {
+  const palette = [];
+  (colors || []).forEach(color => {
+    const normalized = normalizeReadingHighlightColor(color);
+    if (!palette.includes(normalized)) palette.push(normalized);
+  });
+  READING_HIGHLIGHT_COLORS.forEach(color => {
+    if (!palette.includes(color.id)) palette.push(color.id);
+  });
+  try {
+    localStorage.setItem(READING_HIGHLIGHT_PALETTE_KEY, JSON.stringify(palette));
+  } catch (error) {
+    console.warn('保存高亮调色板失败:', error);
+  }
+  refreshReadingHighlightPalette();
+}
+
+function ensureReadingHighlightPaletteColor(color) {
+  const normalized = normalizeReadingHighlightColor(color);
+  const palette = readReadingHighlightPalette();
+  if (palette.includes(normalized)) return;
+  saveReadingHighlightPalette([...palette, normalized]);
+}
+
+function readingHighlightPaletteDefinition(color) {
+  const normalized = normalizeReadingHighlightColor(color);
+  const preset = READING_HIGHLIGHT_COLORS.find(item => item.id === normalized);
+  return preset
+    ? { ...preset, custom: false }
+    : { id: normalized, label: normalized.toUpperCase(), value: normalized, custom: true };
+}
+
+function readingHighlightColorClass(color) {
+  const normalized = normalizeReadingHighlightColor(color);
+  return READING_HIGHLIGHT_COLOR_IDS.has(normalized)
+    ? `reading-highlight-${normalized}`
+    : 'reading-highlight-custom';
+}
+
+function normalizeReadingAnnotationType(type) {
+  const value = String(type || '').trim().toLowerCase();
+  return READING_ANNOTATION_TOOL_IDS.has(value) ? value : 'highlight';
+}
+
+function readingAnnotationTypeClass(type) {
+  return `reading-annotation-${normalizeReadingAnnotationType(type)}`;
+}
+
+function createReadingHighlightMark(color, id, type = 'highlight', note = '') {
+  const normalized = normalizeReadingHighlightColor(color);
+  const normalizedType = normalizeReadingAnnotationType(type);
+  const mark = document.createElement('mark');
+  mark.className = `${READING_HIGHLIGHT_MARK_CLASS} ${readingHighlightColorClass(normalized)} ${readingAnnotationTypeClass(normalizedType)}`;
+  mark.dataset.highlightId = id || '';
+  mark.dataset.highlightColor = normalized;
+  mark.dataset.annotationType = normalizedType;
+  const meaning = readingHighlightColorMeaning(normalized);
+  if (String(note || '').trim()) {
+    mark.dataset.annotationNote = String(note || '').trim();
+  }
+  const accessibleLabel = [meaning, String(note || '').trim()].filter(Boolean).join('。');
+  if (accessibleLabel) mark.setAttribute('aria-label', accessibleLabel);
+  mark.style.setProperty('--reading-highlight-color', readingHighlightColorValue(normalized));
+  return mark;
+}
+
+function readReadingHighlightStore() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(READING_HIGHLIGHT_STORAGE_KEY) || '{}');
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeReadingHighlightStore(store) {
+  try {
+    localStorage.setItem(READING_HIGHLIGHT_STORAGE_KEY, JSON.stringify(store));
+    refreshAnnotationLibraryAfterStoreChange();
+  } catch (error) {
+    console.warn('保存高亮标记失败:', error);
+  }
+}
+
+function createReadingHighlightId() {
+  return `rh-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function unwrapRenderedReadingHighlights(root) {
+  const marks = [...root.querySelectorAll(
+    `.${READING_HIGHLIGHT_MARK_CLASS}:not([data-briefing-annotation-id])`,
+  )];
+  marks.forEach(mark => {
+    const parent = mark.parentNode;
+    if (!parent) return;
+    while (mark.firstChild) parent.insertBefore(mark.firstChild, mark);
+    mark.remove();
+    parent.normalize();
+  });
+}
+
+function readableTextNodes(root) {
+  const nodes = [];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue) return NodeFilter.FILTER_REJECT;
+      const parent = node.parentElement;
+      if (!parent || parent.closest('script, style, textarea, input, select, button, .reading-highlight-popover')) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  return nodes;
+}
+
+function wrapReadingSelectableText(root) {
+  const nodes = readableTextNodes(root).filter(node => {
+    if (!node.nodeValue?.trim()) return false;
+    const parent = node.parentElement;
+    return parent && !parent.closest(`.${READING_SELECT_TEXT_CLASS}`);
+  });
+  nodes.forEach(node => {
+    const parent = node.parentNode;
+    if (!parent) return;
+    const span = document.createElement('span');
+    span.className = READING_SELECT_TEXT_CLASS;
+    parent.insertBefore(span, node);
+    span.appendChild(node);
+  });
+}
+
+function unwrapReadingSelectableText(root) {
+  root.querySelectorAll(`.${READING_SELECT_TEXT_CLASS}`).forEach(span => {
+    const parent = span.parentNode;
+    if (!parent) return;
+    while (span.firstChild) parent.insertBefore(span.firstChild, span);
+    span.remove();
+    parent.normalize();
+  });
+}
+
+function textOffsetsForRange(root, range) {
+  try {
+    const before = document.createRange();
+    before.selectNodeContents(root);
+    before.setEnd(range.startContainer, range.startOffset);
+    const start = before.toString().length;
+    before.setEnd(range.endContainer, range.endOffset);
+    const end = before.toString().length;
+    before.detach?.();
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+    return { start, end };
+  } catch {
+    return null;
+  }
+}
+
+function rangeForTextOffsets(root, start, end) {
+  const range = document.createRange();
+  let offset = 0;
+  let hasStart = false;
+  for (const node of readableTextNodes(root)) {
+    const text = node.nodeValue || '';
+    const nodeStart = offset;
+    const nodeEnd = offset + text.length;
+    if (!hasStart && start >= nodeStart && start <= nodeEnd) {
+      range.setStart(node, Math.min(text.length, Math.max(0, start - nodeStart)));
+      hasStart = true;
+    }
+    if (hasStart && end >= nodeStart && end <= nodeEnd) {
+      range.setEnd(node, Math.min(text.length, Math.max(0, end - nodeStart)));
+      return range;
+    }
+    offset = nodeEnd;
+  }
+  range.detach?.();
+  return null;
+}
+
+function trimReadingSelectionRange(root, range) {
+  const offsets = textOffsetsForRange(root, range);
+  if (!offsets) return null;
+  const selectedText = range.toString();
+  const leadingWhitespace = selectedText.match(/^\s*/u)?.[0].length || 0;
+  const trailingWhitespace = selectedText.match(/\s*$/u)?.[0].length || 0;
+  const start = offsets.start + leadingWhitespace;
+  const end = offsets.end - trailingWhitespace;
+  if (end <= start) return null;
+  return rangeForTextOffsets(root, start, end);
+}
+
+function occurrenceIndexForText(fullText, selectedText, startOffset) {
+  if (!selectedText) return 0;
+  let occurrence = 0;
+  let index = fullText.indexOf(selectedText);
+  while (index >= 0 && index < startOffset) {
+    occurrence += 1;
+    index = fullText.indexOf(selectedText, index + Math.max(1, selectedText.length));
+  }
+  return occurrence;
+}
+
+function nthOccurrenceIndex(fullText, selectedText, occurrence) {
+  if (!selectedText) return -1;
+  let index = -1;
+  let from = 0;
+  const target = Math.max(0, Number(occurrence) || 0);
+  for (let count = 0; count <= target; count += 1) {
+    index = fullText.indexOf(selectedText, from);
+    if (index < 0) return -1;
+    from = index + Math.max(1, selectedText.length);
+  }
+  return index;
+}
+
+function rangesOverlap(a, b) {
+  return a.start < b.end && b.start < a.end;
+}
+
+function resolveReadingHighlightRange(fullText, record) {
+  const text = String(record?.text || '');
+  if (!text) return null;
+  const start = Number(record.start);
+  const end = Number(record.end);
+  if (
+    Number.isInteger(start)
+    && Number.isInteger(end)
+    && start >= 0
+    && end > start
+    && fullText.slice(start, end) === text
+  ) {
+    return { start, end };
+  }
+
+  const fallbackStart = nthOccurrenceIndex(fullText, text, record.occurrence);
+  if (fallbackStart < 0) return null;
+  return { start: fallbackStart, end: fallbackStart + text.length };
+}
+
+function applyReadingHighlightByOffsets(root, start, end, color, id, type = 'highlight', note = '') {
+  const segments = [];
+  let offset = 0;
+  readableTextNodes(root).forEach(node => {
+    const text = node.nodeValue || '';
+    const nodeStart = offset;
+    const nodeEnd = offset + text.length;
+    if (nodeEnd > start && nodeStart < end) {
+      segments.push({
+        node,
+        start: Math.max(0, start - nodeStart),
+        end: Math.min(text.length, end - nodeStart),
+      });
+    }
+    offset = nodeEnd;
+  });
+
+  segments.forEach(({ node, start: segmentStart, end: segmentEnd }) => {
+    if (!node.parentNode || segmentEnd <= segmentStart) return;
+    let target = node;
+    if (segmentStart > 0) target = target.splitText(segmentStart);
+    const length = segmentEnd - segmentStart;
+    if (length < target.nodeValue.length) target.splitText(length);
+    const mark = createReadingHighlightMark(color, id, type, note);
+    target.parentNode.insertBefore(mark, target);
+    mark.appendChild(target);
+  });
+}
+
+function restoreReadingHighlights(root) {
+  if (!root?.dataset?.highlightScope) return;
+  const scopeId = root.dataset.highlightScope;
+  const store = readReadingHighlightStore();
+  const records = Array.isArray(store[scopeId]) ? store[scopeId] : [];
+  unwrapRenderedReadingHighlights(root);
+  const fullText = root.textContent || '';
+  const applied = [];
+  records
+    .map(record => ({ record, range: resolveReadingHighlightRange(fullText, record) }))
+    .filter(item => item.range)
+    .sort((a, b) => b.range.start - a.range.start)
+    .forEach(({ record, range }) => {
+      if (applied.some(existing => rangesOverlap(existing, range))) return;
+      try {
+        applyReadingHighlightByOffsets(
+          root,
+          range.start,
+          range.end,
+          record.color,
+          record.id || createReadingHighlightId(),
+          record.type || 'highlight',
+          record.note || '',
+        );
+        applied.push(range);
+      } catch (error) {
+        console.warn('恢复高亮标记失败:', error);
+      }
+    });
+}
+
+function installReadingHighlightScope(root, scopeId) {
+  if (!root || !scopeId) return;
+  root.dataset.highlightScope = scopeId;
+  root.classList.add('reading-highlight-scope');
+  wrapReadingSelectableText(root);
+  restoreReadingHighlights(root);
+}
+
+function textScopeFingerprint(text) {
+  const value = String(text || '').trim().replace(/\s+/g, ' ').slice(0, 180);
+  let hash = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    hash = ((hash << 5) - hash + value.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash).toString(36) || '0';
+}
+
+function readableScopeClassKey(element) {
+  const classes = String(element?.className || '')
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter(name => ![
+      'reading-highlight-scope',
+      READING_SELECT_TEXT_CLASS,
+      READING_HIGHLIGHT_MARK_CLASS,
+    ].includes(name))
+    .slice(0, 3);
+  return classes.join('.') || element?.tagName?.toLowerCase() || 'text';
+}
+
+function installGlobalTextHighlightScope(root, scopeId) {
+  if (!root || !scopeId || !String(root.textContent || '').trim()) return null;
+  installReadingHighlightScope(root, scopeId);
+  return root;
+}
+
+function stableGlobalHighlightScopeId(root) {
+  if (!root) return '';
+  if (root.dataset?.globalHighlightScope) return root.dataset.globalHighlightScope;
+  const key = readableScopeClassKey(root);
+  const entryId = root.closest('[data-entry-id]')?.dataset?.entryId;
+  if (entryId) return `entry:${entryId}:global:${key}:${textScopeFingerprint(root.textContent)}`;
+  const briefingId = root.closest('[data-briefing-id]')?.dataset?.briefingId;
+  if (briefingId) return `briefing:${briefingId}:global:${key}:${textScopeFingerprint(root.textContent)}`;
+  if (root.id) return `dom:${root.id}:${textScopeFingerprint(root.textContent)}`;
+  const owner = root.closest('[id]');
+  if (owner?.id) return `dom:${owner.id}:${key}:${textScopeFingerprint(root.textContent)}`;
+  return `global:${mode}:${key}:${textScopeFingerprint(root.textContent)}`;
+}
+
+function installAdHocGlobalHighlightScope(root) {
+  const scopeId = stableGlobalHighlightScopeId(root);
+  if (!scopeId) return null;
+  root.dataset.globalHighlightScope = scopeId;
+  return installGlobalTextHighlightScope(root, scopeId);
+}
+
+function globalReadableSelectionRoot(selection) {
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return null;
+  const anchor = elementFromNode(selection.anchorNode);
+  const focus = elementFromNode(selection.focusNode);
+  if (!anchor || !focus) return null;
+  if (anchor.closest('textarea, input, select, button, [contenteditable="true"]')) return null;
+  if (anchor.closest('[data-window-drag-region], .toolbar, .sidebar, .entry-list, .briefing-list')) return null;
+  if (focus.closest('[data-window-drag-region], .toolbar, .sidebar, .entry-list, .briefing-list')) return null;
+  const selector = [
+    '.detail-title',
+    '.detail-journal',
+    '.detail-affiliation',
+    '.detail-meta-author',
+    '.detail-meta-date',
+    '.briefing-detail-title',
+    '.briefing-leadin-full',
+    '.paper-graph-node-title',
+    '.paper-graph-node-meta',
+    '.paper-graph-node-abstract',
+    '.paper-chat-message-body',
+    '.detail-summary-content',
+    '.reading-note-card-preview',
+    '.briefing-md',
+    'blockquote',
+  ].join(',');
+  const root = anchor.closest(selector);
+  if (!root || !root.contains(focus)) return null;
+  if (!String(root.textContent || '').trim()) return null;
+  return root;
+}
+
+function clearReadingHighlightScope(root) {
+  if (!root?.dataset?.highlightScope) return;
+  unwrapRenderedReadingHighlights(root);
+  unwrapReadingSelectableText(root);
+  delete root.dataset.highlightScope;
+  root.classList.remove('reading-highlight-scope');
+}
+
+function selectionReadingHighlightScope(selection) {
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return null;
+  const anchor = elementFromNode(selection.anchorNode);
+  const focus = elementFromNode(selection.focusNode);
+  if (!anchor || !focus) return null;
+  if (anchor.closest('textarea, input, select, button, [contenteditable="true"]')) return null;
+  const anchorScope = anchor.closest(READING_HIGHLIGHT_SCOPE_SELECTOR);
+  const focusScope = focus.closest(READING_HIGHLIGHT_SCOPE_SELECTOR);
+  if (anchorScope && anchorScope === focusScope) return anchorScope;
+  return installAdHocGlobalHighlightScope(globalReadableSelectionRoot(selection));
+}
+
+function ensureReadingHighlightPopover() {
+  if (readingHighlightPopover) return readingHighlightPopover;
+  const popover = document.createElement('div');
+  popover.className = 'reading-highlight-popover hidden';
+  popover.setAttribute('role', 'toolbar');
+  popover.setAttribute('aria-label', '文本标注工具');
+  popover.innerHTML = `
+    <div class="reading-annotation-tools" role="group" aria-label="标注类型">
+      ${READING_ANNOTATION_TOOLS.map(tool => `
+        <button
+          type="button"
+          class="reading-annotation-tool reading-annotation-tool-${tool.id}"
+          data-highlight-tool="${tool.id}"
+          title="${tool.label}"
+          aria-label="${tool.label}"
+        >
+          ${readingAnnotationToolIcon(tool.id)}
+        </button>
+      `).join('')}
+    </div>
+    <div class="reading-highlight-colors" role="group" aria-label="高亮颜色">
+    ${readingHighlightColorDefinitions().map(color => `
+      <button
+        type="button"
+        class="reading-highlight-swatch"
+        data-highlight-color="${color.id}"
+        style="--swatch-color: ${color.value}"
+        title="${escapeHtml(readingHighlightColorDisplayName(color.id))}"
+        aria-label="${escapeHtml(readingHighlightColorDisplayName(color.id))}"
+      ></button>
+    `).join('')}
+    <span class="reading-highlight-custom-controls">
+      <label class="reading-highlight-custom-picker" title="选择自定义高亮颜色">
+        <input type="color" data-highlight-custom-picker aria-label="选择自定义高亮颜色" />
+      </label>
+      <input
+        type="text"
+        class="reading-highlight-hex-input"
+        data-highlight-hex-input
+        maxlength="7"
+        placeholder="#RRGGBB"
+        autocomplete="off"
+        spellcheck="false"
+        aria-label="输入十六进制高亮颜色"
+      />
+      <button
+        type="button"
+        class="reading-highlight-hex-apply"
+        data-highlight-hex-apply
+        title="应用自定义颜色"
+        aria-label="应用自定义颜色"
+      >✓</button>
+    </span>
+    </div>
+    <div class="reading-highlight-note-editor" data-reading-note-editor>
+      <textarea
+        class="reading-highlight-note-input"
+        data-reading-note-input
+        rows="2"
+        placeholder="添加便签"
+        aria-label="便签内容"
+      ></textarea>
+      <div class="reading-highlight-note-actions">
+        <button type="button" class="reading-highlight-note-cancel" data-reading-note-cancel>取消</button>
+        <button type="button" class="reading-highlight-note-save" data-reading-note-save>保存便签</button>
+      </div>
+    </div>
+    <button
+      type="button"
+      class="reading-highlight-delete"
+      data-delete-reading-highlight
+      title="删除标注"
+      aria-label="删除标注"
+    >
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v5M14 11v5" />
+      </svg>
+    </button>
+  `;
+  popover.addEventListener('mousedown', event => {
+    const target = elementFromNode(event.target);
+    if (!target?.matches('input')) event.preventDefault();
+  });
+  popover.addEventListener('click', event => {
+    if (event.target.closest('[data-reading-note-save]')) {
+      savePendingReadingNote();
+      return;
+    }
+    if (event.target.closest('[data-reading-note-cancel]')) {
+      hideReadingHighlightPopover();
+      return;
+    }
+    if (event.target.closest('[data-delete-reading-highlight]')) {
+      deletePendingReadingHighlight();
+      return;
+    }
+    if (event.target.closest('[data-highlight-hex-apply]')) {
+      applyReadingHighlightHexInput(popover);
+      return;
+    }
+    const toolButton = event.target.closest('[data-highlight-tool]');
+    if (toolButton) {
+      if (toolButton.dataset.highlightTool === 'note') {
+        openPendingReadingNoteEditor();
+        return;
+      }
+      applyPendingReadingAnnotation({
+        type: toolButton.dataset.highlightTool,
+        color: localStorage.getItem(READING_HIGHLIGHT_LAST_COLOR_KEY) || 'yellow',
+      });
+      return;
+    }
+    const button = event.target.closest('[data-highlight-color]');
+    if (!button) return;
+    applyPendingReadingHighlight(button.dataset.highlightColor);
+  });
+  popover.querySelector('[data-highlight-custom-picker]')?.addEventListener('change', event => {
+    const color = parseReadingHighlightHexColor(event.currentTarget.value);
+    syncReadingHighlightCustomColorControls(popover, color);
+    if (color) applyPendingReadingHighlight(color);
+  });
+  popover.querySelector('[data-highlight-hex-input]')?.addEventListener('input', event => {
+    const color = parseReadingHighlightHexColor(event.currentTarget.value);
+    event.currentTarget.removeAttribute('aria-invalid');
+    if (color) {
+      const picker = popover.querySelector('[data-highlight-custom-picker]');
+      if (picker) picker.value = color;
+    }
+  });
+  popover.querySelector('[data-highlight-hex-input]')?.addEventListener('keydown', event => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    applyReadingHighlightHexInput(popover);
+  });
+  document.body.appendChild(popover);
+  readingHighlightPopover = popover;
+  return popover;
+}
+
+function syncReadingHighlightCustomColorControls(popover, color) {
+  const normalized = parseReadingHighlightHexColor(color) || '#f3d45e';
+  const picker = popover?.querySelector('[data-highlight-custom-picker]');
+  const hexInput = popover?.querySelector('[data-highlight-hex-input]');
+  if (picker) picker.value = normalized;
+  if (hexInput) {
+    hexInput.value = normalized.toUpperCase();
+    hexInput.removeAttribute('aria-invalid');
+  }
+}
+
+function applyReadingHighlightHexInput(popover) {
+  const input = popover?.querySelector('[data-highlight-hex-input]');
+  const color = parseReadingHighlightHexColor(input?.value);
+  if (!color) {
+    input?.setAttribute('aria-invalid', 'true');
+    input?.focus();
+    return;
+  }
+  syncReadingHighlightCustomColorControls(popover, color);
+  applyPendingReadingHighlight(color);
+}
+
+function readingAnnotationToolIcon(type) {
+  if (type === 'highlight') {
+    return '<span class="reading-tool-a reading-tool-a-box">A</span>';
+  }
+  if (type === 'underline') {
+    return '<span class="reading-tool-a reading-tool-a-underline">A</span>';
+  }
+  if (type === 'note') {
+    return '<span class="reading-tool-note" aria-hidden="true"></span>';
+  }
+  if (type === 'box') {
+    return '<span class="reading-tool-box" aria-hidden="true"></span>';
+  }
+  return '<span class="reading-tool-pen" aria-hidden="true"></span>';
+}
+
+function hideReadingHighlightPopover() {
+  pendingReadingHighlight = null;
+  readingHighlightPopover?.classList.remove('is-managing-existing', 'is-adding-note');
+  const noteInput = readingHighlightPopover?.querySelector('[data-reading-note-input]');
+  if (noteInput) noteInput.value = '';
+  readingHighlightPopover?.classList.add('hidden');
+}
+
+function positionReadingHighlightPopover(popover, rect) {
+  popover.classList.remove('hidden');
+  const width = popover.offsetWidth || 220;
+  const height = popover.offsetHeight || 38;
+  const left = clampNumber(rect.left + rect.width / 2 - width / 2, 8, window.innerWidth - width - 8);
+  const topCandidate = rect.top - height - 10;
+  const top = topCandidate >= 8 ? topCandidate : rect.bottom + 10;
+  popover.style.left = `${Math.round(left + window.scrollX)}px`;
+  popover.style.top = `${Math.round(top + window.scrollY)}px`;
+  syncReadingHighlightCustomColorControls(
+    popover,
+    readingHighlightColorValue(localStorage.getItem(READING_HIGHLIGHT_LAST_COLOR_KEY) || 'yellow'),
+  );
+}
+
+function showReadingHighlightPopoverForSelection() {
+  const selection = window.getSelection();
+  const text = selection?.toString() || '';
+  if (!text.trim()) {
+    hideReadingHighlightPopover();
+    return;
+  }
+  const scope = selectionReadingHighlightScope(selection);
+  if (!scope) {
+    hideReadingHighlightPopover();
+    return;
+  }
+
+  const range = trimReadingSelectionRange(scope, selection.getRangeAt(0)) || selection.getRangeAt(0).cloneRange();
+  selection.removeAllRanges();
+  selection.addRange(range.cloneRange());
+  const rects = [...range.getClientRects()].filter(rect => rect.width > 0 || rect.height > 0);
+  const rect = rects[0] || range.getBoundingClientRect();
+  if (!rect || (!rect.width && !rect.height)) return;
+  pendingReadingHighlight = { scope, range: range.cloneRange() };
+  const popover = ensureReadingHighlightPopover();
+  popover.classList.remove('is-managing-existing', 'is-adding-note');
+  positionReadingHighlightPopover(popover, rect);
+}
+
+function showReadingHighlightPopoverForMark(mark) {
+  const scope = mark?.closest(READING_HIGHLIGHT_SCOPE_SELECTOR);
+  const highlightId = mark?.dataset?.highlightId;
+  const rect = mark?.getBoundingClientRect();
+  if (!scope || !highlightId || !rect || (!rect.width && !rect.height)) return;
+  window.getSelection()?.removeAllRanges();
+  pendingReadingHighlight = {
+    scope,
+    highlightId,
+    briefingAnnotationId: Number(mark.dataset.briefingAnnotationId) || null,
+  };
+  const popover = ensureReadingHighlightPopover();
+  popover.classList.remove('is-adding-note');
+  popover.classList.add('is-managing-existing');
+  positionReadingHighlightPopover(popover, rect);
+}
+
+function openPendingReadingNoteEditor() {
+  const pending = pendingReadingHighlight;
+  if (!pending?.scope || !pending.range) return;
+  const input = ensureReadingHighlightPopover().querySelector('[data-reading-note-input]');
+  if (!input) return;
+  const popover = readingHighlightPopover;
+  popover.classList.remove('is-managing-existing');
+  popover.classList.add('is-adding-note');
+  input.value = '';
+  positionReadingHighlightPopover(popover, pending.range.getBoundingClientRect());
+  requestAnimationFrame(() => input.focus());
+}
+
+function savePendingReadingNote() {
+  const input = readingHighlightPopover?.querySelector('[data-reading-note-input]');
+  const note = input?.value.trim() || '';
+  if (!note) {
+    input?.focus();
+    return;
+  }
+  applyPendingReadingAnnotation({
+    type: 'note',
+    color: localStorage.getItem(READING_HIGHLIGHT_LAST_COLOR_KEY) || 'yellow',
+    note,
+  });
+}
+
+async function deletePendingReadingHighlight() {
+  const pending = pendingReadingHighlight;
+  if (pending?.briefingAnnotationId) {
+    const annotationId = pending.briefingAnnotationId;
+    hideReadingHighlightPopover();
+    try {
+      await invoke('delete_briefing_annotation', { annotationId });
+      briefingLibraryAnnotations = briefingLibraryAnnotations
+        .filter(annotation => Number(annotation.id) !== annotationId);
+      if (selectedBriefingId) await loadBriefingAnnotations(selectedBriefingId);
+      refreshAnnotationLibraryAfterStoreChange();
+      setGlobalStatus('简报标注已删除', 'success');
+    } catch (error) {
+      setGlobalStatus('删除简报标注失败: ' + error, 'error');
+    }
+    return;
+  }
+  const scopeId = pending?.scope?.dataset?.highlightScope;
+  const highlightId = pending?.highlightId;
+  if (!scopeId || !highlightId) return;
+  const store = readReadingHighlightStore();
+  const previous = Array.isArray(store[scopeId]) ? store[scopeId] : [];
+  const remaining = previous.filter(record => record?.id !== highlightId);
+  if (remaining.length) store[scopeId] = remaining;
+  else delete store[scopeId];
+  writeReadingHighlightStore(store);
+  restoreReadingHighlights(pending.scope);
+  hideReadingHighlightPopover();
+}
+
+function applyPendingReadingHighlight(color) {
+  applyPendingReadingAnnotation({ type: 'highlight', color });
+}
+
+function briefingScopeIdFromHighlightScope(scopeId) {
+  const match = String(scopeId || '').match(/^briefing:(\d+):content$/u);
+  return match ? Number(match[1]) : null;
+}
+
+async function saveBriefingSelectionAnnotation({ briefingId, scope, range, selectedText, color, note }) {
+  const anchor = buildBriefingSelectionAnchor(scope, range);
+  if (!anchor) {
+    hideReadingHighlightPopover();
+    setGlobalStatus('无法识别当前高亮范围', 'error');
+    return;
+  }
+
+  window.getSelection()?.removeAllRanges();
+  hideReadingHighlightPopover();
+  setGlobalStatus('正在保存简报标注…', 'progress');
+  try {
+    await invoke('add_briefing_annotation', {
+      briefingId,
+      kind: 'highlight',
+      selectedText,
+      anchorJson: JSON.stringify(anchor),
+      color,
+      note,
+    });
+    if (selectedBriefingId === briefingId) {
+      await loadBriefingAnnotations(briefingId);
+    }
+    setGlobalStatus('简报标注已保存', 'success');
+  } catch (error) {
+    setGlobalStatus('保存简报标注失败: ' + error, 'error');
+  }
+}
+
+function applyPendingReadingAnnotation({ type = 'highlight', color = 'yellow', note = '' } = {}) {
+  const pending = pendingReadingHighlight;
+  if (!pending?.scope || !pending.range) return;
+  const scope = pending.scope;
+  const scopeId = scope.dataset.highlightScope;
+  const selectedText = pending.range.toString();
+  const offsets = textOffsetsForRange(scope, pending.range);
+  if (!scopeId || !selectedText.trim() || !offsets) {
+    hideReadingHighlightPopover();
+    return;
+  }
+
+  const fullText = scope.textContent || '';
+  const normalizedColor = normalizeReadingHighlightColor(color);
+  const normalizedType = normalizeReadingAnnotationType(type);
+  const normalizedNote = String(note || '').trim();
+  if (normalizedType === 'note' && !normalizedNote) return;
+  const briefingId = briefingScopeIdFromHighlightScope(scopeId);
+  if (briefingId && (normalizedType === 'highlight' || normalizedType === 'note')) {
+    try {
+      localStorage.setItem(READING_HIGHLIGHT_LAST_COLOR_KEY, normalizedColor);
+    } catch {}
+    void saveBriefingSelectionAnnotation({
+      briefingId,
+      scope,
+      range: pending.range.cloneRange(),
+      selectedText,
+      color: normalizedColor,
+      note: normalizedNote,
+    });
+    return;
+  }
+  const documentMetadata = readingHighlightDocumentMetadata(scopeId);
+  const nextRecord = {
+    id: createReadingHighlightId(),
+    type: normalizedType,
+    color: normalizedColor,
+    note: normalizedNote,
+    text: selectedText,
+    start: offsets.start,
+    end: offsets.end,
+    occurrence: occurrenceIndexForText(fullText, selectedText, offsets.start),
+    createdAt: new Date().toISOString(),
+    documentTitle: documentMetadata.title,
+    documentKind: documentMetadata.kind,
+  };
+  const store = readReadingHighlightStore();
+  const previous = Array.isArray(store[scopeId]) ? store[scopeId] : [];
+  store[scopeId] = [
+    ...previous.filter(record => {
+      const range = resolveReadingHighlightRange(fullText, record);
+      return !range || !rangesOverlap(range, nextRecord);
+    }),
+    nextRecord,
+  ];
+  writeReadingHighlightStore(store);
+  if (!READING_HIGHLIGHT_COLOR_IDS.has(normalizedColor)) {
+    ensureReadingHighlightPaletteColor(normalizedColor);
+  }
+  try {
+    localStorage.setItem(READING_HIGHLIGHT_LAST_COLOR_KEY, normalizedColor);
+  } catch {}
+  restoreReadingHighlights(scope);
+  window.getSelection()?.removeAllRanges();
+  hideReadingHighlightPopover();
+}
+
+function setupReadingHighlighter() {
+  document.addEventListener('pointerover', event => {
+    const mark = elementFromNode(event.target)?.closest(`.${READING_HIGHLIGHT_MARK_CLASS}`);
+    if (mark) showReadingHighlightMeaningTooltip(mark);
+  });
+  document.addEventListener('pointerout', event => {
+    const mark = elementFromNode(event.target)?.closest(`.${READING_HIGHLIGHT_MARK_CLASS}`);
+    if (!mark) return;
+    const relatedMark = elementFromNode(event.relatedTarget)?.closest?.(`.${READING_HIGHLIGHT_MARK_CLASS}`);
+    if (relatedMark?.dataset.highlightId === mark.dataset.highlightId) return;
+    hideReadingHighlightMeaningTooltip();
+  });
+  document.addEventListener('mouseup', event => {
+    const target = elementFromNode(event.target);
+    if (target?.closest('.reading-highlight-popover')) return;
+    const mark = target?.closest(`.${READING_HIGHLIGHT_MARK_CLASS}`);
+    const selection = window.getSelection();
+    if (mark && (!selection || selection.isCollapsed || !selection.toString().trim())) {
+      hideReadingHighlightMeaningTooltip();
+      showReadingHighlightPopoverForMark(mark);
+      return;
+    }
+    requestAnimationFrame(showReadingHighlightPopoverForSelection);
+  });
+  document.addEventListener('keyup', event => {
+    if (event.key === 'Escape') {
+      hideReadingHighlightPopover();
+      hideReadingHighlightMeaningTooltip();
+      return;
+    }
+    if (readingHighlightPopover?.contains(elementFromNode(event.target))) return;
+    if (
+      pendingReadingHighlight?.highlightId
+      && (event.key === 'Delete' || event.key === 'Backspace')
+      && !elementFromNode(event.target)?.closest('input, textarea, [contenteditable="true"]')
+    ) {
+      event.preventDefault();
+      deletePendingReadingHighlight();
+      return;
+    }
+    requestAnimationFrame(showReadingHighlightPopoverForSelection);
+  });
+  document.addEventListener('mousedown', event => {
+    if (readingHighlightPopover?.contains(elementFromNode(event.target))) return;
+    hideReadingHighlightPopover();
+    hideReadingHighlightMeaningTooltip();
+  });
+  window.addEventListener('resize', () => {
+    hideReadingHighlightPopover();
+    hideReadingHighlightMeaningTooltip();
+  });
+  document.addEventListener('scroll', () => {
+    hideReadingHighlightPopover();
+    hideReadingHighlightMeaningTooltip();
+  }, true);
+}
+
+function ensureReadingHighlightMeaningTooltip() {
+  if (readingHighlightMeaningTooltip) return readingHighlightMeaningTooltip;
+  const tooltip = document.createElement('div');
+  tooltip.className = 'reading-highlight-meaning-tooltip hidden';
+  tooltip.setAttribute('role', 'tooltip');
+  tooltip.innerHTML = `
+    <span class="reading-highlight-tooltip-swatch" aria-hidden="true"></span>
+    <span class="reading-highlight-tooltip-content">
+      <strong class="reading-highlight-tooltip-meaning"></strong>
+      <span class="reading-highlight-tooltip-note hidden"></span>
+    </span>`;
+  document.body.appendChild(tooltip);
+  readingHighlightMeaningTooltip = tooltip;
+  return tooltip;
+}
+
+function positionReadingHighlightMeaningTooltip(tooltip, rect) {
+  tooltip.classList.remove('hidden');
+  const width = tooltip.offsetWidth || 160;
+  const height = tooltip.offsetHeight || 34;
+  const left = clampNumber(rect.left + rect.width / 2 - width / 2, 8, window.innerWidth - width - 8);
+  const above = rect.top - height - 8;
+  const top = above >= 8 ? above : Math.min(window.innerHeight - height - 8, rect.bottom + 8);
+  tooltip.style.left = `${Math.round(left)}px`;
+  tooltip.style.top = `${Math.round(top)}px`;
+}
+
+function showReadingHighlightMeaningTooltip(mark) {
+  const color = normalizeReadingHighlightColor(mark?.dataset?.highlightColor);
+  const meaning = readingHighlightColorMeaning(color);
+  const note = mark?.dataset?.annotationNote || '';
+  if (!mark || (!meaning && !note)) {
+    hideReadingHighlightMeaningTooltip();
+    return;
+  }
+  const tooltip = ensureReadingHighlightMeaningTooltip();
+  tooltip.dataset.highlightId = mark.dataset.highlightId || '';
+  tooltip.style.setProperty('--tooltip-highlight-color', readingHighlightColorValue(color));
+  tooltip.querySelector('.reading-highlight-tooltip-meaning').textContent = meaning || readingHighlightBaseColorName(color);
+  const noteEl = tooltip.querySelector('.reading-highlight-tooltip-note');
+  noteEl.textContent = note;
+  noteEl.classList.toggle('hidden', !note);
+  positionReadingHighlightMeaningTooltip(tooltip, mark.getBoundingClientRect());
+}
+
+function hideReadingHighlightMeaningTooltip() {
+  if (!readingHighlightMeaningTooltip) return;
+  readingHighlightMeaningTooltip.classList.add('hidden');
+  delete readingHighlightMeaningTooltip.dataset.highlightId;
+}
+
+function readingHighlightDocumentMetadata(scopeId) {
+  const match = String(scopeId || '').match(/^(entry|briefing):(\d+):/u);
+  if (!match) return { kind: 'other', title: '' };
+  if (match[1] === 'entry') {
+    const entry = currentEntry?.id === Number(match[2]) ? currentEntry : findEntryById(Number(match[2]));
+    return {
+      kind: 'entry',
+      title: entry?.title_translated || entry?.title || '',
+    };
+  }
+  const briefing = BRIEFINGS.find(item => item.id === Number(match[2]));
+  return { kind: 'briefing', title: briefing?.title || '' };
+}
+
+function annotationScopeSection(scopeId) {
+  const raw = String(scopeId || '').split(':').slice(2).join(':');
+  if (!raw) return '正文';
+  if (raw.startsWith('summary:zh')) return '中文摘要';
+  if (raw.startsWith('summary:en')) return '英文摘要';
+  if (raw.startsWith('detail-title')) return '标题';
+  if (raw.startsWith('detail-author')) return '作者';
+  if (raw.startsWith('lead-in')) return '导语';
+  if (raw.startsWith('content')) return '正文';
+  if (raw.startsWith('note:')) return '阅读笔记';
+  return raw.split(':')[0].replaceAll('-', ' ');
+}
+
+function readingHighlightColorDefinitions() {
+  return readReadingHighlightPalette().map(readingHighlightPaletteDefinition);
+}
+
+function annotationColorMeaningDraft() {
+  const palette = [];
+  const meanings = {};
+  annotationColorMeaningRows?.querySelectorAll('[data-color-meaning-row]').forEach(row => {
+    const color = row.dataset.colorMeaningRow;
+    palette.push(color);
+    const meaning = row.querySelector('[data-color-meaning-input]')?.value.trim() || '';
+    if (meaning) meanings[color] = meaning;
+  });
+  return { palette, meanings };
+}
+
+function renderAnnotationColorMeaningEditor(draft = null) {
+  if (!annotationColorMeaningRows) return;
+  const palette = draft?.palette || readReadingHighlightPalette();
+  const meanings = draft?.meanings || readReadingHighlightColorMeanings();
+  annotationColorMeaningRows.innerHTML = palette.map(readingHighlightPaletteDefinition).map((color, index) => `
+    <div class="annotation-color-meaning-row" draggable="false" data-color-meaning-row="${escapeHtml(color.id)}">
+      <button type="button" class="annotation-color-drag-handle" data-color-drag-handle title="拖动调整顺序" aria-label="拖动调整${escapeHtml(color.custom ? color.label : `${color.label}色`)}顺序">
+        <svg width="12" height="16" viewBox="0 0 12 16" fill="currentColor" aria-hidden="true"><circle cx="3" cy="4" r="1"/><circle cx="9" cy="4" r="1"/><circle cx="3" cy="8" r="1"/><circle cx="9" cy="8" r="1"/><circle cx="3" cy="12" r="1"/><circle cx="9" cy="12" r="1"/></svg>
+      </button>
+      <span class="annotation-color-meaning-swatch" style="--meaning-color:${escapeHtml(color.value)}" aria-hidden="true"></span>
+      <span class="annotation-color-meaning-base">${escapeHtml(color.custom ? color.label : `${color.label}色`)}</span>
+      <input
+        type="text"
+        maxlength="30"
+        value="${escapeHtml(meanings[color.id] || '')}"
+        placeholder="填写自定义含义"
+        data-color-meaning-input="${escapeHtml(color.id)}"
+        aria-label="${escapeHtml(color.custom ? color.label : `${color.label}色`)}的自定义含义"
+      />
+      <span class="annotation-color-row-actions">
+        <button type="button" class="btn-icon" data-color-move="up" title="上移" aria-label="上移" ${index === 0 ? 'disabled' : ''}>↑</button>
+        <button type="button" class="btn-icon" data-color-move="down" title="下移" aria-label="下移" ${index === palette.length - 1 ? 'disabled' : ''}>↓</button>
+        ${color.custom ? '<button type="button" class="btn-icon annotation-color-remove" data-color-remove title="删除颜色" aria-label="删除颜色">×</button>' : ''}
+      </span>
+    </div>`).join('');
+  wireAnnotationColorRowDrag();
+}
+
+function refreshAnnotationColorRowButtons() {
+  const rows = [...(annotationColorMeaningRows?.querySelectorAll('[data-color-meaning-row]') || [])];
+  rows.forEach((row, index) => {
+    const up = row.querySelector('[data-color-move="up"]');
+    const down = row.querySelector('[data-color-move="down"]');
+    if (up) up.disabled = index === 0;
+    if (down) down.disabled = index === rows.length - 1;
+  });
+}
+
+function wireAnnotationColorRowDrag() {
+  let draggedRow = null;
+  annotationColorMeaningRows?.querySelectorAll('[data-color-meaning-row]').forEach(row => {
+    const handle = row.querySelector('[data-color-drag-handle]');
+    handle?.addEventListener('pointerdown', () => {
+      row.draggable = true;
+    });
+    row.addEventListener('dragstart', event => {
+      draggedRow = row;
+      row.classList.add('is-dragging');
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.setData('text/plain', row.dataset.colorMeaningRow || '');
+    });
+    row.addEventListener('dragover', event => {
+      if (!draggedRow || draggedRow === row) return;
+      event.preventDefault();
+      const after = event.clientY > row.getBoundingClientRect().top + row.offsetHeight / 2;
+      annotationColorMeaningRows.insertBefore(draggedRow, after ? row.nextSibling : row);
+      refreshAnnotationColorRowButtons();
+    });
+    row.addEventListener('dragend', () => {
+      draggedRow?.classList.remove('is-dragging');
+      draggedRow = null;
+      row.draggable = false;
+      refreshAnnotationColorRowButtons();
+    });
+    handle?.addEventListener('pointerup', () => {
+      if (!draggedRow) row.draggable = false;
+    });
+  });
+}
+
+function addAnnotationCustomColor() {
+  const color = parseReadingHighlightHexColor(annotationNewColorHexInput?.value);
+  if (!color) {
+    annotationNewColorHexInput?.setAttribute('aria-invalid', 'true');
+    annotationNewColorHexInput?.focus();
+    setGlobalStatus('请输入有效的十六进制颜色，例如 #58A6A6', 'error');
+    return;
+  }
+  annotationNewColorHexInput.value = color.toUpperCase();
+  annotationNewColorHexInput.removeAttribute('aria-invalid');
+  if (annotationNewColorInput) annotationNewColorInput.value = color;
+  const draft = annotationColorMeaningDraft();
+  if (draft.palette.includes(color)) {
+    annotationColorMeaningRows?.querySelector(`[data-color-meaning-row="${color}"] [data-color-meaning-input]`)?.focus();
+    return;
+  }
+  draft.palette.push(color);
+  renderAnnotationColorMeaningEditor(draft);
+  annotationColorMeaningRows?.querySelector(`[data-color-meaning-row="${color}"] [data-color-meaning-input]`)?.focus();
+}
+
+function syncAnnotationLibraryColorFilterOptions() {
+  if (!annotationLibraryColorFilter) return;
+  const selected = annotationLibraryColorFilter.value || 'all';
+  annotationLibraryColorFilter.innerHTML = [
+    '<option value="all">全部颜色</option>',
+    ...readingHighlightColorDefinitions().map(color => {
+      const displayName = readingHighlightColorDisplayName(color.id);
+      const baseName = color.custom ? color.label : `${color.label}色`;
+      const label = displayName === baseName
+        ? displayName
+        : `${baseName} · ${displayName}`;
+      return `<option value="${color.id}">${escapeHtml(label)}</option>`;
+    }),
+  ].join('');
+  annotationLibraryColorFilter.value = [...annotationLibraryColorFilter.options]
+    .some(option => option.value === selected) ? selected : 'all';
+}
+
+function refreshReadingHighlightColorMeanings() {
+  syncAnnotationLibraryColorFilterOptions();
+  readingHighlightPopover?.querySelectorAll('[data-highlight-color]').forEach(button => {
+    const displayName = readingHighlightColorDisplayName(button.dataset.highlightColor);
+    button.title = displayName;
+    button.setAttribute('aria-label', displayName);
+  });
+  document.querySelectorAll(`.${READING_HIGHLIGHT_MARK_CLASS}`).forEach(mark => {
+    const meaning = readingHighlightColorMeaning(mark.dataset.highlightColor);
+    const note = mark.dataset.annotationNote || '';
+    mark.removeAttribute('title');
+    const accessibleLabel = [meaning, note].filter(Boolean).join('。');
+    if (accessibleLabel) mark.setAttribute('aria-label', accessibleLabel);
+    else mark.removeAttribute('aria-label');
+  });
+  hideReadingHighlightMeaningTooltip();
+  if (mode === 'annotations') renderAnnotationLibrary();
+}
+
+function refreshReadingHighlightPalette() {
+  if (readingHighlightPopover) {
+    readingHighlightPopover.remove();
+    readingHighlightPopover = null;
+  }
+  syncAnnotationLibraryColorFilterOptions();
+  if (mode === 'annotations') renderAnnotationLibrary();
+}
+
+function persistAnnotationColorMeanings() {
+  if (!annotationColorMeaningRows) return;
+  const draft = annotationColorMeaningDraft();
+  saveReadingHighlightPalette(draft.palette);
+  saveReadingHighlightColorMeanings(draft.meanings);
+  annotationColorMeaningMenu?.removeAttribute('open');
+  setGlobalStatus('颜色含义已保存', 'success');
+}
+
+function collectReadingAnnotations() {
+  const annotations = [];
+  Object.entries(readReadingHighlightStore()).forEach(([scopeId, records]) => {
+    if (!Array.isArray(records)) return;
+    const scopeMatch = scopeId.match(/^(entry|briefing):(\d+):/u);
+    const scopeKind = scopeMatch?.[1] || 'other';
+    const sourceId = scopeMatch ? Number(scopeMatch[2]) : null;
+    records.forEach((record, index) => {
+      if (!record || !String(record.text || '').trim()) return;
+      const metadata = readingHighlightDocumentMetadata(scopeId);
+      annotations.push({
+        ...record,
+        id: record.id || `${scopeId}:${index}`,
+        recordId: record.id || '',
+        scopeId,
+        scopeKind,
+        sourceId,
+        section: annotationScopeSection(scopeId),
+        documentTitle: record.documentTitle || metadata.title || (scopeKind === 'entry'
+          ? `文献 ${sourceId}`
+          : (scopeKind === 'briefing' ? `简报 ${sourceId}` : '其他阅读内容')),
+        type: normalizeReadingAnnotationType(record.type),
+        color: normalizeReadingHighlightColor(record.color),
+        colorMeaning: readingHighlightColorMeaning(record.color),
+        storageKind: 'local',
+      });
+    });
+  });
+  briefingLibraryAnnotations.forEach(annotation => {
+    const briefingId = Number(annotation?.briefing_id);
+    const isManualNote = annotation?.kind === 'note';
+    const text = isManualNote ? annotation?.note : annotation?.selected_text;
+    if (!Number.isFinite(briefingId) || !String(text || '').trim()) return;
+    const briefing = BRIEFINGS.find(item => Number(item.id) === briefingId);
+    const color = normalizeReadingHighlightColor(annotation.color);
+    annotations.push({
+      id: `briefing-db-${annotation.id}`,
+      recordId: String(annotation.id),
+      scopeId: `briefing:${briefingId}:${isManualNote ? 'manual-note' : 'content'}`,
+      scopeKind: 'briefing',
+      sourceId: briefingId,
+      section: isManualNote ? '简报笔记' : '正文',
+      documentTitle: briefing?.title || `简报 ${briefingId}`,
+      type: isManualNote ? 'note' : 'highlight',
+      color,
+      colorMeaning: readingHighlightColorMeaning(color),
+      text: String(text || '').trim(),
+      note: isManualNote ? '' : String(annotation.note || '').trim(),
+      createdAt: annotation.created_at,
+      updatedAt: annotation.updated_at,
+      storageKind: 'briefing-db',
+    });
+  });
+  return annotations;
+}
+
+function mergeBriefingLibraryAnnotations(briefingId, annotations) {
+  const normalizedId = Number(briefingId);
+  briefingLibraryAnnotations = [
+    ...briefingLibraryAnnotations.filter(annotation => Number(annotation.briefing_id) !== normalizedId),
+    ...(Array.isArray(annotations) ? annotations : []),
+  ];
+  refreshAnnotationLibraryAfterStoreChange();
+}
+
+async function loadBriefingLibraryAnnotations(options = {}) {
+  try {
+    const annotations = await invoke('list_all_briefing_annotations');
+    briefingLibraryAnnotations = Array.isArray(annotations) ? annotations : [];
+    briefingLibraryAnnotationsLoaded = true;
+    refreshReadingHighlightPalette();
+    updateAnnotationLibraryCount();
+    if (mode === 'annotations') renderAnnotationLibrary();
+  } catch (error) {
+    if (options.showError !== false) {
+      setGlobalStatus('加载简报标注失败: ' + error, 'error');
+    }
+  }
+}
+
+function annotationLibraryFilters() {
+  return {
+    query: annotationLibrarySearch?.value.trim().toLowerCase() || '',
+    source: annotationLibrarySourceFilter?.value || 'all',
+    type: annotationLibraryTypeFilter?.value || 'all',
+    color: annotationLibraryColorFilter?.value || 'all',
+    sort: annotationLibrarySort?.value || 'newest',
+  };
+}
+
+function filteredReadingAnnotations() {
+  const filters = annotationLibraryFilters();
+  const filtered = collectReadingAnnotations().filter(annotation => {
+    if (filters.source !== 'all' && annotation.scopeKind !== filters.source) return false;
+    if (filters.type !== 'all' && annotation.type !== filters.type) return false;
+    const isCustomColor = !READING_HIGHLIGHT_COLOR_IDS.has(annotation.color);
+    if (filters.color === 'custom' && !isCustomColor) return false;
+    if (filters.color !== 'all' && filters.color !== 'custom' && annotation.color !== filters.color) return false;
+    if (!filters.query) return true;
+    const haystack = [
+      annotation.text,
+      annotation.note,
+      annotation.documentTitle,
+      annotation.section,
+      annotation.colorMeaning,
+    ]
+      .filter(Boolean)
+      .join('\n')
+      .toLowerCase();
+    return filters.query.split(/\s+/u).filter(Boolean).every(term => haystack.includes(term));
+  });
+  return filtered.sort((left, right) => {
+    if (filters.sort === 'document') {
+      return left.documentTitle.localeCompare(right.documentTitle, 'zh-CN')
+        || String(right.createdAt || '').localeCompare(String(left.createdAt || ''));
+    }
+    const direction = filters.sort === 'oldest' ? 1 : -1;
+    return String(left.createdAt || '').localeCompare(String(right.createdAt || '')) * direction;
+  });
+}
+
+function formatAnnotationDate(value) {
+  const date = new Date(value || '');
+  if (Number.isNaN(date.getTime())) return '';
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date);
+}
+
+function renderAnnotationLibrary() {
+  if (!annotationLibraryItems) return;
+  const allCount = collectReadingAnnotations().length;
+  const annotations = filteredReadingAnnotations();
+  if (annotationLibraryCount) {
+    annotationLibraryCount.textContent = annotations.length === allCount
+      ? `${allCount} 条`
+      : `${annotations.length} / ${allCount} 条`;
+  }
+  if (!annotations.length) {
+    annotationLibraryItems.innerHTML = `<div class="annotation-library-empty">
+      <span class="annotation-library-empty-icon" aria-hidden="true">A</span>
+      <strong>${allCount ? '没有符合当前条件的标注' : '还没有标注'}</strong>
+      <span>${allCount ? '调整上方筛选条件后再查看。' : '在文章或简报中选中文字，即可添加高亮、下划线或便签。'}</span>
+    </div>`;
+    return;
+  }
+
+  const groups = new Map();
+  annotations.forEach(annotation => {
+    const key = `${annotation.scopeKind}:${annotation.sourceId ?? annotation.scopeId}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(annotation);
+  });
+  annotationLibraryItems.innerHTML = [...groups.values()].map(group => {
+    const first = group[0];
+    const sourceLabel = first.scopeKind === 'entry' ? '文献' : (first.scopeKind === 'briefing' ? '简报' : '其他');
+    const canOpen = first.scopeKind !== 'other' && Number.isFinite(first.sourceId);
+    return `<section class="annotation-library-group">
+      <header class="annotation-library-group-header">
+        <div class="annotation-library-group-heading">
+          <span class="annotation-library-source-badge">${sourceLabel}</span>
+          <h3>${escapeHtml(first.documentTitle)}</h3>
+          <span>${group.length} 条</span>
+        </div>
+        ${canOpen ? `<button type="button" class="annotation-library-open" data-annotation-open-scope="${escapeHtml(first.scopeId)}">打开原文</button>` : ''}
+      </header>
+      <div class="annotation-library-group-items">
+        ${group.map(annotation => `<article class="annotation-library-card" style="--annotation-color:${escapeHtml(readingHighlightColorValue(annotation.color))}">
+          <span class="annotation-library-color" title="${escapeHtml(readingHighlightColorDisplayName(annotation.color))}"></span>
+          <div class="annotation-library-card-body">
+            <div class="annotation-library-card-meta">
+              <span>${escapeHtml(READING_ANNOTATION_TYPE_LABELS[annotation.type] || '高亮')}</span>
+              <span>${escapeHtml(annotation.section)}</span>
+              <span class="annotation-library-color-meaning"><i style="--meaning-color:${escapeHtml(readingHighlightColorValue(annotation.color))}" aria-hidden="true"></i>${escapeHtml(readingHighlightColorDisplayName(annotation.color))}</span>
+              <time>${escapeHtml(formatAnnotationDate(annotation.createdAt))}</time>
+            </div>
+            <blockquote>${escapeHtml(annotation.text)}</blockquote>
+            ${annotation.note ? `<p class="annotation-library-note">${escapeHtml(annotation.note)}</p>` : ''}
+          </div>
+          <button type="button" class="btn-icon annotation-library-delete" data-annotation-delete-scope="${escapeHtml(annotation.scopeId)}" data-annotation-delete-id="${escapeHtml(annotation.recordId)}" data-annotation-storage="${escapeHtml(annotation.storageKind)}" title="删除标注" aria-label="删除标注">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M3.5 4.5h9M6 2.8h4M5 4.5l.5 8h5l.5-8"/></svg>
+          </button>
+        </article>`).join('')}
+      </div>
+    </section>`;
+  }).join('');
+}
+
+function updateAnnotationLibraryCount() {
+  const count = collectReadingAnnotations().length;
+  const countEl = document.getElementById('count-annotations');
+  if (countEl) countEl.textContent = count || '';
+}
+
+function refreshAnnotationLibraryAfterStoreChange() {
+  updateAnnotationLibraryCount();
+  if (mode === 'annotations') renderAnnotationLibrary();
+}
+
+async function deleteReadingAnnotationFromLibrary(scopeId, recordId, storageKind = 'local') {
+  if (!scopeId || !recordId) return;
+  if (!await confirmDialog('确定删除这条标注吗？', {
+    okLabel: '删除',
+    cancelLabel: '取消',
+    danger: true,
+  })) return;
+  if (storageKind === 'briefing-db') {
+    const annotationId = Number(recordId);
+    if (!Number.isFinite(annotationId)) return;
+    try {
+      await invoke('delete_briefing_annotation', { annotationId });
+      briefingLibraryAnnotations = briefingLibraryAnnotations
+        .filter(annotation => Number(annotation.id) !== annotationId);
+      if (selectedBriefingId) await loadBriefingAnnotations(selectedBriefingId);
+      refreshAnnotationLibraryAfterStoreChange();
+      setGlobalStatus('简报标注已删除', 'success');
+    } catch (error) {
+      setGlobalStatus('删除简报标注失败: ' + error, 'error');
+    }
+    return;
+  }
+  const store = readReadingHighlightStore();
+  const records = Array.isArray(store[scopeId]) ? store[scopeId] : [];
+  const remaining = records.filter(record => record?.id !== recordId);
+  if (remaining.length) store[scopeId] = remaining;
+  else delete store[scopeId];
+  writeReadingHighlightStore(store);
+  document.querySelectorAll(READING_HIGHLIGHT_SCOPE_SELECTOR).forEach(scope => {
+    if (scope.dataset.highlightScope === scopeId) restoreReadingHighlights(scope);
+  });
+}
+
+async function openReadingAnnotationSource(scopeId) {
+  const match = String(scopeId || '').match(/^(entry|briefing):(\d+):/u);
+  if (!match) return;
+  const sourceId = Number(match[2]);
+  if (match[1] === 'briefing') {
+    const briefing = BRIEFINGS.find(item => item.id === sourceId);
+    if (!briefing) return setGlobalStatus('这份简报当前不可用', 'error');
+    enterBriefingMode();
+    selectBriefing(sourceId);
+    return;
+  }
+  const entry = findEntryById(sourceId);
+  if (!entry) return setGlobalStatus('这篇文献当前不在已加载范围内', 'error');
+  await jumpToArticle(sourceId);
+}
+
+function enterAnnotationMode() {
+  leaveSciReviewMode();
+  cancelLiteratureSearchForNavigation();
+  clearEntrySelection({ render: false, syncPaperChat: false });
+  mode = 'annotations';
+  currentPubmedSearch = null;
+  selectedFeedId = null;
+  document.body.classList.remove('pubmed-mode');
+  pubmedBatchHeader?.classList.add('hidden');
+  entryListEl?.classList.add('hidden');
+  briefingListEl?.classList.add('hidden');
+  detailPanelEl?.classList.add('hidden');
+  briefingDetailEl?.classList.add('hidden');
+  listResizerEl?.classList.add('hidden');
+  annotationLibraryEl?.classList.remove('hidden');
+  syncPaperChatResizerVisibility();
+  syncEntryFilterControls();
+  setToolbarSubtitle('annotations');
+  syncAnnotationLibraryColorFilterOptions();
+  renderAnnotationColorMeaningEditor();
+  renderAnnotationLibrary();
+  if (!briefingLibraryAnnotationsLoaded) void loadBriefingLibraryAnnotations();
+}
+
 // ── DOM refs ──────────────────────────────────────
 let settingsView, mainView, contentArea;
 let btnSettings, btnSidebar, btnRefresh, refreshIcon, btnTogglePaperChatToolbar;
@@ -217,6 +1744,11 @@ let btnExportPubmed;
 let pubmedSnapshotSelect, btnSavePubmedSnapshot, btnDeletePubmedSnapshot;
 let pubmedBulkStatus, btnPubmedAiScreen, btnPubmedAuthorIdentity;
 let entryListEl, briefingListEl, briefingItemsEl, briefingSortSelect, briefingSortDirection;
+let annotationLibraryEl, annotationLibraryItems, annotationLibraryCount;
+let annotationLibrarySearch, annotationLibrarySourceFilter, annotationLibraryTypeFilter;
+let annotationLibraryColorFilter, annotationLibrarySort;
+let annotationColorMeaningMenu, annotationColorMeaningRows, btnSaveColorMeanings;
+let annotationNewColorInput, annotationNewColorHexInput, btnAddAnnotationColor;
 let entryItemsEl, entryFilter, screeningTableEl, btnScreeningTableToggle;
 let screeningWindowView, screeningWindowTitle, screeningWindowSubtitle, btnScreeningWindowClose;
 let entrySortSelect, entrySortDirection, entryMetricIfFilter, entryMetricQFilter, entryMetricBFilter, entryMetricTopFilter, entryTagFilter;
@@ -232,6 +1764,7 @@ let detailSummaryContent, detailSummarySection, detailSummaryRetry;
 let detailSummaryView, detailPdfView, btnDetailViewSummary, btnDetailViewPdf;
 let btnPdfOpenExternal, btnPdfDownload;
 let detailReadingNotesContent;
+let manualReadingNoteInput, btnManualReadingNote;
 let detailPaperChatHint, detailPaperChatMessages, detailPaperChatScopes, paperChatInput, paperChatComposer;
 let paperChatScopeCaption, btnSendPaperChat, btnClearPaperChat, btnTogglePaperChat, btnShowPaperChat;
 let paperChatPickedList, btnPaperChatAddCurrent, btnPaperChatClearPicked;
@@ -245,6 +1778,8 @@ let btnDetailPdf, btnDetailSciHub;
 let detailTagList, detailTagInput, btnDetailAddTag;
 let detailPaperGraphSection, paperGraphStage, paperGraphNodeDetail, paperGraphCounts;
 let briefingDetailEmpty, briefingDetailContent;
+let briefingAnnotationsSection, briefingAnnotationsList, briefingNoteInput;
+let btnBriefingSaveNote;
 
 // ── App state ────────────────────────────────────
 let currentEntry = null;
@@ -282,6 +1817,11 @@ let sciReviewWorkspace = null;
 let sciSkillSpecs = [];
 let pendingSciReviewProjectId = null;
 let selectedBriefingId = null;
+let briefingAnnotations = [];
+let briefingLibraryAnnotations = [];
+let briefingLibraryAnnotationsLoaded = false;
+let briefingAnnotationRequestId = 0;
+let editingBriefingAnnotationId = null;
 let literatureSearchTimer = null;
 let literatureSearchRequestId = 0;
 let literatureSearchRestoreState = null;
@@ -290,6 +1830,7 @@ let journalMetricsLoadPromise = null;
 let readingProfiles = [];
 let editingReadingProfileId = null;
 let editingReadingNoteId = null;
+const manualReadingNoteDrafts = new Map();
 const entryMetricFilters = { if: 'all', q: 'all', b: 'all', top: 'all' };
 const freeFulltextCheckInFlight = new Set();
 const entryPdfLinkCache = new Map();
@@ -411,7 +1952,15 @@ const PAPER_CHAT_MIN_APP_WIDTH = 1420;
 const DETAIL_PANEL_MIN_WIDTH = 420;
 const BRIEFING_DETAIL_MIN_WIDTH = 360;
 const PANEL_RESIZER_WIDTH = 12;
-const SIDEBAR_SECTION_COLLAPSED_STORAGE_KEY = 'sidebar-section-collapsed-v1';
+const SIDEBAR_SECTION_COLLAPSED_STORAGE_KEY = 'sidebar-section-collapsed-v2';
+const SIDEBAR_SECTION_ORDER_STORAGE_KEY = 'sidebar-section-order-v1';
+const SIDEBAR_SOURCE_SECTION_IDS = ['sci-review', 'pmc-gallery', 'pubmed', 'feeds'];
+const SIDEBAR_SOURCE_SECTION_LABELS = {
+  'sci-review': 'SCI 综述项目',
+  'pmc-gallery': 'PMC 图库',
+  pubmed: 'PubMed 检索',
+  feeds: '订阅源',
+};
 const ENTRY_FILTER_STORAGE_KEY = 'entry-filter-v1';
 const ENTRY_FILTER_OPTIONS = ['all', 'unread', 'starred', 'reading-notes'];
 const ENTRY_METRIC_FILTER_STORAGE_KEY = 'entry-metric-filters-v1';
@@ -496,6 +2045,9 @@ const DRAG_BLOCK_SELECTOR = [
   '[role="radio"]',
   '[role="switch"]',
   '[role="option"]',
+  '.sidebar-row',
+  '.feed-item',
+  '.pubmed-search-item',
 ].join(',');
 
 // ── Emoji presets ───────────────────────────────
@@ -736,9 +2288,11 @@ function syncEntryFilterControls() {
 
   const activeSidebarView = mode === 'briefing'
     ? 'briefing'
-    : (mode === 'kept'
-      ? 'kept'
-      : (mode === 'pubmed' || selectedFeedId ? null : entryFilterValue));
+    : (mode === 'annotations'
+      ? 'annotations'
+      : (mode === 'kept'
+        ? 'kept'
+        : (mode === 'pubmed' || selectedFeedId ? null : entryFilterValue)));
   document.querySelectorAll('.sidebar-row').forEach(row => {
     row.classList.toggle('active', !!activeSidebarView && row.dataset.view === activeSidebarView);
   });
@@ -893,6 +2447,7 @@ function renderDetailTitle(entry) {
     secondary.textContent = titles.secondary;
     detailTitle.appendChild(secondary);
   }
+  installGlobalTextHighlightScope(detailTitle, `entry:${entry.id}:detail-title:${titleDisplayMode()}`);
 }
 
 function activeProviderId() {
@@ -1484,7 +3039,11 @@ function showMain() {
   btnSidebar.title = '侧栏';
   if (!sidebarCollapsed) btnSidebar.classList.add('active');
   document.body.classList.remove('settings-mode');
-  setToolbarSubtitle(mode === 'review' ? 'review' : (mode === 'briefing' ? 'briefing' : (mode === 'search' ? 'search' : 'main')));
+  setToolbarSubtitle(mode === 'review'
+    ? 'review'
+    : (mode === 'briefing'
+      ? 'briefing'
+      : (mode === 'annotations' ? 'annotations' : (mode === 'search' ? 'search' : 'main'))));
   if (pubmedPreviewSettingsReturnPending && pubmedPreview) {
     document.getElementById('pubmed-search-modal')?.classList.remove('hidden');
   }
@@ -1503,6 +3062,12 @@ function setToolbarSubtitle(context) {
       <span class="ts-meta">·</span>
       <span class="ts-tertiary">${BRIEFINGS.length} 份</span>
     `;
+    return;
+  }
+  if (context === 'annotations') {
+    toolbarSubtitle.innerHTML = `
+      <span class="ts-accent"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12.5h10"/><path d="m4 9.8 5.7-5.7 2.2 2.2-5.7 5.7H4Z"/></svg></span>
+      <span>标注中心</span>`;
     return;
   }
   if (context === 'review') {
@@ -1553,10 +3118,67 @@ function applyCollapsedState() {
 function loadSidebarSectionCollapsedState() {
   try {
     const state = JSON.parse(localStorage.getItem(SIDEBAR_SECTION_COLLAPSED_STORAGE_KEY) || '{}');
-    return state && typeof state === 'object' ? state : {};
+    return normalizeSidebarSectionCollapsedState(state);
   } catch {
-    return {};
+    return normalizeSidebarSectionCollapsedState({});
   }
+}
+
+function normalizeSidebarSectionCollapsedState(state) {
+  const source = state && typeof state === 'object' ? state : {};
+  return Object.fromEntries(
+    SIDEBAR_SOURCE_SECTION_IDS.map(section => [
+      section,
+      typeof source[section] === 'boolean' ? source[section] : true,
+    ]),
+  );
+}
+
+function normalizeSidebarSourceSectionOrder(order) {
+  const normalized = [];
+  const source = Array.isArray(order) ? order : [];
+  source.forEach(section => {
+    if (SIDEBAR_SOURCE_SECTION_IDS.includes(section) && !normalized.includes(section)) {
+      normalized.push(section);
+    }
+  });
+  SIDEBAR_SOURCE_SECTION_IDS.forEach(section => {
+    if (!normalized.includes(section)) normalized.push(section);
+  });
+  return normalized;
+}
+
+function loadSidebarSourceSectionOrder() {
+  try {
+    return normalizeSidebarSourceSectionOrder(
+      JSON.parse(localStorage.getItem(SIDEBAR_SECTION_ORDER_STORAGE_KEY) || '[]'),
+    );
+  } catch {
+    return normalizeSidebarSourceSectionOrder([]);
+  }
+}
+
+function sidebarSourceSectionOrder(container) {
+  return normalizeSidebarSourceSectionOrder(
+    [...container.querySelectorAll('[data-sidebar-source-section]')]
+      .map(section => section.dataset.sidebarSourceSection),
+  );
+}
+
+function saveSidebarSourceSectionOrder(container) {
+  localStorage.setItem(
+    SIDEBAR_SECTION_ORDER_STORAGE_KEY,
+    JSON.stringify(sidebarSourceSectionOrder(container)),
+  );
+}
+
+function applySidebarSourceSectionOrder(order = loadSidebarSourceSectionOrder()) {
+  const container = document.querySelector('[data-sidebar-source-sections]');
+  if (!container) return;
+  normalizeSidebarSourceSectionOrder(order).forEach(section => {
+    const sectionEl = container.querySelector(`[data-sidebar-source-section="${section}"]`);
+    if (sectionEl) container.appendChild(sectionEl);
+  });
 }
 
 function setSidebarSectionCollapsed(section, collapsed, { persist = true } = {}) {
@@ -1566,9 +3188,7 @@ function setSidebarSectionCollapsed(section, collapsed, { persist = true } = {})
   if (!toggle || !list) return;
 
   toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-  const sectionLabel = section === 'pubmed'
-    ? 'PubMed 检索'
-    : (section === 'pmc-gallery' ? 'PMC 图库' : '订阅源');
+  const sectionLabel = SIDEBAR_SOURCE_SECTION_LABELS[section] || '分组';
   toggle.title = `${collapsed ? '展开' : '折叠'}${sectionLabel}`;
   list.hidden = collapsed;
   toggle.closest('.sidebar-source-section')?.classList.toggle('is-collapsed', collapsed);
@@ -1588,6 +3208,119 @@ function setupSidebarSectionToggles() {
     toggle.addEventListener('click', () => {
       setSidebarSectionCollapsed(section, toggle.getAttribute('aria-expanded') === 'true');
     });
+  });
+}
+
+function clearSidebarSectionDropMarkers(container) {
+  container?.querySelectorAll('.is-drag-over-before, .is-drag-over-after').forEach(section => {
+    section.classList.remove('is-drag-over-before', 'is-drag-over-after');
+  });
+}
+
+function setupSidebarSectionOrdering() {
+  const container = document.querySelector('[data-sidebar-source-sections]');
+  if (!container) return;
+
+  applySidebarSourceSectionOrder();
+  let draggedSection = null;
+  let activeDragHandle = null;
+  let activePointerId = null;
+
+  const sourceSections = () => [...container.querySelectorAll('[data-sidebar-source-section]')];
+
+  const sectionAtY = (clientY) => {
+    const candidates = sourceSections().filter(section => section !== draggedSection);
+    return candidates.find(section => {
+      const rect = section.getBoundingClientRect();
+      return clientY >= rect.top && clientY <= rect.bottom;
+    }) || candidates
+      .map(section => {
+        const rect = section.getBoundingClientRect();
+        return { section, distance: Math.abs(clientY - (rect.top + rect.height / 2)) };
+      })
+      .sort((a, b) => a.distance - b.distance)[0]?.section || null;
+  };
+
+  const moveSection = (sectionEl, direction) => {
+    if (!sectionEl || !['up', 'down'].includes(direction)) return;
+    const sibling = direction === 'up'
+      ? sectionEl.previousElementSibling
+      : sectionEl.nextElementSibling;
+    if (!sibling?.matches?.('[data-sidebar-source-section]')) return;
+    if (direction === 'up') {
+      container.insertBefore(sectionEl, sibling);
+    } else {
+      container.insertBefore(sibling, sectionEl);
+    }
+    saveSidebarSourceSectionOrder(container);
+  };
+
+  const finishDrag = () => {
+    clearSidebarSectionDropMarkers(container);
+    draggedSection?.classList.remove('is-dragging');
+    if (draggedSection) saveSidebarSourceSectionOrder(container);
+    activeDragHandle?.releasePointerCapture?.(activePointerId);
+    draggedSection = null;
+    activeDragHandle = null;
+    activePointerId = null;
+  };
+
+  container.querySelectorAll('[data-sidebar-section-drag-handle]').forEach(handle => {
+    handle.addEventListener('pointerdown', event => {
+      if (event.button !== 0) return;
+      const section = handle.dataset.sidebarSectionDragHandle;
+      draggedSection = container.querySelector(`[data-sidebar-source-section="${section}"]`);
+      if (!draggedSection) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      activeDragHandle = handle;
+      activePointerId = event.pointerId;
+      handle.setPointerCapture?.(event.pointerId);
+      draggedSection.classList.add('is-dragging');
+    });
+
+    handle.addEventListener('pointermove', event => {
+      if (!draggedSection || activePointerId !== event.pointerId) return;
+
+      event.preventDefault();
+      const sectionEl = sectionAtY(event.clientY);
+      if (!sectionEl || sectionEl === draggedSection) return;
+
+      const rect = sectionEl.getBoundingClientRect();
+      const isBefore = event.clientY < rect.top + (rect.height / 2);
+      clearSidebarSectionDropMarkers(container);
+      sectionEl.classList.toggle('is-drag-over-before', isBefore);
+      sectionEl.classList.toggle('is-drag-over-after', !isBefore);
+
+      const next = isBefore ? sectionEl : sectionEl.nextSibling;
+      if (next !== draggedSection) {
+        container.insertBefore(draggedSection, next);
+      }
+    });
+
+    handle.addEventListener('pointerup', event => {
+      if (activePointerId !== event.pointerId) return;
+      event.preventDefault();
+      finishDrag();
+    });
+
+    handle.addEventListener('pointercancel', finishDrag);
+
+    handle.addEventListener('keydown', event => {
+      if (!['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+      const section = handle.closest('[data-sidebar-source-section]');
+      if (!section) return;
+      event.preventDefault();
+      moveSection(section, event.key === 'ArrowUp' ? 'up' : 'down');
+      handle.focus();
+    });
+  });
+
+  document.addEventListener('pointerup', event => {
+    if (activePointerId === event.pointerId) {
+      finishDrag();
+    }
   });
 }
 
@@ -3614,6 +5347,7 @@ function showPubmedSearchContextMenu(x, y, search) {
     <div class="context-item" data-action="refresh">更新检索批次</div>
     ${isAuthorPubmedSearch(search) ? '<div class="context-item" data-action="author-identity">作者身份审核</div>' : ''}
     <div class="context-item" data-action="open-source">在 PubMed 打开</div>
+    <div class="context-item" data-action="generate-briefing">生成此检索简报</div>
     <div class="context-separator"></div>
     <div class="context-item" data-action="translate-title">批量翻译标题</div>
     <div class="context-item" data-action="translate-summary">批量翻译摘要</div>
@@ -3639,6 +5373,8 @@ function showPubmedSearchContextMenu(x, y, search) {
       const url = buildPubmedSearchUrl(search.query);
       if (url) openUrl(url);
       else setGlobalStatus('当前检索没有可打开的 PubMed 检索式', 'error');
+    } else if (action === 'generate-briefing') {
+      await generateBriefingForSource('pubmed', search.id);
     } else if (action === 'translate-title') {
       await translatePubmedSearchEntries(search, 'title');
     } else if (action === 'translate-summary') {
@@ -4259,6 +5995,7 @@ function enterLiteratureMode() {
 
 function leaveSciReviewMode() {
   sciReviewWorkspaceEl?.classList.add('hidden');
+  annotationLibraryEl?.classList.add('hidden');
   listResizerEl?.classList.remove('hidden');
   document.body.classList.remove('sci-review-mode');
 }
@@ -4581,6 +6318,7 @@ function updateOverviewCounts() {
   // "全部" (total entries), so users always see how many briefings exist
   // regardless of read state.
   if (elBriefing) elBriefing.textContent = BRIEFINGS.length || '';
+  updateAnnotationLibraryCount();
   updateTopEntryFilterCounts(allEntries.length ? allEntries : globalEntries);
   // Keep the macOS tray badge in sync with the unread count.
   pushTrayUnread();
@@ -5073,6 +6811,14 @@ function isPaperChatReadingNote(note) {
   return String(note?.profile_id || '').startsWith('paper-chat-excerpts');
 }
 
+function isManualReadingNote(note) {
+  return String(note?.profile_id || '').startsWith('manual-note-');
+}
+
+function isNonRegenerableReadingNote(note) {
+  return isPaperChatReadingNote(note) || isManualReadingNote(note);
+}
+
 function readingNotePreview(note) {
   const plain = String(note?.content || '')
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1')
@@ -5203,6 +6949,7 @@ function showContextMenu(x, y, feed) {
   menu.innerHTML = `
     <div class="context-item" data-action="refresh">更新订阅源</div>
     <div class="context-item" data-action="open-source">${sourceLink.label}</div>
+    <div class="context-item" data-action="generate-briefing">生成此订阅简报</div>
     <div class="context-separator"></div>
     <div class="context-item" data-action="translate-title">翻译标题</div>
     <div class="context-item" data-action="translate-summary">翻译摘要</div>
@@ -5221,6 +6968,8 @@ function showContextMenu(x, y, feed) {
     } else if (action === 'open-source') {
       if (sourceLink.url) openUrl(sourceLink.url);
       else setGlobalStatus('当前订阅源没有可打开的地址', 'error');
+    } else if (action === 'generate-briefing') {
+      await generateBriefingForSource('feed', feed.id);
     } else if (action === 'translate-title') {
       await translateFeedEntries(feed, 'title');
     } else if (action === 'translate-summary') {
@@ -5309,10 +7058,13 @@ async function deleteBriefing(id) {
     // Drop it from the in-memory list immediately so the row vanishes
     // without waiting for the round-trip reload.
     BRIEFINGS = BRIEFINGS.filter(b => b.id !== id);
+    briefingLibraryAnnotations = briefingLibraryAnnotations
+      .filter(annotation => Number(annotation.briefing_id) !== Number(id));
     readBriefings.delete(id);
     persistReadBriefings();
     renderBriefingList();
     updateOverviewCounts();
+    refreshAnnotationLibraryAfterStoreChange();
     if (BRIEFINGS.length === 0) {
       showBriefingEmpty();
     } else if (!selectedBriefingId) {
@@ -5364,6 +7116,12 @@ function showEntryContextMenu(x, y, entry) {
     items += '<div class="context-separator"></div>';
   }
   items += `<div class="context-item" data-action="download-pdf">${isBatch ? `下载所选 ${targetEntries.length} 篇 PDF` : '下载 PDF'}</div>`;
+  if (isBatch) {
+    items += '<div class="context-separator"></div>';
+    items += targetEntries.length <= 40
+      ? `<div class="context-item" data-action="generate-briefing-selection">按所选 ${targetEntries.length} 篇生成简报</div>`
+      : '<div class="context-item disabled">生成简报最多选择 40 篇</div>';
+  }
   if (!isBatch) {
     if (items) items += '<div class="context-separator"></div>';
     items += `<div class="context-item" data-action="${entry.is_read ? 'mark-unread' : 'mark-read'}">${entry.is_read ? '标为未读' : '标为已读'}</div>`;
@@ -5391,6 +7149,8 @@ function showEntryContextMenu(x, y, entry) {
       await translateEntries(targetEntries, 'title');
     } else if (action === 'translate-summary') {
       await translateEntries(targetEntries, 'summary');
+    } else if (action === 'generate-briefing-selection') {
+      await generateBriefingForEntries(targetEntries);
     } else if (action === 'mark-read') await setEntryRead(entry, true);
     else if (action === 'mark-unread') await setEntryRead(entry, false);
     else if (action === 'star' || action === 'unstar') {
@@ -6240,7 +8000,9 @@ function renderDetailJournalMeta(entry) {
       const journalHtml = journal ? `《${escapeHtml(journal)}》` : '';
       detailJournal.innerHTML = `${journalHtml}${metricHtml ? `<span class="journal-metrics journal-metrics-detail">${metricHtml}</span>` : ''}`;
       detailJournal.classList.remove('hidden');
+      installGlobalTextHighlightScope(detailJournal, `entry:${entry.id}:detail-journal`);
     } else {
+      clearReadingHighlightScope(detailJournal);
       detailJournal.innerHTML = '';
       detailJournal.classList.add('hidden');
     }
@@ -6940,14 +8702,44 @@ async function saveReadingNoteContent(noteId) {
   }
 }
 
+async function saveManualReadingNote() {
+  if (!currentEntry?.id || !manualReadingNoteInput || !btnManualReadingNote) return;
+  const entryId = currentEntry.id;
+  const content = manualReadingNoteInput.value || '';
+  if (!content.trim()) {
+    setGlobalStatus('手动笔记内容不能为空', 'error');
+    manualReadingNoteInput.focus();
+    return;
+  }
+
+  btnManualReadingNote.disabled = true;
+  setGlobalStatus('正在保存手动笔记…', 'progress');
+  try {
+    await invoke('add_manual_reading_note', { entryId, content });
+    if (currentEntry?.id === entryId && manualReadingNoteInput.value === content) {
+      manualReadingNoteInput.value = '';
+      manualReadingNoteDrafts.delete(entryId);
+    } else if (currentEntry?.id !== entryId) {
+      manualReadingNoteDrafts.delete(entryId);
+    }
+    editingReadingNoteId = null;
+    await loadReadingNotes(entryId);
+    setGlobalStatus('手动笔记已添加', 'success');
+  } catch (e) {
+    setGlobalStatus('保存手动笔记失败: ' + e, 'error');
+  } finally {
+    btnManualReadingNote.disabled = false;
+  }
+}
+
 function renderReadingNotes(notes) {
   const section = document.getElementById('detail-reading-notes-section');
   const content = detailReadingNotesContent;
   if (!section || !content) return;
 
   if (!notes?.length) {
-    content.innerHTML = '';
-    section.classList.add('hidden');
+    content.innerHTML = '<p class="detail-summary-empty">暂无阅读笔记</p>';
+    section.classList.remove('hidden');
     return;
   }
 
@@ -6964,7 +8756,7 @@ function renderReadingNotes(notes) {
             type="button"
             data-reading-note-edit="${note.id}"
           >修改笔记</button>
-          ${isPaperChatReadingNote(note) ? '' : `
+          ${isNonRegenerableReadingNote(note) ? '' : `
           <button
             class="btn-ghost btn-sm"
             type="button"
@@ -7003,6 +8795,10 @@ function renderReadingNotes(notes) {
       </div>
     </div>
   `).join('');
+  content.querySelectorAll('.reading-note-card-preview').forEach(preview => {
+    const noteId = preview.closest('[data-reading-note-card]')?.dataset.readingNoteCard || 'unknown';
+    installReadingHighlightScope(preview, `entry:${currentEntry?.id || 'unknown'}:note:${noteId}`);
+  });
   section.classList.remove('hidden');
 
   if (editingReadingNoteId) {
@@ -7067,12 +8863,11 @@ async function loadReadingNotes(entryId) {
   const listScrollTop = entryItemsEl?.scrollTop ?? 0;
 
   const targetEntry = currentEntry;
+  section.classList.remove('hidden');
   if (targetEntry?.id === entryId && targetEntry?.has_reading_note) {
-    section.classList.remove('hidden');
     content.innerHTML = '<p class="detail-summary-empty">正在加载阅读笔记…</p>';
   } else {
-    section.classList.add('hidden');
-    content.innerHTML = '';
+    content.innerHTML = '<p class="detail-summary-empty">暂无阅读笔记</p>';
   }
 
   try {
@@ -7511,7 +9306,7 @@ function renderPaperChatMessages(messages, { loading = false, error = '' } = {})
          </div>`
       : '';
     return `
-      <div class="paper-chat-message ${message.role === 'user' ? 'user' : 'assistant'}">
+      <div class="paper-chat-message ${message.role === 'user' ? 'user' : 'assistant'}" data-paper-chat-message="${escapeHtml(message.id || `${message.role}-${message.created_at || ''}`)}">
         <div class="paper-chat-message-header">
           <div class="paper-chat-message-role">${message.role === 'user' ? '我' : 'AI'}</div>
           <div class="paper-chat-message-time">${escapeHtml(formatReadingNoteTime(message.created_at))}</div>
@@ -7521,6 +9316,10 @@ function renderPaperChatMessages(messages, { loading = false, error = '' } = {})
       </div>
     `;
   }).join('');
+  detailPaperChatMessages.querySelectorAll('.paper-chat-message-body').forEach(body => {
+    const messageId = body.closest('[data-paper-chat-message]')?.dataset.paperChatMessage || 'unknown';
+    installReadingHighlightScope(body, `paper-chat:${getPaperChatRequestSignature()}:message:${messageId}`);
+  });
 }
 
 async function loadPaperChatMessages() {
@@ -8390,9 +10189,18 @@ function pubmedStatusLabel(status) {
 
 // ── Detail panel ───────────────────────────────
 function showDetail(entry) {
+  const previousEntryId = currentEntry?.id;
+  if (previousEntryId && manualReadingNoteInput) {
+    const previousDraft = manualReadingNoteInput.value;
+    if (previousDraft) manualReadingNoteDrafts.set(previousEntryId, previousDraft);
+    else manualReadingNoteDrafts.delete(previousEntryId);
+  }
   const entryChanged = currentEntry?.id !== entry.id;
   currentEntry = entry;
   if (entryChanged) {
+    if (manualReadingNoteInput) {
+      manualReadingNoteInput.value = manualReadingNoteDrafts.get(entry.id) || '';
+    }
     resetPaperGraph();
     detailPdfRequestId += 1;
     detailPdfUrl = '';
@@ -8420,13 +10228,16 @@ function showDetail(entry) {
     const formatted = formatAuthors(entry.author);
     if (formatted) {
       authorEl.textContent = formatted;
+      installGlobalTextHighlightScope(authorEl, `entry:${entry.id}:detail-author`);
       authorSep?.classList.remove('hidden');
     } else {
+      clearReadingHighlightScope(authorEl);
       authorEl.textContent = '';
       authorSep?.classList.add('hidden');
     }
   }
   detailPublicationDate.textContent = formatPublicationDate(entry);
+  installGlobalTextHighlightScope(detailPublicationDate, `entry:${entry.id}:detail-publication-date`);
 
   if (entry.summary_translated) {
     detailSourceBadge.textContent = '已翻译';
@@ -8956,6 +10767,18 @@ function renderPaperGraphNodeDetail() {
     </div>
   `;
   paperGraphNodeDetail.classList.remove('hidden');
+  installGlobalTextHighlightScope(
+    paperGraphNodeDetail.querySelector('.paper-graph-node-title'),
+    `paper-graph:${node.paper_id}:title`,
+  );
+  installGlobalTextHighlightScope(
+    paperGraphNodeDetail.querySelector('.paper-graph-node-meta'),
+    `paper-graph:${node.paper_id}:meta`,
+  );
+  installGlobalTextHighlightScope(
+    paperGraphNodeDetail.querySelector('.paper-graph-node-abstract'),
+    `paper-graph:${node.paper_id}:abstract`,
+  );
   paperGraphNodeDetail.querySelector('[data-paper-graph-open]')?.addEventListener('click', () => openUrl(url));
   paperGraphNodeDetail.querySelector('[data-paper-graph-center]')?.addEventListener('click', () => {
     loadPaperGraph({ paperId: node.paper_id, pushHistory: true });
@@ -9003,8 +10826,13 @@ function syncAbstractToggle() {
   toggle.style.visibility = hasBoth ? 'visible' : 'hidden';
 }
 
+function detailSummaryHighlightScope(entry, kind) {
+  return entry?.id ? `entry:${entry.id}:summary:${kind}` : '';
+}
+
 function renderSummary(entry, state = 'ready') {
   syncAbstractToggle();
+  clearReadingHighlightScope(detailSummaryContent);
   const showRetry = abstractLang === 'zh'
     && entry.summary
     && !entry.summary_translated
@@ -9023,18 +10851,21 @@ function renderSummary(entry, state = 'ready') {
       <p class="detail-summary-error">摘要翻译失败：${escapeHtml(entry._transError)}</p>
       ${clean ? `<p class="detail-summary-original">${escapeHtml(clean)}</p>` : ''}
     `;
+    if (clean) installReadingHighlightScope(detailSummaryContent, detailSummaryHighlightScope(entry, 'en'));
     return;
   }
   // 2) Translated text available, zh tab → show it
   if (entry.summary_translated && abstractLang === 'zh') {
     const clean = stripSummaryIdentifierFooter(entry.summary_translated);
     detailSummaryContent.innerHTML = `<p>${escapeHtml(clean)}</p>`;
+    installReadingHighlightScope(detailSummaryContent, detailSummaryHighlightScope(entry, 'zh'));
     return;
   }
   // 3) Original summary available (any of: en tab; or zh tab without translation yet)
   if (entry.summary && (abstractLang === 'en' || !entry.summary_translated)) {
     const clean = stripSummaryIdentifierFooter(stripHtml(entry.summary));
     detailSummaryContent.innerHTML = `<p class="detail-summary-original">${escapeHtml(clean)}</p>`;
+    installReadingHighlightScope(detailSummaryContent, detailSummaryHighlightScope(entry, 'en'));
     return;
   }
   // 4) No summary yet — either still fetching (or we never will)
@@ -9069,7 +10900,9 @@ function applyAffiliation(entry) {
   if (text) {
     detailAffiliation.textContent = text;
     detailAffiliation.classList.remove('hidden');
+    installGlobalTextHighlightScope(detailAffiliation, `entry:${entry.id}:detail-affiliation`);
   } else {
+    clearReadingHighlightScope(detailAffiliation);
     detailAffiliation.textContent = '';
     detailAffiliation.classList.add('hidden');
   }
@@ -10149,6 +11982,7 @@ async function loadBriefings() {
   syncBriefingSortControl();
   renderBriefingList();
   updateOverviewCounts();
+  await loadBriefingLibraryAnnotations({ showError: false });
 }
 
 function enterBriefingMode(options = {}) {
@@ -10324,6 +12158,364 @@ function renderBriefingMarkdown(md) {
   return `<div class="briefing-md">${decorateMarkdownHtml(rendered)}</div>`;
 }
 
+function normalizeBriefingSelectionText(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+function nodePathFromRoot(root, node) {
+  const path = [];
+  let current = node;
+  while (current && current !== root) {
+    const parent = current.parentNode;
+    if (!parent) return null;
+    path.unshift(Array.prototype.indexOf.call(parent.childNodes, current));
+    current = parent;
+  }
+  return current === root ? path : null;
+}
+
+function resolveNodePath(root, path) {
+  if (!root || !Array.isArray(path)) return null;
+  let current = root;
+  for (const index of path) {
+    if (!current?.childNodes || index < 0 || index >= current.childNodes.length) return null;
+    current = current.childNodes[index];
+  }
+  return current;
+}
+
+function compareNodePathDesc(a, b) {
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i += 1) {
+    const av = a[i] ?? -1;
+    const bv = b[i] ?? -1;
+    if (av !== bv) return bv - av;
+  }
+  return 0;
+}
+
+function compareBriefingAnchorDesc(a, b) {
+  if (Number.isFinite(a.startChar) && Number.isFinite(b.startChar) && a.startChar !== b.startChar) {
+    return b.startChar - a.startChar;
+  }
+  const pathOrder = compareNodePathDesc(a.startPath, b.startPath);
+  if (pathOrder !== 0) return pathOrder;
+  return (b.startOffset || 0) - (a.startOffset || 0);
+}
+
+function briefingRangeIsInsideBody(root, range) {
+  if (!root || !range) return false;
+  return root.contains(range.startContainer) && root.contains(range.endContainer);
+}
+
+function briefingRangeTextOffsets(root, range) {
+  if (!briefingRangeIsInsideBody(root, range)) return null;
+  const preRange = document.createRange();
+  preRange.selectNodeContents(root);
+  preRange.setEnd(range.startContainer, range.startOffset);
+  const startChar = preRange.toString().length;
+  preRange.detach?.();
+  const selectedLength = range.toString().length;
+  return { startChar, endChar: startChar + selectedLength };
+}
+
+function rangeFromBriefingTextOffsets(root, startChar, endChar) {
+  if (!root || !Number.isFinite(startChar) || !Number.isFinite(endChar) || endChar <= startChar) {
+    return null;
+  }
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const range = document.createRange();
+  let currentOffset = 0;
+  let startSet = false;
+  let node;
+  while ((node = walker.nextNode())) {
+    const length = node.nodeValue.length;
+    const nextOffset = currentOffset + length;
+    if (!startSet && startChar <= nextOffset) {
+      range.setStart(node, Math.max(0, startChar - currentOffset));
+      startSet = true;
+    }
+    if (startSet && endChar <= nextOffset) {
+      range.setEnd(node, Math.max(0, endChar - currentOffset));
+      return range;
+    }
+    currentOffset = nextOffset;
+  }
+  range.detach?.();
+  return null;
+}
+
+function buildBriefingSelectionAnchor(root, range) {
+  if (!briefingRangeIsInsideBody(root, range)) return null;
+  const startPath = nodePathFromRoot(root, range.startContainer);
+  const endPath = nodePathFromRoot(root, range.endContainer);
+  const textOffsets = briefingRangeTextOffsets(root, range);
+  if (!startPath || !endPath) return null;
+  return {
+    startPath,
+    startOffset: range.startOffset,
+    endPath,
+    endOffset: range.endOffset,
+    ...(textOffsets || {}),
+  };
+}
+
+function parseBriefingAnchor(annotation) {
+  if (!annotation?.anchor_json) return null;
+  try {
+    const anchor = JSON.parse(annotation.anchor_json);
+    if (!Array.isArray(anchor.startPath) || !Array.isArray(anchor.endPath)) return null;
+    return anchor;
+  } catch {
+    return null;
+  }
+}
+
+function briefTextExcerpt(text, limit = 160) {
+  const value = normalizeBriefingSelectionText(text);
+  if (value.length <= limit) return value;
+  return `${value.slice(0, limit - 1)}…`;
+}
+
+function briefingHighlightColorLabel(color) {
+  return readingHighlightColorDisplayName(color);
+}
+
+function renderSelectedBriefingBody() {
+  const sectionsEl = document.getElementById('briefing-detail-sections');
+  const briefing = BRIEFINGS.find(item => item.id === selectedBriefingId);
+  if (!sectionsEl || !briefing) return;
+  sectionsEl.innerHTML = renderBriefingMarkdown(briefing.content || '');
+  applyBriefingHighlights();
+  installReadingHighlightScope(sectionsEl, `briefing:${briefing.id}:content`);
+}
+
+function applyBriefingHighlights() {
+  const root = document.getElementById('briefing-detail-sections');
+  if (!root) return;
+  const highlights = briefingAnnotations
+    .filter(annotation => annotation.kind === 'highlight')
+    .map(annotation => ({ annotation, anchor: parseBriefingAnchor(annotation) }))
+    .filter(item => item.anchor)
+    .sort((a, b) => compareBriefingAnchorDesc(a.anchor, b.anchor));
+
+  for (const { annotation, anchor } of highlights) {
+    const startNode = resolveNodePath(root, anchor.startPath);
+    const endNode = resolveNodePath(root, anchor.endPath);
+    const range = Number.isFinite(anchor.startChar) && Number.isFinite(anchor.endChar)
+      ? rangeFromBriefingTextOffsets(root, anchor.startChar, anchor.endChar)
+      : null;
+    if (!range && (!startNode || !endNode)) continue;
+    try {
+      const targetRange = range || document.createRange();
+      if (!range) {
+        targetRange.setStart(startNode, anchor.startOffset);
+        targetRange.setEnd(endNode, anchor.endOffset);
+      }
+      if (targetRange.collapsed) continue;
+      const color = normalizeReadingHighlightColor(annotation.color);
+      const mark = createReadingHighlightMark(
+        color,
+        `briefing-annotation-${annotation.id}`,
+        'highlight',
+        annotation.note,
+      );
+      mark.classList.add('briefing-highlight');
+      mark.dataset.briefingAnnotationId = String(annotation.id);
+      mark.style.setProperty('--briefing-highlight-color', readingHighlightColorValue(color));
+      mark.appendChild(targetRange.extractContents());
+      targetRange.insertNode(mark);
+      targetRange.detach?.();
+    } catch {
+      // If markdown rendering changed enough to invalidate an old DOM anchor,
+      // keep the saved annotation visible in the side list and skip the mark.
+    }
+  }
+}
+
+function renderBriefingAnnotations(options = {}) {
+  if (!briefingAnnotationsList || !briefingAnnotationsSection) return;
+  briefingAnnotationsSection.classList.remove('hidden');
+
+  if (options.loading) {
+    briefingAnnotationsList.innerHTML = '<p class="detail-summary-empty">正在加载笔记与高亮…</p>';
+    return;
+  }
+
+  if (!briefingAnnotations.length) {
+    briefingAnnotationsList.innerHTML = '<p class="detail-summary-empty">暂无笔记与高亮</p>';
+    return;
+  }
+
+  briefingAnnotationsList.innerHTML = briefingAnnotations.map(annotation => {
+    const isEditing = editingBriefingAnnotationId === String(annotation.id);
+    const title = annotation.kind === 'note'
+      ? '手动笔记'
+      : `${briefingHighlightColorLabel(annotation.color)}高亮`;
+    const notePreview = annotation.note
+      ? renderBriefingMarkdown(annotation.note)
+      : '<p class="briefing-annotation-empty-note">无备注</p>';
+    return `
+      <div class="briefing-annotation-card ${annotation.kind} ${isEditing ? 'is-editing' : ''}" data-briefing-annotation-card="${annotation.id}">
+        <div class="briefing-annotation-card-header">
+          <div class="briefing-annotation-card-meta">
+            <div class="briefing-annotation-card-title">${escapeHtml(title)}</div>
+            <div class="briefing-annotation-card-date">${escapeHtml(formatReadingNoteTime(annotation.updated_at || annotation.created_at))}</div>
+          </div>
+          <div class="briefing-annotation-card-actions">
+            <button class="btn-ghost btn-sm" type="button" data-briefing-annotation-edit="${annotation.id}">${annotation.kind === 'note' ? '修改' : '备注'}</button>
+            <button class="btn-ghost btn-sm" type="button" data-briefing-annotation-delete="${annotation.id}">删除</button>
+          </div>
+        </div>
+        ${annotation.kind === 'highlight' ? `
+          <blockquote class="briefing-annotation-quote briefing-highlight" style="--briefing-highlight-color:${escapeHtml(readingHighlightColorValue(annotation.color))}">${escapeHtml(briefTextExcerpt(annotation.selected_text))}</blockquote>
+        ` : ''}
+        <div class="briefing-annotation-preview">${notePreview}</div>
+        <div class="briefing-annotation-editor">
+          <textarea
+            class="settings-input settings-textarea briefing-annotation-editor-input"
+            data-briefing-annotation-textarea="${annotation.id}"
+            rows="${annotation.kind === 'note' ? '8' : '4'}"
+          >${escapeHtml(annotation.note || '')}</textarea>
+          <p class="detail-summary-error hidden briefing-annotation-editor-error" data-briefing-annotation-error="${annotation.id}"></p>
+          <div class="briefing-annotation-editor-actions">
+            <button class="btn btn-primary btn-sm" type="button" data-briefing-annotation-save="${annotation.id}">保存</button>
+            <button class="btn btn-secondary btn-sm" type="button" data-briefing-annotation-cancel="${annotation.id}">取消</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+  briefingAnnotationsList.querySelectorAll('.briefing-annotation-preview').forEach(preview => {
+    const annotationId = preview.closest('[data-briefing-annotation-card]')?.dataset.briefingAnnotationCard || 'unknown';
+    installReadingHighlightScope(preview, `briefing:${selectedBriefingId || 'unknown'}:annotation:${annotationId}:note`);
+  });
+}
+
+async function loadBriefingAnnotations(briefingId) {
+  const requestId = ++briefingAnnotationRequestId;
+  renderBriefingAnnotations({ loading: true });
+  try {
+    const annotations = await invoke('list_briefing_annotations', { briefingId });
+    if (requestId !== briefingAnnotationRequestId || selectedBriefingId !== briefingId) return;
+    briefingAnnotations = annotations || [];
+    mergeBriefingLibraryAnnotations(briefingId, briefingAnnotations);
+    renderSelectedBriefingBody();
+    renderBriefingAnnotations();
+  } catch (e) {
+    if (requestId !== briefingAnnotationRequestId || selectedBriefingId !== briefingId) return;
+    briefingAnnotationsList.innerHTML = `<p class="detail-summary-error">加载笔记与高亮失败: ${escapeHtml(String(e))}</p>`;
+  }
+}
+
+async function saveBriefingManualNote() {
+  if (!selectedBriefingId || !briefingNoteInput || !btnBriefingSaveNote) return;
+  const note = briefingNoteInput.value || '';
+  if (!note.trim()) {
+    setGlobalStatus('简报笔记内容不能为空', 'error');
+    briefingNoteInput.focus();
+    return;
+  }
+
+  btnBriefingSaveNote.disabled = true;
+  setGlobalStatus('正在保存简报笔记…', 'progress');
+  try {
+    await invoke('add_briefing_annotation', {
+      briefingId: selectedBriefingId,
+      kind: 'note',
+      selectedText: null,
+      anchorJson: null,
+      color: null,
+      note,
+    });
+    briefingNoteInput.value = '';
+    editingBriefingAnnotationId = null;
+    await loadBriefingAnnotations(selectedBriefingId);
+    setGlobalStatus('简报笔记已保存', 'success');
+  } catch (e) {
+    setGlobalStatus('保存简报笔记失败: ' + e, 'error');
+  } finally {
+    btnBriefingSaveNote.disabled = false;
+  }
+}
+
+function closeBriefingAnnotationEditor() {
+  editingBriefingAnnotationId = null;
+  renderBriefingAnnotations();
+}
+
+function openBriefingAnnotationEditor(annotationId) {
+  editingBriefingAnnotationId = String(annotationId);
+  renderBriefingAnnotations();
+  const textarea = briefingAnnotationsList?.querySelector(`[data-briefing-annotation-textarea="${annotationId}"]`);
+  textarea?.focus();
+  textarea?.setSelectionRange(textarea.value.length, textarea.value.length);
+}
+
+function setBriefingAnnotationCardBusy(annotationId, busy) {
+  const card = briefingAnnotationsList?.querySelector(`[data-briefing-annotation-card="${annotationId}"]`);
+  if (!card) return;
+  card.querySelectorAll('button, textarea').forEach(el => {
+    el.disabled = busy;
+  });
+}
+
+async function saveBriefingAnnotationNote(annotationId) {
+  const annotation = briefingAnnotations.find(item => item.id === annotationId);
+  const textarea = briefingAnnotationsList?.querySelector(`[data-briefing-annotation-textarea="${annotationId}"]`);
+  const errorEl = briefingAnnotationsList?.querySelector(`[data-briefing-annotation-error="${annotationId}"]`);
+  if (!annotation || !textarea) return;
+  const note = textarea.value || '';
+  if (errorEl) {
+    errorEl.textContent = '';
+    errorEl.classList.add('hidden');
+  }
+  if (annotation.kind === 'note' && !note.trim()) {
+    if (errorEl) {
+      errorEl.textContent = '简报笔记内容不能为空';
+      errorEl.classList.remove('hidden');
+    }
+    textarea.focus();
+    return;
+  }
+
+  setBriefingAnnotationCardBusy(annotationId, true);
+  setGlobalStatus('正在保存简报标注…', 'progress');
+  try {
+    await invoke('update_briefing_annotation', { annotationId, note });
+    editingBriefingAnnotationId = null;
+    await loadBriefingAnnotations(selectedBriefingId);
+    setGlobalStatus('简报标注已保存', 'success');
+  } catch (e) {
+    if (errorEl) {
+      errorEl.textContent = '保存失败: ' + e;
+      errorEl.classList.remove('hidden');
+    }
+    setGlobalStatus('保存简报标注失败: ' + e, 'error');
+    setBriefingAnnotationCardBusy(annotationId, false);
+  }
+}
+
+async function deleteBriefingAnnotationById(annotationId) {
+  if (!annotationId) return;
+  if (!await confirmDialog('确定删除这条简报标注吗？', {
+    okLabel: '删除',
+    cancelLabel: '取消',
+    danger: true,
+  })) {
+    return;
+  }
+  setGlobalStatus('正在删除简报标注…', 'progress');
+  try {
+    await invoke('delete_briefing_annotation', { annotationId });
+    editingBriefingAnnotationId = null;
+    await loadBriefingAnnotations(selectedBriefingId);
+    setGlobalStatus('简报标注已删除', 'success');
+  } catch (e) {
+    setGlobalStatus('删除简报标注失败: ' + e, 'error');
+  }
+}
+
 function selectBriefing(id) {
   selectedBriefingId = id;
   const b = BRIEFINGS.find(x => x.id === id);
@@ -10347,8 +12539,14 @@ function selectBriefing(id) {
   briefingDetailEmpty.classList.add('hidden');
   briefingDetailContent.classList.remove('hidden');
 
-  document.getElementById('briefing-detail-date').textContent = b.date || '';
-  document.getElementById('briefing-detail-eyebrow').innerHTML = `
+  const briefingDateEl = document.getElementById('briefing-detail-date');
+  if (briefingDateEl) {
+    briefingDateEl.textContent = b.date || '';
+    installGlobalTextHighlightScope(briefingDateEl, `briefing:${b.id}:date`);
+  }
+  const briefingEyebrowEl = document.getElementById('briefing-detail-eyebrow');
+  if (briefingEyebrowEl) {
+    briefingEyebrowEl.innerHTML = `
     <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v3M8 11v3M2 8h3M11 8h3M4.2 4.2l2 2M9.8 9.8l2 2M11.8 4.2l-2 2M6.2 9.8l-2 2"/></svg>
     <span>${escapeHtml(b.period || '')}</span>
     <span style="opacity:0.6">·</span>
@@ -10356,15 +12554,28 @@ function selectBriefing(id) {
     <span style="opacity:0.6">·</span>
     <span>${escapeHtml(b.source_name || '全部来源')}</span>
   `;
-  document.getElementById('briefing-detail-title').textContent = b.title || '';
-  document.getElementById('briefing-detail-leadin').textContent = b.lead_in || b.leadIn || '';
+    installGlobalTextHighlightScope(briefingEyebrowEl, `briefing:${b.id}:eyebrow`);
+  }
+  const briefingTitleEl = document.getElementById('briefing-detail-title');
+  if (briefingTitleEl) {
+    briefingTitleEl.textContent = b.title || '';
+    installGlobalTextHighlightScope(briefingTitleEl, `briefing:${b.id}:title`);
+  }
+  const briefingLeadIn = document.getElementById('briefing-detail-leadin');
+  if (briefingLeadIn) {
+    briefingLeadIn.textContent = b.lead_in || b.leadIn || '';
+    installReadingHighlightScope(briefingLeadIn, `briefing:${b.id}:lead-in`);
+  }
+  if (briefingNoteInput) briefingNoteInput.value = '';
+  editingBriefingAnnotationId = null;
+  briefingAnnotations = [];
 
   // Render the briefing body. The backend returns `content` as a Markdown
   // string per the new prompt format; this used to iterate `b.sections`,
   // which was a mock-data shape that never matched the live API. That's why
   // briefings were rendering as title + lead-in only with no body.
   const sectionsEl = document.getElementById('briefing-detail-sections');
-  sectionsEl.innerHTML = renderBriefingMarkdown(b.content || '');
+  renderSelectedBriefingBody();
   // Delegate clicks on inline reference links so they open in the system
   // browser via `open_url`, matching how article links behave elsewhere.
   // Without this the Tauri webview either swallows the click or opens the
@@ -10383,6 +12594,7 @@ function selectBriefing(id) {
   const modelName = activeModelDisplayName();
   document.getElementById('briefing-detail-footer-text').innerHTML =
     `<span class="ai-footer-strong">由 ${escapeHtml(providerMeta.label)} · ${escapeHtml(modelName)} 生成</span>，来源：${escapeHtml(b.source_name || '全部来源')}，共 ${(b.counts?.articles || 0)} 篇文献。`;
+  loadBriefingAnnotations(id);
 }
 
 function syncBriefingSourceControls() {
@@ -10408,9 +12620,23 @@ function syncBriefingSourceControls() {
   }
 }
 
+async function generateBriefingForSource(sourceScope, sourceId) {
+  if (!['feed', 'pubmed'].includes(sourceScope) || !Number(sourceId)) return;
+  localStorage.setItem('briefing-source-scope', sourceScope);
+  localStorage.setItem('briefing-source-id', String(sourceId));
+  syncBriefingSourceControls();
+  enterBriefingMode();
+  await generateBriefingNow();
+}
+
 function showBriefingEmpty() {
+  selectedBriefingId = null;
+  briefingAnnotations = [];
+  editingBriefingAnnotationId = null;
   briefingDetailEmpty.classList.remove('hidden');
   briefingDetailContent.classList.add('hidden');
+  if (briefingNoteInput) briefingNoteInput.value = '';
+  if (briefingAnnotationsList) briefingAnnotationsList.innerHTML = '';
 }
 
 async function jumpToArticle(articleId) {
@@ -10453,7 +12679,23 @@ function computeNextBriefingDate() {
 // client-side flag is the UX layer that lets us toggle the button label.
 let briefingInFlight = false;
 
-async function generateBriefingNow() {
+async function generateBriefingForEntries(entries) {
+  const entryIds = [...new Set(
+    (entries || []).map(entry => Number(entry?.id)).filter(Number.isFinite),
+  )];
+  if (entryIds.length < 2) {
+    setGlobalStatus('请至少选择 2 篇文献生成简报', 'error');
+    return;
+  }
+  if (entryIds.length > 40) {
+    setGlobalStatus('生成简报最多选择 40 篇文献', 'error');
+    return;
+  }
+  enterBriefingMode();
+  await generateBriefingNow({ entryIds });
+}
+
+async function generateBriefingNow(options = {}) {
   if (briefingInFlight) {
     // User clicked again before the previous call finished. Silently no-op
     // rather than queueing — duplicate briefings were the original bug.
@@ -10469,7 +12711,13 @@ async function generateBriefingNow() {
     btn.innerHTML = '<span class="spinner"></span> 生成中…';
   }
 
-  setGlobalStatus('正在生成简报…', 'progress');
+  const entryIds = Array.isArray(options?.entryIds)
+    ? [...new Set(options.entryIds.map(Number).filter(Number.isFinite))]
+    : [];
+  setGlobalStatus(
+    entryIds.length ? `正在根据所选 ${entryIds.length} 篇文献生成简报…` : '正在生成简报…',
+    'progress',
+  );
   // Stamp last-attempt so the scheduler doesn't retry the same failure every
   // tick — wait at least an hour after a failure to try again.
   localStorage.setItem('briefing-last-attempt', String(Date.now()));
@@ -10477,13 +12725,21 @@ async function generateBriefingNow() {
   // output-schema part on its own, so the user can edit the editorial
   // direction freely without breaking parsing.
   const customPrompt = localStorage.getItem('briefing-prompt') || null;
-  const expectedFrequency = localStorage.getItem('briefing-frequency') || 'weekly';
-  const sourceScope = localStorage.getItem('briefing-source-scope') || 'rss';
-  const sourceId = ['feed', 'pubmed'].includes(sourceScope)
+  const expectedFrequency = options?.expectedFrequency || null;
+  const sourceScope = entryIds.length
+    ? 'selection'
+    : (localStorage.getItem('briefing-source-scope') || 'rss');
+  const sourceId = !entryIds.length && ['feed', 'pubmed'].includes(sourceScope)
     ? Number(localStorage.getItem('briefing-source-id')) || null
     : null;
   try {
-    const b = await invoke('generate_briefing', { customPrompt, expectedFrequency, sourceScope, sourceId });
+    const b = await invoke('generate_briefing', {
+      customPrompt,
+      expectedFrequency,
+      sourceScope,
+      sourceId,
+      entryIds: entryIds.length ? entryIds : null,
+    });
     loadCostSummary();
     setGlobalStatus('简报已生成', 'success');
     await loadBriefings();
@@ -10602,7 +12858,7 @@ function briefingSchedulerTick() {
 
   if (lastBriefingAt < expected) {
     console.info('[briefing-scheduler] firing — last:', lastBriefingAt, 'expected:', expected);
-    generateBriefingNow();
+    generateBriefingNow({ expectedFrequency: freq });
   }
 }
 
@@ -12871,6 +15127,20 @@ window.addEventListener('DOMContentLoaded', () => {
   // Briefing list
   briefingListEl  = document.getElementById('briefing-list');
   briefingItemsEl = document.getElementById('briefing-items');
+  annotationLibraryEl = document.getElementById('annotation-library');
+  annotationLibraryItems = document.getElementById('annotation-library-items');
+  annotationLibraryCount = document.getElementById('annotation-library-count');
+  annotationLibrarySearch = document.getElementById('annotation-library-search');
+  annotationLibrarySourceFilter = document.getElementById('annotation-library-source-filter');
+  annotationLibraryTypeFilter = document.getElementById('annotation-library-type-filter');
+  annotationLibraryColorFilter = document.getElementById('annotation-library-color-filter');
+  annotationLibrarySort = document.getElementById('annotation-library-sort');
+  annotationColorMeaningMenu = document.getElementById('annotation-color-meaning-menu');
+  annotationColorMeaningRows = document.getElementById('annotation-color-meaning-rows');
+  btnSaveColorMeanings = document.getElementById('btn-save-color-meanings');
+  annotationNewColorInput = document.getElementById('annotation-new-color');
+  annotationNewColorHexInput = document.getElementById('annotation-new-color-hex');
+  btnAddAnnotationColor = document.getElementById('btn-add-annotation-color');
 
   // Detail
   detailPanelEl        = document.getElementById('detail-panel');
@@ -12897,6 +15167,8 @@ window.addEventListener('DOMContentLoaded', () => {
   btnPdfOpenExternal = document.getElementById('btn-pdf-open-external');
   btnPdfDownload = document.getElementById('btn-pdf-download');
   detailReadingNotesContent = document.getElementById('detail-reading-notes-content');
+  manualReadingNoteInput = document.getElementById('manual-reading-note-input');
+  btnManualReadingNote = document.getElementById('btn-manual-reading-note');
   detailPaperChatHint = document.getElementById('detail-paper-chat-hint');
   detailPaperChatMessages = document.getElementById('detail-paper-chat-messages');
   detailPaperChatScopes = document.getElementById('detail-paper-chat-scopes');
@@ -12935,6 +15207,10 @@ window.addEventListener('DOMContentLoaded', () => {
   paperGraphCounts     = document.getElementById('paper-graph-counts');
   briefingDetailEmpty  = document.getElementById('briefing-detail-empty');
   briefingDetailContent = document.getElementById('briefing-detail-content');
+  briefingAnnotationsSection = document.getElementById('briefing-annotations-section');
+  briefingAnnotationsList = document.getElementById('briefing-annotations-list');
+  briefingNoteInput = document.getElementById('briefing-note-input');
+  btnBriefingSaveNote = document.getElementById('btn-briefing-save-note');
 
   sciReviewWorkspace = new SciReviewWorkspace({
     projectList: document.getElementById('sci-review-project-list'),
@@ -12976,11 +15252,13 @@ window.addEventListener('DOMContentLoaded', () => {
   });
 
   setupSidebarResizer();
+  setupSidebarSectionOrdering();
   setupSidebarSectionToggles();
   loadPmcGalleryHistory();
   setupListResizer();
   setupPaperChatResizer();
   setupPaperChatAttachmentDrop();
+  setupReadingHighlighter();
 
   // Wire events
   btnSettings.addEventListener('click', () => {
@@ -13182,6 +15460,10 @@ window.addEventListener('DOMContentLoaded', () => {
         enterBriefingMode({ preserveSearch: !!query });
         return;
       }
+      if (view === 'annotations') {
+        enterAnnotationMode();
+        return;
+      }
       if (view === 'kept') {
         enterKeptMode({ preserveSearch: !!query });
         return;
@@ -13342,6 +15624,74 @@ window.addEventListener('DOMContentLoaded', () => {
     syncBriefingSortControl();
     renderBriefingList();
   });
+
+  [
+    annotationLibrarySearch,
+    annotationLibrarySourceFilter,
+    annotationLibraryTypeFilter,
+    annotationLibraryColorFilter,
+    annotationLibrarySort,
+  ].forEach(control => {
+    control?.addEventListener(control === annotationLibrarySearch ? 'input' : 'change', renderAnnotationLibrary);
+  });
+  annotationLibraryItems?.addEventListener('click', async event => {
+    const openButton = event.target.closest('[data-annotation-open-scope]');
+    if (openButton) {
+      await openReadingAnnotationSource(openButton.dataset.annotationOpenScope);
+      return;
+    }
+    const deleteButton = event.target.closest('[data-annotation-delete-scope]');
+    if (deleteButton) {
+      await deleteReadingAnnotationFromLibrary(
+        deleteButton.dataset.annotationDeleteScope,
+        deleteButton.dataset.annotationDeleteId,
+        deleteButton.dataset.annotationStorage,
+      );
+    }
+  });
+  annotationColorMeaningMenu?.querySelector('summary')?.addEventListener('click', () => {
+    if (!annotationColorMeaningMenu.open) renderAnnotationColorMeaningEditor();
+  });
+  annotationColorMeaningMenu?.querySelector('[data-color-meaning-cancel]')?.addEventListener('click', () => {
+    annotationColorMeaningMenu.removeAttribute('open');
+  });
+  annotationColorMeaningRows?.addEventListener('click', event => {
+    const row = event.target.closest('[data-color-meaning-row]');
+    if (!row) return;
+    const moveButton = event.target.closest('[data-color-move]');
+    if (moveButton) {
+      const sibling = moveButton.dataset.colorMove === 'up'
+        ? row.previousElementSibling
+        : row.nextElementSibling;
+      if (!sibling) return;
+      if (moveButton.dataset.colorMove === 'up') row.parentElement.insertBefore(row, sibling);
+      else row.parentElement.insertBefore(sibling, row);
+      refreshAnnotationColorRowButtons();
+      return;
+    }
+    if (event.target.closest('[data-color-remove]')) {
+      row.remove();
+      refreshAnnotationColorRowButtons();
+    }
+  });
+  annotationNewColorInput?.addEventListener('input', () => {
+    const color = parseReadingHighlightHexColor(annotationNewColorInput.value);
+    if (!color || !annotationNewColorHexInput) return;
+    annotationNewColorHexInput.value = color.toUpperCase();
+    annotationNewColorHexInput.removeAttribute('aria-invalid');
+  });
+  annotationNewColorHexInput?.addEventListener('input', () => {
+    const color = parseReadingHighlightHexColor(annotationNewColorHexInput.value);
+    annotationNewColorHexInput.removeAttribute('aria-invalid');
+    if (color && annotationNewColorInput) annotationNewColorInput.value = color;
+  });
+  annotationNewColorHexInput?.addEventListener('keydown', event => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    addAnnotationCustomColor();
+  });
+  btnAddAnnotationColor?.addEventListener('click', addAnnotationCustomColor);
+  btnSaveColorMeanings?.addEventListener('click', persistAnnotationColorMeanings);
 
   btnDetailAddTag?.addEventListener('click', () => addTagsToCurrentEntry());
   detailTagInput?.addEventListener('keydown', e => {
@@ -13666,6 +16016,19 @@ window.addEventListener('DOMContentLoaded', () => {
     await applyBulkPubmedStatus(status);
   });
   btnPubmedAiScreen?.addEventListener('click', startPubmedAiScreening);
+  btnManualReadingNote?.addEventListener('click', saveManualReadingNote);
+  manualReadingNoteInput?.addEventListener('input', () => {
+    if (!currentEntry?.id) return;
+    const draft = manualReadingNoteInput.value;
+    if (draft) manualReadingNoteDrafts.set(currentEntry.id, draft);
+    else manualReadingNoteDrafts.delete(currentEntry.id);
+  });
+  manualReadingNoteInput?.addEventListener('keydown', event => {
+    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+      event.preventDefault();
+      saveManualReadingNote();
+    }
+  });
 
   // Generate briefing
   document.getElementById('btn-generate-briefing')?.addEventListener('click', generateBriefingNow);
@@ -13677,7 +16040,47 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('briefing-source-id')?.addEventListener('change', event => {
     localStorage.setItem('briefing-source-id', event.currentTarget.value);
   });
+  btnBriefingSaveNote?.addEventListener('click', saveBriefingManualNote);
+  briefingNoteInput?.addEventListener('keydown', event => {
+    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+      event.preventDefault();
+      saveBriefingManualNote();
+    }
+  });
+  briefingAnnotationsList?.addEventListener('click', async event => {
+    const editBtn = event.target.closest('[data-briefing-annotation-edit]');
+    if (editBtn) {
+      event.preventDefault();
+      openBriefingAnnotationEditor(editBtn.dataset.briefingAnnotationEdit);
+      return;
+    }
 
+    const saveBtn = event.target.closest('[data-briefing-annotation-save]');
+    if (saveBtn) {
+      event.preventDefault();
+      await saveBriefingAnnotationNote(parseInt(saveBtn.dataset.briefingAnnotationSave, 10));
+      return;
+    }
+
+    const cancelBtn = event.target.closest('[data-briefing-annotation-cancel]');
+    if (cancelBtn) {
+      event.preventDefault();
+      closeBriefingAnnotationEditor();
+      return;
+    }
+
+    const deleteBtn = event.target.closest('[data-briefing-annotation-delete]');
+    if (deleteBtn) {
+      event.preventDefault();
+      await deleteBriefingAnnotationById(parseInt(deleteBtn.dataset.briefingAnnotationDelete, 10));
+      return;
+    }
+
+    const a = event.target.closest('a[data-open-url]');
+    if (!a) return;
+    event.preventDefault();
+    openUrl(a.dataset.openUrl);
+  });
   // Initialize sub-modules
   setupWindowDragFallback();
   initAppearanceControls();

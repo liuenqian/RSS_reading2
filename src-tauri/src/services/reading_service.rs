@@ -10,6 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const PAPER_CHAT_NOTE_PROFILE_ID: &str = "paper-chat-excerpts";
 const PAPER_CHAT_NOTE_PROFILE_NAME: &str = "对话摘录";
+const MANUAL_READING_NOTE_PROFILE_PREFIX: &str = "manual-note";
+const MANUAL_READING_NOTE_PROFILE_NAME: &str = "手动笔记";
 
 pub(crate) struct EntryReadingContext {
     pub(crate) title: String,
@@ -128,6 +130,42 @@ pub fn upsert_reading_note(
         reading_note_from_row,
     )
     .map_err(|e| format!("读取新笔记失败: {}", e))
+}
+
+pub fn add_manual_reading_note(
+    conn: &Connection,
+    entry_id: i64,
+    content: &str,
+) -> Result<ReadingNote, String> {
+    if content.trim().is_empty() {
+        return Err("手动笔记内容不能为空".to_string());
+    }
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let profile_id = format!("{}-{}", MANUAL_READING_NOTE_PROFILE_PREFIX, suffix);
+    conn.execute(
+        "INSERT INTO reading_notes (entry_id, profile_id, profile_name, content, generated_at)
+         VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+        rusqlite::params![
+            entry_id,
+            &profile_id,
+            MANUAL_READING_NOTE_PROFILE_NAME,
+            content.trim()
+        ],
+    )
+    .map_err(|e| format!("保存手动笔记失败: {}", e))?;
+
+    conn.query_row(
+        "SELECT id, entry_id, profile_id, profile_name, content, generated_at
+         FROM reading_notes
+         WHERE id = ?1",
+        [conn.last_insert_rowid()],
+        reading_note_from_row,
+    )
+    .map_err(|e| format!("读取手动笔记失败: {}", e))
 }
 
 pub fn delete_reading_note(conn: &Connection, note_id: i64) -> Result<(), String> {

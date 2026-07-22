@@ -6,7 +6,7 @@
 // thin wrappers wire it up.
 
 use crate::db::DbState;
-use crate::models::Briefing;
+use crate::models::{Briefing, BriefingAnnotation};
 use crate::services::{briefing_service, notify};
 use tauri::{AppHandle, State};
 use tracing::warn;
@@ -23,6 +23,64 @@ pub fn list_briefings(state: State<'_, DbState>) -> Result<Vec<Briefing>, String
 pub fn delete_briefing(state: State<'_, DbState>, id: i64) -> Result<(), String> {
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
     briefing_service::delete_briefing(&conn, id)
+}
+
+#[tauri::command]
+pub fn list_briefing_annotations(
+    state: State<'_, DbState>,
+    briefing_id: i64,
+) -> Result<Vec<BriefingAnnotation>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    briefing_service::list_briefing_annotations(&conn, briefing_id)
+}
+
+#[tauri::command]
+pub fn list_all_briefing_annotations(
+    state: State<'_, DbState>,
+) -> Result<Vec<BriefingAnnotation>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    briefing_service::list_all_briefing_annotations(&conn)
+}
+
+#[tauri::command]
+pub fn add_briefing_annotation(
+    state: State<'_, DbState>,
+    briefing_id: i64,
+    kind: String,
+    selected_text: Option<String>,
+    anchor_json: Option<String>,
+    color: Option<String>,
+    note: Option<String>,
+) -> Result<BriefingAnnotation, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    briefing_service::add_briefing_annotation(
+        &conn,
+        briefing_id,
+        &kind,
+        selected_text.as_deref(),
+        anchor_json.as_deref(),
+        color.as_deref(),
+        note.as_deref(),
+    )
+}
+
+#[tauri::command]
+pub fn update_briefing_annotation(
+    state: State<'_, DbState>,
+    annotation_id: i64,
+    note: String,
+) -> Result<BriefingAnnotation, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    briefing_service::update_briefing_annotation(&conn, annotation_id, &note)
+}
+
+#[tauri::command]
+pub fn delete_briefing_annotation(
+    state: State<'_, DbState>,
+    annotation_id: i64,
+) -> Result<(), String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    briefing_service::delete_briefing_annotation(&conn, annotation_id)
 }
 
 /// Compose a fresh briefing from the last 7 days of articles via the active AI
@@ -42,6 +100,7 @@ pub async fn generate_briefing(
     expected_frequency: Option<String>,
     source_scope: Option<String>,
     source_id: Option<i64>,
+    entry_ids: Option<Vec<i64>>,
 ) -> Result<Briefing, String> {
     let briefing = briefing_service::generate_briefing(
         state.inner(),
@@ -49,6 +108,7 @@ pub async fn generate_briefing(
         expected_frequency,
         source_scope,
         source_id,
+        entry_ids,
     )
     .await?;
 

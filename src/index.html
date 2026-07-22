@@ -2231,6 +2231,23 @@
                             ></span>
                         </div>
                         <div
+                            class="sidebar-row sidebar-row-annotations"
+                            data-view="annotations"
+                            id="sidebar-row-annotations"
+                        >
+                            <span class="sidebar-row-icon">
+                                <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                    <path d="M3 12.5h10" />
+                                    <path d="m4 9.8 5.7-5.7 2.2 2.2-5.7 5.7H4Z" />
+                                </svg>
+                            </span>
+                            <span class="sidebar-row-label">标注</span>
+                            <span
+                                class="sidebar-row-count sidebar-row-count-annotations"
+                                id="count-annotations"
+                            ></span>
+                        </div>
+                        <div
                             class="sidebar-row"
                             data-view="briefing"
                             id="sidebar-row-briefing"
@@ -2283,7 +2300,7 @@
                         </div>
                     </div>
 
-                    <div class="sidebar-source-sections">
+                    <div class="sidebar-source-sections" data-sidebar-source-sections>
                         <section class="sidebar-source-section sci-review-sidebar-section" data-sidebar-source-section="sci-review">
                             <div class="feed-section-label">
                                 <button
@@ -2297,9 +2314,14 @@
                                     <svg class="sidebar-section-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
                                     <span>SCI 综述项目</span>
                                 </button>
-                                <button id="btn-new-sci-review-project" class="sidebar-section-action" type="button" title="新建 SCI 综述项目" aria-label="新建 SCI 综述项目">
-                                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
-                                </button>
+                                <div class="sidebar-section-actions">
+                                    <button class="sidebar-section-drag-handle" type="button" data-sidebar-section-drag-handle="sci-review" title="拖动调整顺序" aria-label="拖动调整顺序">
+                                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M5.5 4.5h.01M10.5 4.5h.01M5.5 8h.01M10.5 8h.01M5.5 11.5h.01M10.5 11.5h.01" /></svg>
+                                    </button>
+                                    <button id="btn-new-sci-review-project" class="sidebar-section-action" type="button" title="新建 SCI 综述项目" aria-label="新建 SCI 综述项目">
+                                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                                    </button>
+                                </div>
                             </div>
                             <ul id="sci-review-project-list" class="review-project-list sidebar-section-list"></ul>
                         </section>
@@ -2316,9 +2338,14 @@
                                     <svg class="sidebar-section-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
                                     <span>PMC 图库</span>
                                 </button>
-                                <button id="btn-new-pmc-gallery-search" class="sidebar-section-action" type="button" title="新建 PMC 图库检索" aria-label="新建 PMC 图库检索">
-                                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
-                                </button>
+                                <div class="sidebar-section-actions">
+                                    <button class="sidebar-section-drag-handle" type="button" data-sidebar-section-drag-handle="pmc-gallery" title="拖动调整顺序" aria-label="拖动调整顺序">
+                                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M5.5 4.5h.01M10.5 4.5h.01M5.5 8h.01M10.5 8h.01M5.5 11.5h.01M10.5 11.5h.01" /></svg>
+                                    </button>
+                                    <button id="btn-new-pmc-gallery-search" class="sidebar-section-action" type="button" title="新建 PMC 图库检索" aria-label="新建 PMC 图库检索">
+                                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                                    </button>
+                                </div>
                             </div>
                             <ul id="pmc-gallery-search-list" class="pubmed-search-list sidebar-section-list"></ul>
                         </section>
@@ -2335,9 +2362,14 @@
                                     <svg class="sidebar-section-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
                                     <span>PubMed 检索</span>
                                 </button>
-                                <button id="btn-new-pubmed-search" class="sidebar-section-action" type="button" title="新建 PubMed 检索" aria-label="新建 PubMed 检索">
-                                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
-                                </button>
+                                <div class="sidebar-section-actions">
+                                    <button class="sidebar-section-drag-handle" type="button" data-sidebar-section-drag-handle="pubmed" title="拖动调整顺序" aria-label="拖动调整顺序">
+                                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M5.5 4.5h.01M10.5 4.5h.01M5.5 8h.01M10.5 8h.01M5.5 11.5h.01M10.5 11.5h.01" /></svg>
+                                    </button>
+                                    <button id="btn-new-pubmed-search" class="sidebar-section-action" type="button" title="新建 PubMed 检索" aria-label="新建 PubMed 检索">
+                                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                                    </button>
+                                </div>
                             </div>
                             <ul id="pubmed-search-list" class="pubmed-search-list sidebar-section-list"></ul>
                         </section>
@@ -2355,9 +2387,14 @@
                                     <svg class="sidebar-section-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
                                     <span>订阅源</span>
                                 </button>
-                                <button id="btn-new-feed" class="sidebar-section-action" type="button" title="添加 RSS 订阅" aria-label="添加 RSS 订阅">
-                                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
-                                </button>
+                                <div class="sidebar-section-actions">
+                                    <button class="sidebar-section-drag-handle" type="button" data-sidebar-section-drag-handle="feeds" title="拖动调整顺序" aria-label="拖动调整顺序">
+                                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M5.5 4.5h.01M10.5 4.5h.01M5.5 8h.01M10.5 8h.01M5.5 11.5h.01M10.5 11.5h.01" /></svg>
+                                    </button>
+                                    <button id="btn-new-feed" class="sidebar-section-action" type="button" title="添加 RSS 订阅" aria-label="添加 RSS 订阅">
+                                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                                    </button>
+                                </div>
                             </div>
                             <ul id="feed-list" class="feed-list sidebar-section-list"></ul>
                         </section>
@@ -2807,6 +2844,88 @@
                         <ul id="briefing-items" class="briefing-items"></ul>
                     </section>
 
+                    <section id="annotation-library" class="annotation-library hidden" aria-label="标注中心">
+                        <header class="annotation-library-header">
+                            <div class="annotation-library-heading">
+                                <span class="annotation-library-kicker">阅读工作区</span>
+                                <div class="annotation-library-title-row">
+                                    <h2>标注中心</h2>
+                                    <span id="annotation-library-count" class="annotation-library-count">0 条</span>
+                                </div>
+                            </div>
+                            <div class="annotation-library-controls" aria-label="筛选标注">
+                                <label class="annotation-library-search">
+                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3"/></svg>
+                                    <input id="annotation-library-search" type="search" placeholder="搜索标注、便签或文献标题" aria-label="搜索标注" />
+                                </label>
+                                <select id="annotation-library-source-filter" class="settings-select compact" aria-label="按来源筛选">
+                                    <option value="all">全部来源</option>
+                                    <option value="entry">文献</option>
+                                    <option value="briefing">简报</option>
+                                    <option value="other">其他</option>
+                                </select>
+                                <select id="annotation-library-type-filter" class="settings-select compact" aria-label="按类型筛选">
+                                    <option value="all">全部类型</option>
+                                    <option value="highlight">高亮</option>
+                                    <option value="underline">下划线</option>
+                                    <option value="note">便签</option>
+                                    <option value="box">框选</option>
+                                    <option value="pen">画笔</option>
+                                </select>
+                                <select id="annotation-library-color-filter" class="settings-select compact" aria-label="按颜色筛选">
+                                    <option value="all">全部颜色</option>
+                                    <option value="yellow">黄色</option>
+                                    <option value="green">绿色</option>
+                                    <option value="blue">蓝色</option>
+                                    <option value="pink">粉色</option>
+                                    <option value="purple">紫色</option>
+                                    <option value="orange">橙色</option>
+                                    <option value="custom">自定义色</option>
+                                </select>
+                                <details id="annotation-color-meaning-menu" class="annotation-color-meaning-menu">
+                                    <summary class="btn btn-secondary btn-sm">
+                                        <span class="annotation-color-meaning-icon" aria-hidden="true"></span>
+                                        <span>颜色含义</span>
+                                    </summary>
+                                    <div class="annotation-color-meaning-panel">
+                                        <div class="annotation-color-meaning-heading">颜色与含义</div>
+                                        <div id="annotation-color-meaning-rows" class="annotation-color-meaning-rows"></div>
+                                        <div class="annotation-color-add-row">
+                                            <label class="annotation-color-add-picker" title="选择新颜色">
+                                                <input id="annotation-new-color" type="color" value="#d46f58" aria-label="选择新颜色" />
+                                            </label>
+                                            <input
+                                                id="annotation-new-color-hex"
+                                                class="annotation-color-add-hex"
+                                                type="text"
+                                                value="#D46F58"
+                                                maxlength="7"
+                                                placeholder="#RRGGBB"
+                                                autocomplete="off"
+                                                spellcheck="false"
+                                                aria-label="输入十六进制颜色"
+                                            />
+                                            <button type="button" id="btn-add-annotation-color" class="btn btn-secondary btn-sm">
+                                                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                                                <span>添加颜色</span>
+                                            </button>
+                                        </div>
+                                        <div class="annotation-color-meaning-actions">
+                                            <button type="button" class="btn btn-secondary btn-sm" data-color-meaning-cancel>取消</button>
+                                            <button type="button" id="btn-save-color-meanings" class="btn btn-primary btn-sm">保存</button>
+                                        </div>
+                                    </div>
+                                </details>
+                                <select id="annotation-library-sort" class="settings-select compact" aria-label="标注排序">
+                                    <option value="newest">最新在前</option>
+                                    <option value="oldest">最早在前</option>
+                                    <option value="document">按文献整理</option>
+                                </select>
+                            </div>
+                        </header>
+                        <div id="annotation-library-items" class="annotation-library-items"></div>
+                    </section>
+
                     <div
                         id="list-resizer"
                         class="panel-resizer"
@@ -3169,6 +3288,24 @@
                                             <div class="detail-reading-notes-header">
                                                 <div class="detail-reading-notes-label">
                                                     阅读笔记
+                                                </div>
+                                            </div>
+                                            <div class="manual-reading-note-composer">
+                                                <textarea
+                                                    id="manual-reading-note-input"
+                                                    class="settings-input settings-textarea manual-reading-note-input"
+                                                    rows="3"
+                                                    placeholder="写下自己的阅读笔记、疑问或后续想法"
+                                                    aria-label="自己的阅读笔记"
+                                                ></textarea>
+                                                <div class="manual-reading-note-actions">
+                                                    <button
+                                                        id="btn-manual-reading-note"
+                                                        class="btn btn-primary btn-sm"
+                                                        type="button"
+                                                    >
+                                                        添加笔记
+                                                    </button>
                                                 </div>
                                             </div>
                                             <div
@@ -3560,6 +3697,37 @@
                                         id="briefing-detail-leadin"
                                     ></p>
                                     <div id="briefing-detail-sections"></div>
+                                    <section
+                                        id="briefing-annotations-section"
+                                        class="briefing-annotations-section"
+                                    >
+                                        <div class="briefing-annotations-header">
+                                            <div class="briefing-annotations-label">
+                                                笔记与高亮
+                                            </div>
+                                        </div>
+                                        <div class="briefing-note-composer">
+                                            <textarea
+                                                id="briefing-note-input"
+                                                class="settings-input settings-textarea briefing-note-input"
+                                                rows="4"
+                                                placeholder="写下备注、疑问或后续动作"
+                                            ></textarea>
+                                            <div class="briefing-note-composer-actions">
+                                                <button
+                                                    class="btn btn-primary btn-sm"
+                                                    type="button"
+                                                    id="btn-briefing-save-note"
+                                                >
+                                                    添加笔记
+                                                </button>
+                                            </div>
+                                        </div>
+                                        <div
+                                            id="briefing-annotations-list"
+                                            class="briefing-annotations-list"
+                                        ></div>
+                                    </section>
                                     <div
                                         id="briefing-detail-footer"
                                         class="detail-ai-footer"

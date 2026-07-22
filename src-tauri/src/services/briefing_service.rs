@@ -3,9 +3,9 @@
 // driven by the "AI 简报" panel in the frontend.
 
 use crate::db::DbState;
-use crate::models::{Briefing, BriefingCounts, DeepSeekSettings};
+use crate::models::{Briefing, BriefingAnnotation, BriefingCounts, DeepSeekSettings};
 use crate::services::{cost_service, settings_service, translate_service};
-use rusqlite::Connection;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
@@ -128,6 +128,201 @@ pub fn delete_briefing(conn: &Connection, id: i64) -> Result<(), String> {
     Ok(())
 }
 
+fn briefing_annotation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BriefingAnnotation> {
+    Ok(BriefingAnnotation {
+        id: row.get(0)?,
+        briefing_id: row.get(1)?,
+        kind: row.get(2)?,
+        selected_text: row.get(3)?,
+        anchor_json: row.get(4)?,
+        color: row.get(5)?,
+        note: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn normalize_annotation_kind(kind: &str) -> Result<&'static str, String> {
+    match kind.trim() {
+        "note" => Ok("note"),
+        "highlight" => Ok("highlight"),
+        _ => Err("未知的简报标注类型".to_string()),
+    }
+}
+
+fn normalize_annotation_color(color: Option<&str>) -> Result<String, String> {
+    let value = color.unwrap_or("yellow").trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Ok("yellow".to_string());
+    }
+    if ["yellow", "green", "blue", "pink", "purple", "orange"].contains(&value.as_str()) {
+        return Ok(value);
+    }
+    if value.len() == 7
+        && value.starts_with('#')
+        && value[1..]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Ok(value);
+    }
+    Err("未知的高亮颜色".to_string())
+}
+
+fn clipped_annotation_text(value: Option<&str>, max_chars: usize) -> String {
+    value.unwrap_or("").trim().chars().take(max_chars).collect()
+}
+
+fn ensure_briefing_exists(conn: &Connection, briefing_id: i64) -> Result<(), String> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM briefings WHERE id = ?1",
+            [briefing_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| format!("检查简报失败: {}", e))?
+        .is_some();
+    if !exists {
+        return Err("简报不存在或已删除".to_string());
+    }
+    Ok(())
+}
+
+fn read_briefing_annotation(
+    conn: &Connection,
+    annotation_id: i64,
+) -> Result<BriefingAnnotation, String> {
+    conn.query_row(
+        "SELECT id, briefing_id, kind, selected_text, anchor_json, color, note,
+                created_at, updated_at
+         FROM briefing_annotations
+         WHERE id = ?1",
+        [annotation_id],
+        briefing_annotation_from_row,
+    )
+    .map_err(|e| format!("读取简报标注失败: {}", e))
+}
+
+pub fn list_briefing_annotations(
+    conn: &Connection,
+    briefing_id: i64,
+) -> Result<Vec<BriefingAnnotation>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, briefing_id, kind, selected_text, anchor_json, color, note,
+                    created_at, updated_at
+             FROM briefing_annotations
+             WHERE briefing_id = ?1
+             ORDER BY updated_at DESC, id DESC",
+        )
+        .map_err(|e| format!("读取简报标注失败: {}", e))?;
+    let rows = stmt
+        .query_map([briefing_id], briefing_annotation_from_row)
+        .map_err(|e| format!("读取简报标注失败: {}", e))?;
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+pub fn list_all_briefing_annotations(conn: &Connection) -> Result<Vec<BriefingAnnotation>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, briefing_id, kind, selected_text, anchor_json, color, note,
+                    created_at, updated_at
+             FROM briefing_annotations
+             ORDER BY updated_at DESC, id DESC",
+        )
+        .map_err(|e| format!("读取全部简报标注失败: {}", e))?;
+    let rows = stmt
+        .query_map([], briefing_annotation_from_row)
+        .map_err(|e| format!("读取全部简报标注失败: {}", e))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("解析简报标注失败: {}", e))
+}
+
+pub fn add_briefing_annotation(
+    conn: &Connection,
+    briefing_id: i64,
+    kind: &str,
+    selected_text: Option<&str>,
+    anchor_json: Option<&str>,
+    color: Option<&str>,
+    note: Option<&str>,
+) -> Result<BriefingAnnotation, String> {
+    ensure_briefing_exists(conn, briefing_id)?;
+    let kind = normalize_annotation_kind(kind)?;
+    let mut selected_text = clipped_annotation_text(selected_text, 4000);
+    let mut anchor_json = clipped_annotation_text(anchor_json, 12000);
+    let mut color = normalize_annotation_color(color)?;
+    let note = clipped_annotation_text(note, 20000);
+
+    if kind == "note" {
+        if note.is_empty() {
+            return Err("简报笔记内容不能为空".to_string());
+        }
+        selected_text.clear();
+        anchor_json.clear();
+        color = "yellow".to_string();
+    } else if selected_text.is_empty() {
+        return Err("请先选择要高亮的简报内容".to_string());
+    }
+
+    conn.execute(
+        "INSERT INTO briefing_annotations
+            (briefing_id, kind, selected_text, anchor_json, color, note, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))",
+        params![briefing_id, kind, selected_text, anchor_json, color, note],
+    )
+    .map_err(|e| format!("保存简报标注失败: {}", e))?;
+    read_briefing_annotation(conn, conn.last_insert_rowid())
+}
+
+pub fn update_briefing_annotation(
+    conn: &Connection,
+    annotation_id: i64,
+    note: &str,
+) -> Result<BriefingAnnotation, String> {
+    let kind = conn
+        .query_row(
+            "SELECT kind FROM briefing_annotations WHERE id = ?1",
+            [annotation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("读取简报标注失败: {}", e))?
+        .ok_or_else(|| "简报标注不存在或已删除".to_string())?;
+    let note = clipped_annotation_text(Some(note), 20000);
+    if kind == "note" && note.is_empty() {
+        return Err("简报笔记内容不能为空".to_string());
+    }
+
+    let changed = conn
+        .execute(
+            "UPDATE briefing_annotations
+             SET note = ?2,
+                 updated_at = datetime('now')
+             WHERE id = ?1",
+            params![annotation_id, note],
+        )
+        .map_err(|e| format!("更新简报标注失败: {}", e))?;
+    if changed == 0 {
+        return Err("简报标注不存在或已删除".to_string());
+    }
+    read_briefing_annotation(conn, annotation_id)
+}
+
+pub fn delete_briefing_annotation(conn: &Connection, annotation_id: i64) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            "DELETE FROM briefing_annotations WHERE id = ?1",
+            [annotation_id],
+        )
+        .map_err(|e| format!("删除简报标注失败: {}", e))?;
+    if changed == 0 {
+        return Err("简报标注不存在或已删除".to_string());
+    }
+    Ok(())
+}
+
 /// Generate a briefing from entries fetched in the last week.
 /// Reads the DB → builds the prompt → calls DeepSeek → parses → saves → returns
 /// the new briefing. The DB lock is dropped before each `.await`.
@@ -142,6 +337,7 @@ pub async fn generate_briefing(
     expected_frequency: Option<String>,
     source_scope: Option<String>,
     source_id: Option<i64>,
+    entry_ids: Option<Vec<i64>>,
 ) -> Result<Briefing, String> {
     // Reject overlapping calls. swap returns the previous value, so if a
     // generation is already in flight we get `true` and bail out without
@@ -154,7 +350,12 @@ pub async fn generate_briefing(
     }
     let _guard = InFlightGuard(&state.briefing_in_flight);
 
-    let source_scope = normalize_source_scope(source_scope.as_deref());
+    let selected_entry_ids = normalize_selected_entry_ids(entry_ids)?;
+    let source_scope = if selected_entry_ids.is_empty() {
+        normalize_source_scope(source_scope.as_deref())
+    } else {
+        "selection"
+    };
     let (entries, source_name, settings, period_label) = {
         let conn = state.conn.lock().map_err(|e| e.to_string())?;
         let settings = settings_service::get_settings(&conn);
@@ -176,7 +377,11 @@ pub async fn generate_briefing(
                 }
             }
         }
-        let (entries, source_name) = collect_recent_entries(&conn, source_scope, source_id)?;
+        let (entries, source_name) = if source_scope == "selection" {
+            collect_selected_entries(&conn, &selected_entry_ids)?
+        } else {
+            collect_recent_entries(&conn, source_scope, source_id)?
+        };
         let label = build_period_label();
         (entries, source_name, settings, label)
     };
@@ -317,6 +522,26 @@ fn normalize_source_scope(value: Option<&str>) -> &'static str {
     }
 }
 
+fn normalize_selected_entry_ids(entry_ids: Option<Vec<i64>>) -> Result<Vec<i64>, String> {
+    let mut ids = Vec::new();
+    for id in entry_ids
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| *id > 0)
+    {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if ids.len() > MAX_ARTICLES_IN_PROMPT {
+        return Err(format!(
+            "生成简报最多选择 {} 篇文献",
+            MAX_ARTICLES_IN_PROMPT
+        ));
+    }
+    Ok(ids)
+}
+
 fn briefing_source_name(
     conn: &Connection,
     source_scope: &str,
@@ -415,6 +640,57 @@ fn collect_recent_entries(
     Ok((rows.filter_map(|r| r.ok()).collect(), source_name))
 }
 
+fn collect_selected_entries(
+    conn: &Connection,
+    entry_ids: &[i64],
+) -> Result<(Vec<EntryForBriefing>, String), String> {
+    if entry_ids.is_empty() {
+        return Err("请至少选择 1 篇文献".to_string());
+    }
+    let placeholders = (1..=entry_ids.len())
+        .map(|index| format!("?{}", index))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT e.feed_id,
+                e.title,
+                e.source,
+                t_title.translated_text,
+                t_summary.translated_text,
+                e.link
+         FROM entries e
+         LEFT JOIN translations t_title
+           ON t_title.entry_id = e.id AND t_title.field = 'title'
+          AND length(trim(t_title.translated_text)) > 0
+         LEFT JOIN translations t_summary
+           ON t_summary.entry_id = e.id AND t_summary.field = 'summary'
+          AND length(trim(t_summary.translated_text)) > 0
+         WHERE e.id IN ({})
+         ORDER BY e.published_at DESC, e.fetched_at DESC",
+        placeholders
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("查询所选文章失败: {}", e))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(entry_ids.iter()), |row| {
+            Ok(EntryForBriefing {
+                feed_id: row.get(0)?,
+                title_en: row.get(1)?,
+                journal: row.get(2)?,
+                title_zh: row.get(3)?,
+                summary_zh: row.get(4)?,
+                link: row.get(5)?,
+            })
+        })
+        .map_err(|e| format!("查询所选文章失败: {}", e))?;
+    let entries = rows.filter_map(|row| row.ok()).collect::<Vec<_>>();
+    if entries.len() != entry_ids.len() {
+        return Err("部分所选文献不存在，请刷新列表后重试".to_string());
+    }
+    Ok((entries, format!("手动选择 {} 篇文献", entry_ids.len())))
+}
+
 fn format_entries_for_prompt(entries: &[EntryForBriefing]) -> String {
     let mut buf = String::with_capacity(entries.len() * 240);
     buf.push_str("以下是近 7 天抓取的文献（已按时间倒序）。请在简报末尾输出「## 参考文献」一节，按编号列出全部用到的文献及其链接：\n\n");
@@ -499,7 +775,7 @@ fn parse_briefing_json(raw: &str) -> Result<ParsedBriefing, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::collect_recent_entries;
+    use super::{collect_recent_entries, collect_selected_entries, normalize_annotation_color};
     use rusqlite::Connection;
 
     fn source_database() -> Connection {
@@ -556,5 +832,28 @@ mod tests {
         assert_eq!(pubmed[0].title_en, "PubMed paper");
         assert_eq!(pubmed_name, "PubMed B");
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn selected_entries_are_collected_by_exact_ids() {
+        let conn = source_database();
+        let (selected, source_name) = collect_selected_entries(&conn, &[20]).unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].title_en, "PubMed paper");
+        assert_eq!(source_name, "手动选择 1 篇文献");
+    }
+
+    #[test]
+    fn briefing_annotation_colors_accept_presets_and_hex_values() {
+        assert_eq!(
+            normalize_annotation_color(Some("purple")).unwrap(),
+            "purple"
+        );
+        assert_eq!(
+            normalize_annotation_color(Some("#58A6A6")).unwrap(),
+            "#58a6a6"
+        );
+        assert!(normalize_annotation_color(Some("#58ZZZZ")).is_err());
     }
 }

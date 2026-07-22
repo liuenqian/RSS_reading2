@@ -776,6 +776,19 @@ pub struct Briefing {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BriefingAnnotation {
+    pub id: i64,
+    pub briefing_id: i64,
+    pub kind: String,
+    pub selected_text: String,
+    pub anchor_json: String,
+    pub color: String,
+    pub note: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiteratureGrowthSource {
     pub source_kind: String,
     pub source_id: i64,
