@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "cento"
-version = "1.1.14"
+version = "1.1.15"
 dependencies = [
  "calamine",
  "feed-rs",
