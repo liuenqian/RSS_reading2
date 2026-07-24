@@ -44,7 +44,7 @@ test('briefings support manual notes and persistent highlights', () => {
   assert.match(lib, /briefing_cmd::delete_briefing_annotation/);
   assert.match(db, /CREATE TABLE IF NOT EXISTS briefing_annotations/);
   assert.match(migrations, /ensure_briefing_annotation_table/);
-  assert.match(migrations, /const PUBMED_SCHEMA_VERSION: i64 = 15/);
+  assert.match(migrations, /const PUBMED_SCHEMA_VERSION: i64 = 16/);
   assert.match(migrations, /ensure_briefing_annotation_color_schema/);
   assert.match(service, /value\.starts_with\('#'\)/);
 });

@@ -200,6 +200,16 @@ pub fn bulk_set_pubmed_screening_status(
 }
 
 #[tauri::command]
+pub fn remove_pubmed_search_entries(
+    state: State<DbState>,
+    search_id: i64,
+    entry_ids: Vec<i64>,
+) -> Result<usize, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    pubmed_search_service::remove_search_entries(&conn, search_id, &entry_ids)
+}
+
+#[tauri::command]
 pub fn get_pubmed_author_identity_state(
     state: State<DbState>,
     search_id: i64,

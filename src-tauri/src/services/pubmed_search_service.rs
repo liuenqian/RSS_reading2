@@ -1223,13 +1223,16 @@ async fn run_search_inner(
     cancel_flag: &AtomicBool,
 ) -> Result<PubmedSearchRunResult, String> {
     let client = pubmed_client()?;
-    let pmids = if let Some(pmids) = resume_pmids {
+    let pmids = if let Some(mut pmids) = resume_pmids {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        filter_ignored_pmids(&conn, search_id, &mut pmids)?;
         pmids
     } else {
         match collect_run_query_pmids(&client, search, expansion, cancel_flag).await {
-            Ok(branches) => {
-                let pmids = merge_query_pmids(&branches);
+            Ok(mut branches) => {
                 let conn = state.conn.lock().map_err(|e| e.to_string())?;
+                filter_ignored_query_pmids(&conn, search_id, &mut branches)?;
+                let pmids = merge_query_pmids(&branches);
                 complete_run_queries(&conn, run_id, &branches)?;
                 snapshot_multi_query_run_items(&conn, run_id, &branches, &pmids)?;
                 reuse_local_run_items(&conn, search_id, run_id, &pmids)?
@@ -1447,6 +1450,39 @@ fn merge_query_pmids(branches: &[CollectedRunQuery]) -> Vec<String> {
         .filter(|pmid| seen.insert((*pmid).clone()))
         .cloned()
         .collect()
+}
+
+fn ignored_pmids(conn: &Connection, search_id: i64) -> Result<HashSet<String>, String> {
+    let mut statement = conn
+        .prepare("SELECT pmid FROM pubmed_search_ignored_pmids WHERE search_id = ?1")
+        .map_err(|e| format!("准备读取 PubMed 忽略文献失败: {}", e))?;
+    let rows = statement
+        .query_map([search_id], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("读取 PubMed 忽略文献失败: {}", e))?;
+    rows.collect::<Result<HashSet<_>, _>>()
+        .map_err(|e| format!("读取 PubMed 忽略文献失败: {}", e))
+}
+
+fn filter_ignored_pmids(
+    conn: &Connection,
+    search_id: i64,
+    pmids: &mut Vec<String>,
+) -> Result<(), String> {
+    let ignored = ignored_pmids(conn, search_id)?;
+    pmids.retain(|pmid| !ignored.contains(pmid));
+    Ok(())
+}
+
+fn filter_ignored_query_pmids(
+    conn: &Connection,
+    search_id: i64,
+    branches: &mut [CollectedRunQuery],
+) -> Result<(), String> {
+    let ignored = ignored_pmids(conn, search_id)?;
+    for branch in branches {
+        branch.pmids.retain(|pmid| !ignored.contains(pmid));
+    }
+    Ok(())
 }
 
 fn complete_run_queries(
@@ -2434,6 +2470,64 @@ pub fn list_search_entries(
         .map_err(|e| format!("查询 PubMed 批次文献失败: {}", e))?;
     load_search_entry_structured_authors(conn, search_id, &mut entries)?;
     Ok(entries)
+}
+
+pub fn remove_search_entries(
+    conn: &Connection,
+    search_id: i64,
+    entry_ids: &[i64],
+) -> Result<usize, String> {
+    let unique_ids = entry_ids.iter().copied().collect::<HashSet<_>>();
+    if unique_ids.is_empty() {
+        return Err("请先选择要移出的文献".to_string());
+    }
+
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("开始移出 PubMed 文献失败: {}", e))?;
+    let search_exists = tx
+        .query_row(
+            "SELECT 1 FROM pubmed_searches WHERE id = ?1",
+            [search_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| format!("读取 PubMed 检索失败: {}", e))?
+        .is_some();
+    if !search_exists {
+        return Err("PubMed 检索不存在".to_string());
+    }
+
+    let mut removed = 0;
+    for entry_id in unique_ids {
+        let pmid = tx
+            .query_row(
+                "SELECT e.pmid
+                 FROM pubmed_search_entries pse
+                 JOIN entries e ON e.id = pse.entry_id
+                 WHERE pse.search_id = ?1 AND pse.entry_id = ?2 AND pse.is_current_match = 1",
+                params![search_id, entry_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("读取待移出 PubMed 文献失败: {}", e))?
+            .ok_or_else(|| format!("文献 {} 不属于当前检索结果", entry_id))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO pubmed_search_ignored_pmids (search_id, pmid)
+             VALUES (?1, ?2)",
+            params![search_id, pmid],
+        )
+        .map_err(|e| format!("保存 PubMed 忽略文献失败: {}", e))?;
+        removed += tx
+            .execute(
+                "DELETE FROM pubmed_search_entries WHERE search_id = ?1 AND entry_id = ?2",
+                params![search_id, entry_id],
+            )
+            .map_err(|e| format!("移出 PubMed 文献失败: {}", e))?;
+    }
+    tx.commit()
+        .map_err(|e| format!("提交 PubMed 文献移出失败: {}", e))?;
+    Ok(removed)
 }
 
 fn load_search_entry_structured_authors(
@@ -3870,6 +3964,12 @@ mod tests {
                 is_current_match INTEGER NOT NULL DEFAULT 1, pubmed_rank INTEGER,
                 PRIMARY KEY(search_id, entry_id)
             );
+            CREATE TABLE pubmed_search_ignored_pmids (
+                search_id INTEGER NOT NULL REFERENCES pubmed_searches(id) ON DELETE CASCADE,
+                pmid TEXT NOT NULL,
+                ignored_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY(search_id, pmid)
+            );
             CREATE TABLE pubmed_search_run_items (
                 run_id INTEGER NOT NULL REFERENCES pubmed_search_runs(id) ON DELETE CASCADE,
                 pmid TEXT NOT NULL, rank INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
@@ -4852,6 +4952,63 @@ mod tests {
         let kept = list_kept_entries(&conn).unwrap();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].searches.len(), 2);
+    }
+
+    #[test]
+    fn removed_entry_is_ignored_only_for_its_current_search() {
+        let conn = search_db();
+        let first = create_search(&conn, "First", None, "sepsis").unwrap();
+        let second = create_search(&conn, "Second", None, "immune").unwrap();
+
+        let first_run = begin_run(&conn, first.id).unwrap();
+        snapshot_run_items(&conn, first_run, &["10".to_string()]).unwrap();
+        let (entry_id, _) = finish_item(&conn, first_run, first.id, &record("10", "Shared"));
+        complete_run(&conn, first.id, first_run).unwrap();
+
+        let second_run = begin_run(&conn, second.id).unwrap();
+        snapshot_run_items(&conn, second_run, &["10".to_string()]).unwrap();
+        assert!(
+            reuse_local_run_items(&conn, second.id, second_run, &["10".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+        complete_run(&conn, second.id, second_run).unwrap();
+        conn.execute(
+            "INSERT INTO reading_notes (entry_id) VALUES (?1)",
+            [entry_id],
+        )
+        .unwrap();
+
+        assert_eq!(
+            remove_search_entries(&conn, first.id, &[entry_id]).unwrap(),
+            1
+        );
+        assert!(list_search_entries(&conn, first.id).unwrap().is_empty());
+        assert_eq!(list_search_entries(&conn, second.id).unwrap().len(), 1);
+        let note_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reading_notes WHERE entry_id = ?1",
+                [entry_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(note_count, 1);
+
+        let mut branches = vec![CollectedRunQuery {
+            kind: "base",
+            pmids: vec!["10".to_string(), "11".to_string()],
+        }];
+        filter_ignored_query_pmids(&conn, first.id, &mut branches).unwrap();
+        assert_eq!(branches[0].pmids, vec!["11".to_string()]);
+        let mut second_branches = vec![CollectedRunQuery {
+            kind: "base",
+            pmids: vec!["10".to_string(), "11".to_string()],
+        }];
+        filter_ignored_query_pmids(&conn, second.id, &mut second_branches).unwrap();
+        assert_eq!(
+            second_branches[0].pmids,
+            vec!["10".to_string(), "11".to_string()]
+        );
     }
 
     #[test]

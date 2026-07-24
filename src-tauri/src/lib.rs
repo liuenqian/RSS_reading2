@@ -197,6 +197,7 @@ pub fn run() {
             pubmed_search_cmd::list_pubmed_search_entries,
             pubmed_search_cmd::set_pubmed_screening_status,
             pubmed_search_cmd::bulk_set_pubmed_screening_status,
+            pubmed_search_cmd::remove_pubmed_search_entries,
             pubmed_search_cmd::get_pubmed_author_identity_state,
             pubmed_search_cmd::save_pubmed_author_identity_state,
             pubmed_search_cmd::list_kept_pubmed_entries,

@@ -1,7 +1,23 @@
 use crate::services::entry_identity_service;
 use rusqlite::{params, Connection, OptionalExtension};
 
-const PUBMED_SCHEMA_VERSION: i64 = 15;
+const PUBMED_SCHEMA_VERSION: i64 = 16;
+
+fn ensure_pubmed_search_ignored_table(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pubmed_search_ignored_pmids (
+            search_id  INTEGER NOT NULL,
+            pmid       TEXT NOT NULL,
+            ignored_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (search_id, pmid),
+            FOREIGN KEY (search_id) REFERENCES pubmed_searches(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_pubmed_search_ignored_pmids_search
+            ON pubmed_search_ignored_pmids(search_id, pmid);",
+    )
+    .map_err(|error| format!("创建 PubMed 忽略文献表失败: {}", error))?;
+    Ok(())
+}
 
 fn ensure_briefing_scope_columns(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
@@ -179,6 +195,17 @@ pub fn needs_migration(conn: &Connection) -> Result<bool, String> {
     if briefing_annotations_exists != 1 {
         return Ok(true);
     }
+    let ignored_pmids_exists = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'pubmed_search_ignored_pmids'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("读取 PubMed 忽略文献表结构失败: {}", e))?;
+    if ignored_pmids_exists != 1 {
+        return Ok(true);
+    }
     Ok(!briefing_annotation_colors_are_current(conn)?)
 }
 
@@ -194,6 +221,7 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     ensure_briefing_scope_columns(conn)?;
     ensure_briefing_annotation_table(conn)?;
     ensure_briefing_annotation_color_schema(conn)?;
+    ensure_pubmed_search_ignored_table(conn)?;
     if version >= 13 && !rebuild_entries {
         conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('schema_version', ?1)",
@@ -1480,5 +1508,52 @@ mod tests {
             [],
         )
         .expect("insert custom color");
+    }
+
+    #[test]
+    fn schema_fifteen_adds_pubmed_ignored_pmids_table() {
+        let conn = Connection::open_in_memory().expect("open database");
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE entries (id INTEGER PRIMARY KEY, feed_id INTEGER);
+             CREATE TABLE briefings (
+                id INTEGER PRIMARY KEY,
+                period TEXT NOT NULL,
+                title TEXT NOT NULL,
+                lead_in TEXT NOT NULL,
+                content TEXT NOT NULL,
+                article_count INTEGER NOT NULL,
+                feed_count INTEGER NOT NULL,
+                generated_at TEXT NOT NULL,
+                source_scope TEXT NOT NULL DEFAULT 'all',
+                source_name TEXT NOT NULL DEFAULT '全部来源'
+             );
+             CREATE TABLE pubmed_searches (id INTEGER PRIMARY KEY);
+             INSERT INTO pubmed_searches (id) VALUES (7);
+             INSERT INTO settings (key, value) VALUES ('schema_version', '15');",
+        )
+        .expect("seed schema fifteen");
+
+        migrate(&conn).expect("migrate ignored PMIDs table");
+
+        conn.execute(
+            "INSERT INTO pubmed_search_ignored_pmids (search_id, pmid) VALUES (7, '12345')",
+            [],
+        )
+        .expect("store ignored PMID");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM pubmed_search_ignored_pmids WHERE search_id = 7",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            PUBMED_SCHEMA_VERSION
+        );
     }
 }

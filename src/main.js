@@ -1742,7 +1742,7 @@ let pubmedStatusFilter, pubmedSort, pubmedStarFilter, pubmedDateFilters, pubmedP
 let pubmedProgressEl, pubmedProgressFill, pubmedProgressLabel, btnRunPubmedSearch, btnCancelPubmedRun;
 let btnExportPubmed;
 let pubmedSnapshotSelect, btnSavePubmedSnapshot, btnDeletePubmedSnapshot;
-let pubmedBulkStatus, btnPubmedAiScreen, btnPubmedAuthorIdentity;
+let pubmedBulkStatus, btnPubmedAiScreen, btnPubmedAuthorIdentity, btnPubmedRemoveSelected;
 let entryListEl, briefingListEl, briefingItemsEl, briefingSortSelect, briefingSortDirection;
 let annotationLibraryEl, annotationLibraryItems, annotationLibraryCount;
 let annotationLibrarySearch, annotationLibrarySourceFilter, annotationLibraryTypeFilter;
@@ -1824,6 +1824,7 @@ let briefingAnnotationRequestId = 0;
 let editingBriefingAnnotationId = null;
 let literatureSearchTimer = null;
 let literatureSearchRequestId = 0;
+let entryScopeRequestId = 0;
 let literatureSearchRestoreState = null;
 let journalMetricsIndex = null;
 let journalMetricsLoadPromise = null;
@@ -5142,6 +5143,30 @@ async function applyBulkPubmedStatus(status) {
   }
 }
 
+async function removeSelectedPubmedEntries() {
+  if (mode !== 'pubmed' || !currentPubmedSearch?.id || !selectedEntryIds.size) return;
+  const entryIds = [...selectedEntryIds].map(Number).filter(Number.isFinite);
+  if (!entryIds.length) return;
+  const searchId = currentPubmedSearch.id;
+  const confirmed = await confirmDialog(
+    `将所选 ${entryIds.length} 篇文献从“${escapeHtml(currentPubmedSearch.name)}”永久移出？后续更新不会再次加入，但其他检索中的归属、阅读笔记和标注都会保留。`,
+    { okLabel: '永久移出', cancelLabel: '取消', danger: true },
+  );
+  if (!confirmed) return;
+
+  btnPubmedRemoveSelected.disabled = true;
+  try {
+    const removed = await invoke('remove_pubmed_search_entries', { searchId, entryIds });
+    clearEntrySelection({ render: false, syncPaperChat: false });
+    await loadPubmedSearches();
+    await selectPubmedSearch(searchId);
+    setGlobalStatus(`已从当前检索移出 ${removed} 篇文献`, 'success');
+  } catch (e) {
+    setGlobalStatus('移出检索失败: ' + e, 'error');
+    syncEntryBulkActions();
+  }
+}
+
 function requestPubmedScreeningCriteria() {
   return new Promise(resolve => {
     const overlay = document.createElement('div');
@@ -5475,6 +5500,7 @@ function entryMatchesLiteratureSearchQuery(entry, query) {
 }
 
 async function selectPubmedSearch(searchId) {
+  const requestId = ++entryScopeRequestId;
   cancelLiteratureSearchForNavigation();
   const search = allPubmedSearches.find(item => item.id === Number(searchId));
   if (!search) return;
@@ -5492,12 +5518,18 @@ async function selectPubmedSearch(searchId) {
   entryItemsEl.innerHTML = '<li class="entry-empty">正在读取检索结果…</li>';
   try {
     const entries = await invoke('list_pubmed_search_entries', { searchId: search.id });
-    allEntries = entries.map(normalizePubmedEntry);
     await hydrateAuthorIdentityState(search.id);
+    if (
+      requestId !== entryScopeRequestId
+      || mode !== 'pubmed'
+      || currentPubmedSearch?.id !== search.id
+    ) return;
+    allEntries = entries.map(normalizePubmedEntry);
     refreshEntryTagFilterOptions(allEntries);
     renderEntryList(allEntries);
     refreshPaperChatAfterScopeDataChange();
   } catch (e) {
+    if (requestId !== entryScopeRequestId) return;
     entryItemsEl.innerHTML = `<li class="entry-empty">加载检索结果失败: ${escapeHtml(String(e))}</li>`;
   }
 }
@@ -5957,6 +5989,7 @@ async function openAuthorIdentityReview() {
 }
 
 async function enterKeptMode(options = {}) {
+  const requestId = ++entryScopeRequestId;
   const preserveSearch = !!options.preserveSearch;
   if (!preserveSearch) cancelLiteratureSearchForNavigation();
   clearEntrySelection({ render: false, syncPaperChat: false });
@@ -5972,11 +6005,13 @@ async function enterKeptMode(options = {}) {
   entryItemsEl.innerHTML = '<li class="entry-empty">正在读取保留文献…</li>';
   try {
     const entries = await invoke('list_kept_pubmed_entries');
+    if (requestId !== entryScopeRequestId || mode !== 'kept') return;
     allEntries = entries.map(normalizePubmedEntry);
     refreshEntryTagFilterOptions(allEntries);
     renderEntryList(allEntries);
     refreshPaperChatAfterScopeDataChange();
   } catch (e) {
+    if (requestId !== entryScopeRequestId) return;
     entryItemsEl.innerHTML = `<li class="entry-empty">加载保留文献失败: ${escapeHtml(String(e))}</li>`;
   }
 }
@@ -7441,6 +7476,9 @@ function syncEntryBulkActions() {
   if (pubmedBulkStatus) pubmedBulkStatus.disabled = count === 0;
   btnPubmedAiScreen?.classList.toggle('hidden', !pubmedBatchMode || !entrySelectionMode);
   if (btnPubmedAiScreen) btnPubmedAiScreen.disabled = count === 0;
+  const canRemoveFromPubmed = pubmedBatchMode && entrySelectionMode;
+  btnPubmedRemoveSelected?.classList.toggle('hidden', !canRemoveFromPubmed);
+  if (btnPubmedRemoveSelected) btnPubmedRemoveSelected.disabled = count === 0;
   btnPubmedAuthorIdentity?.classList.toggle('hidden', !pubmedBatchMode || !isAuthorPubmedSearch());
   if (currentEntry) refreshPaperChatScopeControls();
 }
@@ -9491,21 +9529,39 @@ async function appendPaperChatMessageToNote(messageId) {
 
 // ── Entry list ─────────────────────────────────
 async function loadEntries(feedId) {
+  if (mode === 'pubmed' && currentPubmedSearch?.id) {
+    await selectPubmedSearch(currentPubmedSearch.id);
+    return;
+  }
+  if (mode === 'kept') {
+    await enterKeptMode({ preserveSearch: true });
+    return;
+  }
+  const requestId = ++entryScopeRequestId;
+  const expectedMode = mode;
+  const expectedFeedId = feedId || null;
   try {
     clearEntrySelection({ render: false, syncPaperChat: false });
-    allEntries = await invoke('list_entries', { feedId: feedId || null });
+    let entries = await invoke('list_entries', { feedId: feedId || null });
     if (feedId != null) {
       const states = await invoke('list_feed_screening_states', { feedId });
-      allEntries = allEntries.map(entry => ({
+      entries = entries.map(entry => ({
         ...entry,
         ...(states?.[entry.id] || {}),
       }));
     }
+    if (
+      requestId !== entryScopeRequestId
+      || mode !== expectedMode
+      || (expectedMode === 'feed' && (selectedFeedId || null) !== expectedFeedId)
+    ) return;
+    allEntries = entries;
     refreshEntryTagFilterOptions(allEntries);
     syncEntryBulkActions();
     renderEntryList(allEntries);
     refreshPaperChatAfterScopeDataChange();
   } catch (e) {
+    if (requestId !== entryScopeRequestId) return;
     entryItemsEl.innerHTML = `<li class="entry-empty">加载文章失败: ${e}</li>`;
   }
 }
@@ -11894,9 +11950,7 @@ async function refreshAll() {
     // so the frontend doesn't dispatch them here anymore.
 
     await loadFeeds();
-    const query = literatureSearchInput?.value.trim() || '';
-    if (mode === 'search' && query) await runLiteratureSearch(query);
-    else await loadEntries(selectedFeedId);
+    await reloadEntriesAfterFeedRefresh();
   } catch (e) {
     setGlobalStatus('刷新失败: ' + e, 'error');
   } finally {
@@ -11913,10 +11967,25 @@ function startSchedulerListener() {
   if (!listen) return;
   listen('scheduler-refreshed', async () => {
     await loadFeeds();
-    const query = literatureSearchInput?.value.trim() || '';
-    if (mode === 'search' && query) await runLiteratureSearch(query);
-    else await loadEntries(selectedFeedId);
+    await reloadEntriesAfterFeedRefresh();
   });
+}
+
+async function reloadEntriesAfterFeedRefresh() {
+  const query = literatureSearchInput?.value.trim() || '';
+  if (mode === 'search' && query) {
+    await runLiteratureSearch(query);
+    return;
+  }
+  if (mode === 'pubmed' && currentPubmedSearch?.id) {
+    await selectPubmedSearch(currentPubmedSearch.id);
+    return;
+  }
+  if (mode === 'kept') {
+    await enterKeptMode({ preserveSearch: true });
+    return;
+  }
+  if (mode === 'feed') await loadEntries(selectedFeedId);
 }
 
 // ── Briefing mode ──────────────────────────────
@@ -15091,6 +15160,7 @@ window.addEventListener('DOMContentLoaded', () => {
   entryBulkExistingMode = document.getElementById('entry-bulk-existing-mode');
   btnEntryBulkGenerate = document.getElementById('btn-entry-bulk-generate');
   btnEntryBulkClear = document.getElementById('btn-entry-bulk-clear');
+  btnPubmedRemoveSelected = document.getElementById('btn-pubmed-remove-selected');
   entryMetricIfFilter = document.getElementById('entry-metric-if-filter');
   entryMetricQFilter = document.getElementById('entry-metric-q-filter');
   entryMetricBFilter = document.getElementById('entry-metric-b-filter');
@@ -15969,6 +16039,7 @@ window.addEventListener('DOMContentLoaded', () => {
   btnEntryBulkExport?.addEventListener('click', () => {
     exportCurrentPubmedEntries(entryBulkExportFormat?.value, btnEntryBulkExport);
   });
+  btnPubmedRemoveSelected?.addEventListener('click', removeSelectedPubmedEntries);
   pubmedSnapshotSelect?.addEventListener('change', () => activatePubmedSnapshot(pubmedSnapshotSelect.value));
   btnSavePubmedSnapshot?.addEventListener('click', saveCurrentPubmedSnapshot);
   btnDeletePubmedSnapshot?.addEventListener('click', deleteCurrentPubmedSnapshot);
