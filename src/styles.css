@@ -5699,6 +5699,10 @@ body.screening-window-mode #app {
   user-select: text;
 }
 
+.reading-select-text {
+  display: contents;
+}
+
 .reading-highlight-scope::selection,
 .reading-highlight-scope *::selection {
   background: transparent;
@@ -9645,6 +9649,98 @@ body.screening-window-mode #app {
   gap: 8px;
 }
 .confirm-actions .btn { min-width: 64px; }
+
+.text-input-dialog-input {
+  width: 100%;
+  height: 36px;
+  box-sizing: border-box;
+  margin: -4px 0 18px;
+  padding: 0 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--control-bg);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+
+.text-input-dialog-input:focus {
+  border-color: color-mix(in srgb, var(--accent) 65%, var(--border-soft));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.text-input-dialog-input[aria-invalid="true"] {
+  border-color: var(--color-error);
+}
+
+.pubmed-file-import-card {
+  width: min(520px, calc(100vw - 32px));
+  max-width: 520px;
+  box-sizing: border-box;
+}
+
+.pubmed-file-import-name {
+  display: block;
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pubmed-file-import-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.pubmed-file-import-stats span {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  color: var(--text-tertiary);
+  font-size: 10.5px;
+  text-align: center;
+}
+
+.pubmed-file-import-stats b {
+  display: block;
+  color: var(--text-primary);
+  font-size: 15px;
+}
+
+.pubmed-file-import-format,
+.pubmed-file-import-label {
+  color: var(--text-secondary);
+  font-size: 11.5px;
+}
+
+.pubmed-file-import-samples {
+  max-height: 110px;
+  margin: 10px 0 14px;
+  padding-left: 20px;
+  overflow-y: auto;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.pubmed-file-import-label {
+  display: block;
+  margin: 14px 0 6px;
+}
+
+.pubmed-file-import-card .text-input-dialog-input {
+  margin: 0 0 18px;
+}
+
+@media (max-width: 520px) {
+  .pubmed-file-import-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 
 .note-target-card {
   min-width: 380px;

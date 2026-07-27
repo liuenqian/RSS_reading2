@@ -64,6 +64,7 @@ test('highlight colors render in all annotation UIs', () => {
   assert.match(styles, /\.reading-annotation-box/);
   assert.match(styles, /\.reading-annotation-pen/);
   assert.match(styles, /\.reading-highlight-scope \*::selection/);
+  assert.match(styles, /\.reading-select-text\s*\{[^}]*display:\s*contents;/s);
   assert.match(styles, /\.reading-highlight-scope \.reading-select-text::selection/);
   assert.match(styles, /\.reading-highlight-popover\.is-managing-existing \.reading-highlight-delete/);
   assert.match(styles, /\.reading-highlight-popover\.is-adding-note \.reading-highlight-note-editor/);

@@ -385,6 +385,8 @@ pub struct PubmedAuthorQueryResult {
     pub candidates: Vec<PubmedAuthorQueryCandidate>,
     pub author_name: String,
     pub affiliation: Option<String>,
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -17,6 +17,7 @@ pub mod pmc_gallery_search_service;
 pub mod pmc_gallery_service;
 pub mod pubmed_author_query_service;
 pub mod pubmed_conversion_service;
+pub mod pubmed_file_import_service;
 pub mod pubmed_search_service;
 pub mod pubmed_service;
 pub mod reading_service;

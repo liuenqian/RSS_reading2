@@ -182,6 +182,8 @@ pub fn run() {
             pubmed_conversion_cmd::convert_pubmed_feed_to_search,
             pubmed_conversion_cmd::convert_pubmed_search_to_feed,
             pubmed_search_cmd::preview_pubmed_search,
+            pubmed_search_cmd::preview_pubmed_file_import,
+            pubmed_search_cmd::import_pubmed_file,
             pubmed_search_cmd::assess_pubmed_search_preview,
             pubmed_search_cmd::assess_pubmed_author_preview,
             pubmed_search_cmd::create_pubmed_search,

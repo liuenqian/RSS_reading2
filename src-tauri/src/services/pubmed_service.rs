@@ -237,7 +237,6 @@ struct AuthorQueryAiCandidate {
     rationale: String,
 }
 
-#[cfg(test)]
 fn build_author_query(
     author_name: &str,
     affiliation: Option<&str>,
@@ -266,6 +265,29 @@ fn build_author_query(
     }
 
     Ok(clauses.join(" AND "))
+}
+
+fn build_fallback_author_query_result(
+    author_name: &str,
+    affiliation: Option<&str>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+    ai_error: &str,
+) -> Result<PubmedAuthorQueryResult, String> {
+    let author_name = normalize_author_query_value(author_name, "作者姓名或描述")?;
+    let affiliation = normalize_optional_query_value(affiliation, "机构描述")?;
+    let query = build_author_query(&author_name, affiliation.as_deref(), start_date, end_date)?;
+    Ok(PubmedAuthorQueryResult {
+        query: query.clone(),
+        candidates: vec![PubmedAuthorQueryCandidate {
+            label: "基础作者检索".to_string(),
+            query,
+            rationale: "AI 响应不可用，已按当前输入生成可编辑的基础检索式".to_string(),
+        }],
+        author_name,
+        affiliation,
+        warning: Some(format!("{}；已生成基础检索式，请检查后预览", ai_error)),
+    })
 }
 
 fn build_author_ai_request(author_name: &str, affiliation: Option<&str>) -> Result<String, String> {
@@ -305,14 +327,28 @@ pub async fn natural_language_to_author_query(
 ) -> Result<(PubmedAuthorQueryResult, TokenUsage), String> {
     let request = build_author_ai_request(author_name, affiliation)?;
     let date_clause = build_author_date_clause(start_date, end_date)?;
-    let output = translate_service::complete_with_prompts(
+    let output = match translate_service::complete_with_prompts(
         settings,
         AUTHOR_QUERY_PROMPT,
         &request,
         0.1,
         i64::from(NL_QUERY_MAX_TOKENS),
     )
-    .await?;
+    .await
+    {
+        Ok(output) => output,
+        Err(error) if error.contains("返回了空结果或不兼容的响应格式") => {
+            let result = build_fallback_author_query_result(
+                author_name,
+                affiliation,
+                start_date,
+                end_date,
+                &error,
+            )?;
+            return Ok((result, TokenUsage::default()));
+        }
+        Err(error) => return Err(error),
+    };
 
     let mut result = parse_author_ai_response(&output.content, author_name, affiliation)?;
     if let Some(date_clause) = date_clause {
@@ -478,6 +514,7 @@ fn parse_author_ai_response_for_phase(
         candidates,
         author_name,
         affiliation,
+        warning: None,
     })
 }
 
@@ -547,7 +584,6 @@ fn normalize_optional_date(value: Option<&str>, label: &str) -> Result<Option<St
     Ok(Some(parts.join("/")))
 }
 
-#[cfg(test)]
 fn escape_pubmed_phrase(value: &str) -> String {
     value.replace('"', "")
 }
@@ -946,8 +982,8 @@ mod urlencoding {
 mod tests {
     use super::{
         build_author_ai_request, build_author_date_clause, build_author_query,
-        parse_author_ai_response, parse_author_expansion_ai_response, parse_sci_review_strategy,
-        validate_query_syntax,
+        build_fallback_author_query_result, parse_author_ai_response,
+        parse_author_expansion_ai_response, parse_sci_review_strategy, validate_query_syntax,
     };
 
     #[test]
@@ -987,6 +1023,25 @@ mod tests {
         assert!(
             build_author_query("Smith JA", None, Some("2025-01-02"), Some("2025-01-01"),).is_err()
         );
+    }
+
+    #[test]
+    fn falls_back_to_an_editable_author_query_for_empty_ai_responses() {
+        let result = build_fallback_author_query_result(
+            "Jia Guo",
+            Some("Peking University"),
+            Some("2020-01-01"),
+            None,
+            "DeepSeek 返回了空结果或不兼容的响应格式",
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.query,
+            "Jia Guo[Author] AND \"Peking University\"[Affiliation:~50] AND 2020/01/01:3000/12/31[Date - Publication]"
+        );
+        assert_eq!(result.candidates.len(), 1);
+        assert!(result.warning.unwrap().contains("已生成基础检索式"));
     }
 
     #[test]

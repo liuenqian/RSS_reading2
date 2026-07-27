@@ -5,10 +5,28 @@ use crate::models::{
     PubmedSearchPreview, PubmedSearchRunResult,
 };
 use crate::services::{
-    cost_service, google_translate_xlsx_service, pubmed_search_service, settings_service,
+    cost_service, google_translate_xlsx_service, pubmed_file_import_service, pubmed_search_service,
+    settings_service,
 };
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, State};
+
+#[tauri::command]
+pub fn preview_pubmed_file_import(
+    path: String,
+) -> Result<pubmed_file_import_service::PubmedFileImportPreview, String> {
+    pubmed_file_import_service::preview_file(&PathBuf::from(path))
+}
+
+#[tauri::command]
+pub fn import_pubmed_file(
+    state: State<DbState>,
+    path: String,
+    name: String,
+) -> Result<pubmed_file_import_service::PubmedFileImportResult, String> {
+    let conn = state.conn.lock().map_err(|error| error.to_string())?;
+    pubmed_file_import_service::import_file(&conn, &PathBuf::from(path), &name)
+}
 
 #[tauri::command]
 pub async fn preview_pubmed_search(

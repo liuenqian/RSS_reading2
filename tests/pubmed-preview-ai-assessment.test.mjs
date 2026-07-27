@@ -65,6 +65,7 @@ test('author query generation separates and restores detected affiliations', () 
   assert.match(authorGeneration, /result\?\.author_name/);
   assert.match(authorGeneration, /result\?\.affiliation/);
   assert.match(authorGeneration, /result\?\.candidates/);
+  assert.match(authorGeneration, /result\?\.warning/);
   assert.match(authorGeneration, /pubmed-author-name'\)\.value = detectedAuthor/);
   assert.match(authorGeneration, /pubmed-author-affiliation'\)\.value = detectedAffiliation/);
   assert.match(authorGeneration, /已识别作者/);

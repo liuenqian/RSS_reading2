@@ -38,6 +38,8 @@ const FETCH_BATCH_SIZE: usize = 100;
 const FETCH_ISOLATION_REQUEST_LIMIT: usize = 24;
 const SEARCH_PAGE_SIZE: usize = 1_000;
 const PUBMED_MAX_RESULT_WINDOW: usize = 10_000;
+const PUBMED_REQUEST_MAX_ATTEMPTS: usize = 3;
+const PUBMED_RETRY_BASE_DELAY: Duration = Duration::from_millis(750);
 const PROGRESS_EVENT: &str = "pubmed-search-progress";
 const RUN_CANCELLED_MESSAGE: &str = "用户取消";
 
@@ -53,6 +55,43 @@ enum PubmedFetchBatch {
         pmids: Vec<String>,
         error: String,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PubmedRequestFailure {
+    Transport,
+    ResponseBody,
+    ResponseDecode,
+    Http(reqwest::StatusCode),
+}
+
+fn should_retry_pubmed_failure(attempt: usize, failure: PubmedRequestFailure) -> bool {
+    if attempt >= PUBMED_REQUEST_MAX_ATTEMPTS {
+        return false;
+    }
+    match failure {
+        PubmedRequestFailure::Transport
+        | PubmedRequestFailure::ResponseBody
+        | PubmedRequestFailure::ResponseDecode => true,
+        PubmedRequestFailure::Http(status) => {
+            status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status.is_server_error()
+        }
+    }
+}
+
+async fn wait_before_pubmed_retry(operation: &str, attempt: usize, error: &str) {
+    let delay = PUBMED_RETRY_BASE_DELAY.saturating_mul(attempt as u32);
+    warn!(
+        operation,
+        attempt,
+        max_attempts = PUBMED_REQUEST_MAX_ATTEMPTS,
+        delay_ms = delay.as_millis(),
+        error = %error,
+        "PubMed 请求遇到瞬时故障，准备重试"
+    );
+    tokio::time::sleep(delay).await;
 }
 
 pub async fn preview_query(
@@ -750,21 +789,61 @@ async fn search_page_with_options(
     options: &PubmedRetrievalOptions,
 ) -> Result<PubmedSearchPage, String> {
     let query = normalize_query(query)?;
-    throttle().await;
-    let request =
-        build_search_request_with_options(client, &query, retstart, retmax, use_history, options)?;
-    let response = client
-        .execute(request)
-        .await
-        .map_err(|e| format_reqwest_error("请求 PubMed ESearch 失败", &e))?;
-    if !response.status().is_success() {
-        return Err(format!("PubMed ESearch 返回 HTTP {}", response.status()));
+    for attempt in 1..=PUBMED_REQUEST_MAX_ATTEMPTS {
+        throttle().await;
+        let request = build_search_request_with_options(
+            client,
+            &query,
+            retstart,
+            retmax,
+            use_history,
+            options,
+        )?;
+        let response = match client.execute(request).await {
+            Ok(response) => response,
+            Err(source) => {
+                let error = format_reqwest_error("请求 PubMed ESearch 失败", &source);
+                if should_retry_pubmed_failure(attempt, PubmedRequestFailure::Transport) {
+                    wait_before_pubmed_retry("ESearch", attempt, &error).await;
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let error = format!("PubMed ESearch 返回 HTTP {status}");
+            if should_retry_pubmed_failure(attempt, PubmedRequestFailure::Http(status)) {
+                wait_before_pubmed_retry("ESearch", attempt, &error).await;
+                continue;
+            }
+            return Err(error);
+        }
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(source) => {
+                let error = format_reqwest_error("读取 PubMed ESearch 响应失败", &source);
+                if should_retry_pubmed_failure(attempt, PubmedRequestFailure::ResponseBody) {
+                    wait_before_pubmed_retry("ESearch", attempt, &error).await;
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        let body: Value = match serde_json::from_slice(&bytes) {
+            Ok(body) => body,
+            Err(source) => {
+                let error = format!("解析 PubMed ESearch 响应失败: {source}");
+                if should_retry_pubmed_failure(attempt, PubmedRequestFailure::ResponseDecode) {
+                    wait_before_pubmed_retry("ESearch", attempt, &error).await;
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        return parse_search_response(&body);
     }
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("解析 PubMed ESearch 响应失败: {}", e))?;
-    parse_search_response(&body)
+    unreachable!("PubMed ESearch retry loop always returns")
 }
 
 #[cfg(test)]
@@ -850,22 +929,48 @@ pub async fn fetch_records(
     if pmids.is_empty() {
         return Ok(Vec::new());
     }
-    throttle().await;
     let ids = pmids.join(",");
-    let response = client
-        .get(EFETCH_URL)
-        .query(&[("db", "pubmed"), ("id", ids.as_str()), ("retmode", "xml")])
-        .send()
-        .await
-        .map_err(|e| format_reqwest_error("请求 PubMed EFetch 失败", &e))?;
-    if !response.status().is_success() {
-        return Err(format!("PubMed EFetch 返回 HTTP {}", response.status()));
+    for attempt in 1..=PUBMED_REQUEST_MAX_ATTEMPTS {
+        throttle().await;
+        let response = match client
+            .get(EFETCH_URL)
+            .query(&[("db", "pubmed"), ("id", ids.as_str()), ("retmode", "xml")])
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(source) => {
+                let error = format_reqwest_error("请求 PubMed EFetch 失败", &source);
+                if should_retry_pubmed_failure(attempt, PubmedRequestFailure::Transport) {
+                    wait_before_pubmed_retry("EFetch", attempt, &error).await;
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let error = format!("PubMed EFetch 返回 HTTP {status}");
+            if should_retry_pubmed_failure(attempt, PubmedRequestFailure::Http(status)) {
+                wait_before_pubmed_retry("EFetch", attempt, &error).await;
+                continue;
+            }
+            return Err(error);
+        }
+        let xml = match response.text().await {
+            Ok(xml) => xml,
+            Err(source) => {
+                let error = format_reqwest_error("读取 PubMed EFetch 响应失败", &source);
+                if should_retry_pubmed_failure(attempt, PubmedRequestFailure::ResponseBody) {
+                    wait_before_pubmed_retry("EFetch", attempt, &error).await;
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        return parse_pubmed_records(&xml);
     }
-    let xml = response
-        .text()
-        .await
-        .map_err(|e| format!("读取 PubMed EFetch 响应失败: {}", e))?;
-    parse_pubmed_records(&xml)
+    unreachable!("PubMed EFetch retry loop always returns")
 }
 
 async fn fetch_records_with_isolated_skips(
@@ -1014,6 +1119,69 @@ pub fn create_search_with_options(
     )
     .map_err(|e| format!("创建 PubMed 检索失败: {}", e))?;
     get_search(conn, conn.last_insert_rowid())
+}
+
+pub fn import_records(
+    conn: &Connection,
+    search_id: i64,
+    records: &[PubmedArticleRecord],
+) -> Result<PubmedSearchRunResult, String> {
+    if records.is_empty() {
+        return Err("没有可导入的 PubMed 记录".to_string());
+    }
+    get_search(conn, search_id)?;
+    let run_id = begin_run(conn, search_id)?;
+    conn.execute(
+        "UPDATE pubmed_search_runs SET run_type = 'import' WHERE id = ?1",
+        [run_id],
+    )
+    .map_err(|e| format!("标记 PubMed 导入运行失败: {}", e))?;
+    let pmids = records
+        .iter()
+        .map(|record| record.pmid.clone())
+        .collect::<Vec<_>>();
+
+    let import_result = (|| {
+        snapshot_run_items(conn, run_id, &pmids)?;
+        persist_pubmed_records(conn, search_id, run_id, &pmids, records.to_vec(), false)?;
+        let (_, _, failed) = run_item_counts(conn, run_id)?;
+        if failed == 0 {
+            complete_import_run(conn, search_id, run_id)
+        } else {
+            finalize_partial_run(conn, search_id, run_id, "部分 PubMed 文件记录导入失败")
+        }
+    })();
+
+    if let Err(error) = import_result {
+        let _ = finalize_run_error(conn, run_id, "failed", &error);
+        return Err(error);
+    }
+    run_result(conn, run_id, None)
+}
+
+fn complete_import_run(conn: &Connection, search_id: i64, run_id: i64) -> Result<(), String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("开始提交 PubMed 导入事务失败: {}", e))?;
+    let visible_count = publish_partial_run_successes(&tx, search_id, run_id, false)?;
+    let (added, reused, failed) = run_item_counts(&tx, run_id)?;
+    tx.execute(
+        "UPDATE pubmed_search_runs SET
+            status = 'completed', completed_at = datetime('now'), added_count = ?1,
+            reused_count = ?2, failed_count = ?3, error_message = NULL
+         WHERE id = ?4",
+        params![added, reused, failed, run_id],
+    )
+    .map_err(|e| format!("完成 PubMed 导入运行失败: {}", e))?;
+    tx.execute(
+        "UPDATE pubmed_searches SET
+            last_success_at = datetime('now'), last_result_count = ?2
+         WHERE id = ?1",
+        params![search_id, visible_count],
+    )
+    .map_err(|e| format!("更新 PubMed 导入结果数量失败: {}", e))?;
+    tx.commit()
+        .map_err(|e| format!("提交 PubMed 导入事务失败: {}", e))
 }
 
 pub fn list_searches(conn: &Connection) -> Result<Vec<PubmedSearch>, String> {
@@ -1291,7 +1459,7 @@ async fn run_search_inner(
             for fetched_batch in fetched_batches {
                 match fetched_batch {
                     PubmedFetchBatch::Records { pmids, records } => {
-                        persist_pubmed_records(&conn, search_id, run_id, &pmids, records)?;
+                        persist_pubmed_records(&conn, search_id, run_id, &pmids, records, true)?;
                     }
                     PubmedFetchBatch::Failed { pmids, error } => {
                         mark_fetch_batch_failed(&conn, run_id, &pmids, &error)?;
@@ -1913,6 +2081,7 @@ fn persist_pubmed_records(
     run_id: i64,
     pmids: &[String],
     records: Vec<PubmedArticleRecord>,
+    update_structured_authors: bool,
 ) -> Result<(), String> {
     let by_pmid = records
         .into_iter()
@@ -1923,7 +2092,7 @@ fn persist_pubmed_records(
         .map_err(|e| format!("开始 PubMed 批次事务失败: {}", e))?;
     for pmid in pmids {
         if let Some(record) = by_pmid.get(pmid) {
-            match upsert_search_record(&tx, search_id, run_id, record) {
+            match upsert_search_record(&tx, search_id, run_id, record, update_structured_authors) {
                 Ok((entry_id, added)) => {
                     tx.execute(
                         "UPDATE pubmed_search_run_items
@@ -1970,6 +2139,7 @@ fn upsert_search_record(
     search_id: i64,
     run_id: i64,
     record: &PubmedArticleRecord,
+    update_structured_authors: bool,
 ) -> Result<(i64, bool), String> {
     let existing =
         entry_identity_service::resolve_entry_id(conn, Some(&record.pmid), record.doi.as_deref())?;
@@ -2051,7 +2221,9 @@ fn upsert_search_record(
         record.doi.as_deref(),
         "pubmed",
     )?;
-    replace_structured_authors(conn, entry_id, &record.structured_authors)?;
+    if update_structured_authors {
+        replace_structured_authors(conn, entry_id, &record.structured_authors)?;
+    }
 
     let existing_membership = conn
         .query_row(
@@ -4039,6 +4211,43 @@ mod tests {
     }
 
     #[test]
+    fn imports_file_records_as_a_completed_local_batch() {
+        let conn = search_db();
+        let records = vec![record("101", "Imported one"), record("102", "Imported two")];
+        let search = create_search_with_options(
+            &conn,
+            "Imported PubMed",
+            Some("Cento 本地 PubMed 文件导入"),
+            "0[PMID]",
+            &PubmedRetrievalOptions {
+                scope: "custom".to_string(),
+                limit: Some(2),
+                date_from: None,
+                date_to: None,
+                sort: "most_recent".to_string(),
+            },
+        )
+        .unwrap();
+
+        let result = import_records(&conn, search.id, &records).unwrap();
+        let entries = list_search_entries(&conn, result.search_id).unwrap();
+
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.added_count, 2);
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.summary.as_deref() == Some("Abstract")));
+        assert_eq!(
+            get_search(&conn, result.search_id)
+                .unwrap()
+                .question
+                .as_deref(),
+            Some("Cento 本地 PubMed 文件导入")
+        );
+    }
+
+    #[test]
     fn failed_fetch_batch_is_marked_failed_and_skipped() {
         let conn = search_db();
         let search = create_search(&conn, "Sepsis", None, "sepsis").unwrap();
@@ -4077,6 +4286,29 @@ mod tests {
             "PubMed EFetch 返回 HTTP 400 Bad Request"
         ));
         assert!(!is_batch_wide_fetch_error("解析 PubMed XML 失败"));
+    }
+
+    #[test]
+    fn pubmed_transient_failures_are_retried() {
+        for failure in [
+            PubmedRequestFailure::Transport,
+            PubmedRequestFailure::ResponseBody,
+            PubmedRequestFailure::ResponseDecode,
+            PubmedRequestFailure::Http(reqwest::StatusCode::REQUEST_TIMEOUT),
+            PubmedRequestFailure::Http(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            PubmedRequestFailure::Http(reqwest::StatusCode::BAD_GATEWAY),
+        ] {
+            assert!(should_retry_pubmed_failure(1, failure));
+        }
+
+        assert!(!should_retry_pubmed_failure(
+            1,
+            PubmedRequestFailure::Http(reqwest::StatusCode::BAD_REQUEST),
+        ));
+        assert!(!should_retry_pubmed_failure(
+            PUBMED_REQUEST_MAX_ATTEMPTS,
+            PubmedRequestFailure::Transport,
+        ));
     }
 
     #[test]
@@ -4227,7 +4459,7 @@ mod tests {
         ];
 
         let (entry_id, _) = finish_item(&conn, run_id, search.id, &article);
-        upsert_search_record(&conn, search.id, run_id, &article).unwrap();
+        upsert_search_record(&conn, search.id, run_id, &article, true).unwrap();
 
         assert_eq!(
             conn.query_row(
@@ -4271,7 +4503,7 @@ mod tests {
         record: &PubmedArticleRecord,
     ) -> (i64, bool) {
         let (entry_id, added) =
-            upsert_search_record(conn, search_id, run_id, record).expect("upsert record");
+            upsert_search_record(conn, search_id, run_id, record, true).expect("upsert record");
         conn.execute(
             "UPDATE pubmed_search_run_items SET status = ?1, entry_id = ?2
              WHERE run_id = ?3 AND pmid = ?4",
@@ -4516,6 +4748,41 @@ mod tests {
         let result = run_result(&conn, second_run, None).unwrap();
         assert_eq!(result.added_count, 1);
         assert_eq!(result.reused_count, 1);
+    }
+
+    #[test]
+    fn imported_records_merge_with_current_results_and_preserve_screening() {
+        let conn = search_db();
+        let search = create_search(&conn, "Sepsis", None, "sepsis").unwrap();
+        let first_run = begin_run(&conn, search.id).unwrap();
+        snapshot_run_items(&conn, first_run, &["1".to_string()]).unwrap();
+        let (first_entry, _) = finish_item(&conn, first_run, search.id, &record("1", "One"));
+        complete_run(&conn, search.id, first_run).unwrap();
+        set_screening_status(&conn, search.id, &[first_entry], "keep").unwrap();
+
+        let result = import_records(&conn, search.id, &[record("2", "Imported")]).unwrap();
+
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.matched_count, 1);
+        assert_eq!(result.added_count, 1);
+        let entries = list_search_entries(&conn, search.id).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.entry_id == first_entry)
+                .unwrap()
+                .screening_status,
+            "keep"
+        );
+        let run_type: String = conn
+            .query_row(
+                "SELECT run_type FROM pubmed_search_runs WHERE id = ?1",
+                [result.run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_type, "import");
     }
 
     #[test]
@@ -4787,6 +5054,7 @@ mod tests {
                 record("2", "Bad PubMed entry"),
                 record("3", "Three"),
             ],
+            true,
         )
         .unwrap();
         finalize_partial_run(&conn, search.id, run, "部分 PMID 获取失败，可继续重试").unwrap();

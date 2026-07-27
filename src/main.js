@@ -4298,7 +4298,7 @@ function activatePubmedSnapshot(snapshotId) {
   refreshPaperChatAfterScopeDataChange();
 }
 
-function saveCurrentPubmedSnapshot() {
+async function saveCurrentPubmedSnapshot() {
   if (!['pubmed', 'kept'].includes(mode)) return;
   const entries = getFilteredPubmedEntries(allEntries);
   if (!entries.length) {
@@ -4307,7 +4307,12 @@ function saveCurrentPubmedSnapshot() {
   }
   const now = new Date();
   const defaultName = `快照 ${now.toLocaleDateString('zh-CN')} ${now.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`;
-  const name = window.prompt('快照名称', defaultName)?.trim();
+  const name = (await textInputDialog('快照名称', {
+    defaultValue: defaultName,
+    placeholder: '输入快照名称',
+    okLabel: '保存',
+    maxLength: 60,
+  }))?.trim();
   if (!name) return;
   const snapshot = {
     id: `snapshot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -4366,6 +4371,135 @@ async function importOpml() {
     }
   } catch (e) {
     setGlobalStatus('导入失败: ' + e, 'error');
+  }
+}
+
+function showDataTransferMenu(button, event) {
+  event?.stopPropagation();
+  hideContextMenu();
+  const menu = document.createElement('div');
+  menu.className = 'context-menu';
+  menu.innerHTML = `
+    <div class="context-item" data-action="import-pubmed">导入 PubMed 文件</div>
+    <div class="context-item" data-action="import-opml">导入 OPML 订阅</div>
+    <div class="context-separator"></div>
+    <div class="context-item" data-action="export-opml">导出 OPML 订阅</div>
+  `;
+  menu.addEventListener('click', async clickEvent => {
+    const action = clickEvent.target.closest('[data-action]')?.dataset.action;
+    if (!action) return;
+    hideContextMenu();
+    if (action === 'import-pubmed') await importPubmedFile();
+    else if (action === 'import-opml') await importOpml();
+    else if (action === 'export-opml') await exportOpml();
+  });
+  const rect = button.getBoundingClientRect();
+  mountContextMenu(menu, rect.left, rect.bottom + 4);
+  document.addEventListener('click', hideContextMenu, { once: true });
+}
+
+function pubmedFileImportDialog(preview) {
+  return new Promise(resolve => {
+    const formatLabel = preview.format === 'csv' ? 'PubMed CSV' : 'PubMed 文本（含摘要）';
+    const sampleTitles = (preview.sampleTitles || [])
+      .map(title => `<li>${escapeHtml(title)}</li>`)
+      .join('');
+    const overlay = document.createElement('div');
+    overlay.className = 'confirm-overlay';
+    overlay.innerHTML = `
+      <div class="confirm-card pubmed-file-import-card" role="dialog" aria-modal="true" aria-labelledby="pubmed-file-import-title">
+        <div id="pubmed-file-import-title" class="confirm-msg">
+          <strong>确认导入 PubMed 文件</strong>
+          <span class="pubmed-file-import-name">${escapeHtml(preview.fileName)}</span>
+        </div>
+        <div class="pubmed-file-import-stats">
+          <span><b>${preview.importableCount.toLocaleString('zh-CN')}</b> 可导入</span>
+          <span><b>${preview.withAbstractCount.toLocaleString('zh-CN')}</b> 含摘要</span>
+          <span><b>${preview.duplicateCount.toLocaleString('zh-CN')}</b> 重复</span>
+          <span><b>${preview.skippedCount.toLocaleString('zh-CN')}</b> 跳过</span>
+        </div>
+        <div class="pubmed-file-import-format">格式：${formatLabel}</div>
+        ${sampleTitles ? `<ul class="pubmed-file-import-samples">${sampleTitles}</ul>` : ''}
+        <label class="pubmed-file-import-label" for="pubmed-file-import-name">批次名称</label>
+        <input id="pubmed-file-import-name" class="text-input-dialog-input" type="text" maxlength="80" />
+        <div class="confirm-actions">
+          <button class="btn btn-secondary btn-sm pubmed-file-import-cancel" type="button">取消</button>
+          <button class="btn btn-primary btn-sm pubmed-file-import-ok" type="button">开始导入</button>
+        </div>
+      </div>
+    `;
+    const input = overlay.querySelector('#pubmed-file-import-name');
+    input.value = String(preview.suggestedName || 'PubMed 文件导入').slice(0, 80);
+    const cleanup = value => {
+      document.removeEventListener('keydown', onKey);
+      overlay.remove();
+      resolve(value);
+    };
+    const submit = () => {
+      const name = input.value.trim();
+      if (!name) {
+        input.setAttribute('aria-invalid', 'true');
+        input.focus();
+        return;
+      }
+      cleanup(name.slice(0, 80));
+    };
+    const onKey = event => {
+      if (event.key === 'Escape') cleanup(null);
+      else if (event.key === 'Enter' && !event.isComposing) submit();
+    };
+    input.addEventListener('input', () => input.removeAttribute('aria-invalid'));
+    overlay.addEventListener('click', event => {
+      if (event.target === overlay) cleanup(null);
+    });
+    overlay.querySelector('.pubmed-file-import-ok').addEventListener('click', submit);
+    overlay.querySelector('.pubmed-file-import-cancel').addEventListener('click', () => cleanup(null));
+    document.addEventListener('keydown', onKey);
+    document.body.appendChild(overlay);
+    setTimeout(() => { input.focus(); input.select(); }, 0);
+  });
+}
+
+async function importPubmedFile() {
+  try {
+    const dialog = window.__TAURI__?.dialog;
+    if (!dialog) {
+      setGlobalStatus('对话框插件不可用', 'error');
+      return;
+    }
+    const path = await dialog.open({
+      title: '导入 PubMed 文件',
+      multiple: false,
+      directory: false,
+      filters: [{ name: 'PubMed 导出文件', extensions: ['txt', 'nbib', 'csv'] }],
+    });
+    if (!path) return;
+    const filePath = Array.isArray(path) ? path[0] : path;
+    setGlobalStatus('正在检查 PubMed 文件…', 'progress');
+    const preview = await invoke('preview_pubmed_file_import', { path: filePath });
+    const name = await pubmedFileImportDialog(preview);
+    if (!name) {
+      setGlobalStatus('', '');
+      return;
+    }
+    setGlobalStatus(`正在导入 ${preview.importableCount.toLocaleString('zh-CN')} 篇文献…`, 'progress');
+    const report = await invoke('import_pubmed_file', { path: filePath, name });
+    await loadPubmedSearches();
+    await selectPubmedSearch(report.run.search_id);
+    const details = [
+      `新增 ${report.run.added_count}`,
+      `已有 ${report.run.reused_count}`,
+    ];
+    if (report.duplicateCount) details.push(`文件内重复 ${report.duplicateCount}`);
+    if (report.skippedCount || report.run.failed_count) {
+      details.push(`跳过/失败 ${report.skippedCount + report.run.failed_count}`);
+    }
+    setGlobalStatus(
+      `PubMed 文件导入完成：${details.join('，')}`,
+      report.run.failed_count ? 'error' : 'success',
+    );
+  } catch (error) {
+    setGlobalStatus('PubMed 文件导入失败: ' + error, 'error');
   }
 }
 
@@ -4657,6 +4791,7 @@ async function buildPubmedAuthorQuery() {
     renderPubmedAuthorQueryCandidates(typeof result === 'string' ? [] : result?.candidates || []);
     const detectedAuthor = typeof result === 'string' ? authorName : result?.author_name?.trim() || authorName;
     const detectedAffiliation = affiliation || (typeof result === 'string' ? '' : result?.affiliation?.trim() || '');
+    const warning = typeof result === 'string' ? '' : result?.warning?.trim() || '';
     document.getElementById('pubmed-batch-query-input').value = query;
     document.getElementById('pubmed-author-name').value = detectedAuthor;
     if (!affiliation && detectedAffiliation) {
@@ -4666,9 +4801,9 @@ async function buildPubmedAuthorQuery() {
     if (!nameInput.value.trim()) nameInput.value = `【作者｜${detectedAuthor}】`;
     document.getElementById('pubmed-question').value = `持续关注作者 ${detectedAuthor}${detectedAffiliation ? `（${detectedAffiliation}）` : ''} 的 PubMed 文献`;
     invalidatePubmedPreview();
-    status.textContent = detectedAffiliation
+    status.textContent = warning || (detectedAffiliation
       ? `已识别作者“${detectedAuthor}”和单位“${detectedAffiliation}”，请点击预览结果后再进行 AI 评估`
-      : `已识别作者“${detectedAuthor}”，未识别到单位；可手工补充后再预览`;
+      : `已识别作者“${detectedAuthor}”，未识别到单位；可手工补充后再预览`);
   } catch (e) {
     status.textContent = `构建失败：${e}`;
   } finally {
@@ -5095,6 +5230,10 @@ async function createAndRunPubmedSearch() {
 
 async function runCurrentPubmedSearch() {
   if (!currentPubmedSearch || activePubmedRunId) return;
+  if (isLocalPubmedImport(currentPubmedSearch)) {
+    setGlobalStatus('本地导入批次不能在线更新；需要补充时请再次导入文件', 'error');
+    return;
+  }
   btnRunPubmedSearch.disabled = true;
   pubmedProgressEl.classList.remove('hidden');
   pubmedProgressLabel.textContent = '正在建立 PMID 快照…';
@@ -5368,19 +5507,20 @@ function showPubmedSearchContextMenu(x, y, search) {
   hideContextMenu();
   const menu = document.createElement('div');
   menu.className = 'context-menu';
+  const localImport = isLocalPubmedImport(search);
   menu.innerHTML = `
-    <div class="context-item" data-action="refresh">更新检索批次</div>
+    ${localImport ? '' : '<div class="context-item" data-action="refresh">更新检索批次</div>'}
     ${isAuthorPubmedSearch(search) ? '<div class="context-item" data-action="author-identity">作者身份审核</div>' : ''}
-    <div class="context-item" data-action="open-source">在 PubMed 打开</div>
+    ${localImport ? '' : '<div class="context-item" data-action="open-source">在 PubMed 打开</div>'}
     <div class="context-item" data-action="generate-briefing">生成此检索简报</div>
     <div class="context-separator"></div>
     <div class="context-item" data-action="translate-title">批量翻译标题</div>
     <div class="context-item" data-action="translate-summary">批量翻译摘要</div>
     <div class="context-separator"></div>
-    <div class="context-item" data-action="edit">编辑检索词</div>
+    ${localImport ? '' : '<div class="context-item" data-action="edit">编辑检索词</div>'}
     <div class="context-item" data-action="rename">重命名</div>
-    <div class="context-item" data-action="clone">复制为新检索</div>
-    <div class="context-item" data-action="convert-to-rss">转为 RSS 订阅</div>
+    ${localImport ? '' : '<div class="context-item" data-action="clone">复制为新检索</div>'}
+    ${localImport ? '' : '<div class="context-item" data-action="convert-to-rss">转为 RSS 订阅</div>'}
     <div class="context-separator"></div>
     <div class="context-item context-item-danger" data-action="delete">删除</div>
   `;
@@ -5540,6 +5680,10 @@ function isAuthorPubmedSearch(search = currentPubmedSearch) {
   const question = String(search.question || '');
   return /【作者\s*[|｜]/i.test(name)
     || /持续关注作者|作者\s+.+?的\s*PubMed\s*文献/i.test(question);
+}
+
+function isLocalPubmedImport(search = currentPubmedSearch) {
+  return String(search?.question || '') === 'Cento 本地 PubMed 文件导入';
 }
 
 function authorIdentityStorageKey(searchId) {
@@ -6287,11 +6431,14 @@ function updatePubmedBatchHeader() {
     pubmedBatchMeta.textContent = '';
     btnRunPubmedSearch?.classList.add('hidden');
   } else if (currentPubmedSearch) {
-    const updated = currentPubmedSearch.last_success_at
-      ? `上次更新 ${formatCompactDateTime(currentPubmedSearch.last_success_at)}`
-      : '尚未完成首次抓取';
+    const localImport = isLocalPubmedImport(currentPubmedSearch);
+    const updated = localImport
+      ? `本地导入 · ${currentPubmedSearch.total_entries || 0} 篇`
+      : currentPubmedSearch.last_success_at
+        ? `上次更新 ${formatCompactDateTime(currentPubmedSearch.last_success_at)}`
+        : '尚未完成首次抓取';
     pubmedBatchMeta.textContent = updated;
-    btnRunPubmedSearch?.classList.remove('hidden');
+    btnRunPubmedSearch?.classList.toggle('hidden', localImport);
   }
   refreshPubmedSnapshotControls();
 }
@@ -6839,6 +6986,70 @@ function confirmDialog(message, { okLabel = '删除', cancelLabel = '取消', da
     document.body.appendChild(overlay);
     // Focus the primary action for fast keyboard confirm
     setTimeout(() => overlay.querySelector('.confirm-ok')?.focus(), 0);
+  });
+}
+
+function textInputDialog(title, {
+  defaultValue = '',
+  placeholder = '',
+  okLabel = '保存',
+  cancelLabel = '取消',
+  maxLength = 60,
+} = {}) {
+  return new Promise(resolve => {
+    const inputMaxLength = Math.max(1, Math.min(200, Number(maxLength) || 60));
+    const overlay = document.createElement('div');
+    overlay.className = 'confirm-overlay';
+    overlay.innerHTML = `
+      <div class="confirm-card text-input-dialog-card" role="dialog" aria-modal="true" aria-labelledby="text-input-dialog-title">
+        <div id="text-input-dialog-title" class="confirm-msg">${escapeHtml(title)}</div>
+        <input class="text-input-dialog-input" type="text" maxlength="${inputMaxLength}" />
+        <div class="confirm-actions">
+          <button class="btn btn-secondary btn-sm text-input-dialog-cancel" type="button">${escapeHtml(cancelLabel)}</button>
+          <button class="btn btn-primary btn-sm text-input-dialog-ok" type="button">${escapeHtml(okLabel)}</button>
+        </div>
+      </div>
+    `;
+    const input = overlay.querySelector('.text-input-dialog-input');
+    input.value = String(defaultValue || '').slice(0, inputMaxLength);
+    input.placeholder = String(placeholder || '');
+
+    const cleanup = value => {
+      document.removeEventListener('keydown', onKey);
+      overlay.remove();
+      resolve(value);
+    };
+    const submit = () => {
+      const value = input.value.trim();
+      if (!value) {
+        input.setAttribute('aria-invalid', 'true');
+        input.focus();
+        return;
+      }
+      cleanup(value.slice(0, inputMaxLength));
+    };
+    const onKey = event => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        cleanup(null);
+      } else if (event.key === 'Enter' && !event.isComposing) {
+        event.preventDefault();
+        submit();
+      }
+    };
+
+    input.addEventListener('input', () => input.removeAttribute('aria-invalid'));
+    overlay.addEventListener('click', event => {
+      if (event.target === overlay) cleanup(null);
+    });
+    overlay.querySelector('.text-input-dialog-ok').addEventListener('click', submit);
+    overlay.querySelector('.text-input-dialog-cancel').addEventListener('click', () => cleanup(null));
+    document.addEventListener('keydown', onKey);
+    document.body.appendChild(overlay);
+    setTimeout(() => {
+      input.focus();
+      input.select();
+    }, 0);
   });
 }
 
@@ -14669,14 +14880,15 @@ async function buildPmcGalleryAuthorQuery() {
     const query = typeof result === 'string' ? result : result?.query || '';
     const detectedAuthor = typeof result === 'string' ? authorName : result?.author_name?.trim() || authorName;
     const detectedAffiliation = affiliation || (typeof result === 'string' ? '' : result?.affiliation?.trim() || '');
+    const warning = typeof result === 'string' ? '' : result?.warning?.trim() || '';
     document.getElementById('pmc-gallery-query').value = query;
     document.getElementById('pmc-gallery-author-name').value = detectedAuthor;
     if (!affiliation && detectedAffiliation) {
       document.getElementById('pmc-gallery-author-affiliation').value = detectedAffiliation;
     }
-    invalidatePmcGalleryPreview(detectedAffiliation
+    invalidatePmcGalleryPreview(warning || (detectedAffiliation
       ? `已识别作者“${detectedAuthor}”和单位“${detectedAffiliation}”，请预览结果`
-      : `已识别作者“${detectedAuthor}”，未识别到单位；可补充后再预览`);
+      : `已识别作者“${detectedAuthor}”，未识别到单位；可补充后再预览`));
   } catch (error) {
     setPmcGalleryPreviewStatus(`构建失败：${error}`, 'error');
   } finally {
@@ -15580,9 +15792,9 @@ window.addEventListener('DOMContentLoaded', () => {
     });
   });
 
-  // OPML import/export
-  document.getElementById('btn-export-opml')?.addEventListener('click', exportOpml);
-  document.getElementById('btn-import-opml')?.addEventListener('click', importOpml);
+  document.getElementById('btn-data-transfer')?.addEventListener('click', event => {
+    showDataTransferMenu(event.currentTarget, event);
+  });
 
   // Test notification — go through the Rust backend so we exercise exactly
   // the same NotificationExt path the scheduler uses. If this banner shows,

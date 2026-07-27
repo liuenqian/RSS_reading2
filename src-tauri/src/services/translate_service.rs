@@ -182,10 +182,7 @@ fn parse_provider_response(
             (content, parse_gemini_usage(response_body))
         }
         _ => (
-            response_body["choices"][0]["message"]["content"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
+            parse_openai_compatible_content(response_body),
             parse_openai_usage(response_body),
         ),
     };
@@ -198,6 +195,48 @@ fn parse_provider_response(
         ));
     }
     Ok(TranslationOutput { content, usage })
+}
+
+fn parse_openai_compatible_content(response_body: &Value) -> String {
+    fn text_from_value(value: &Value) -> String {
+        match value {
+            Value::String(text) => text.to_string(),
+            Value::Array(parts) => parts
+                .iter()
+                .map(|part| {
+                    part.as_str()
+                        .or_else(|| part["text"].as_str())
+                        .or_else(|| part["content"].as_str())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        }
+    }
+
+    let candidates = [
+        &response_body["choices"][0]["message"]["content"],
+        &response_body["choices"][0]["text"],
+        &response_body["output_text"],
+    ];
+    for candidate in candidates {
+        let content = text_from_value(candidate);
+        if !content.trim().is_empty() {
+            return content;
+        }
+    }
+
+    response_body["output"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| text_from_value(&item["content"]))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 fn capped_max_tokens(requested: i64, configured_limit: i64) -> i64 {
@@ -443,6 +482,33 @@ mod tests {
         assert_eq!(output.usage.prompt_cache_hit_tokens, 20);
         assert_eq!(output.usage.prompt_cache_miss_tokens, 100);
         assert_eq!(output.usage.completion_tokens, 8);
+    }
+
+    #[test]
+    fn parses_openai_compatible_segmented_content() {
+        let value = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "first"},
+                        {"type": "text", "text": " second"}
+                    ]
+                }
+            }]
+        });
+
+        let output = parse_provider_response("deepseek", &value).unwrap();
+
+        assert_eq!(output.content, "first second");
+    }
+
+    #[test]
+    fn parses_openai_responses_output_text() {
+        let value = serde_json::json!({"output_text": "ok"});
+
+        let output = parse_provider_response("openai", &value).unwrap();
+
+        assert_eq!(output.content, "ok");
     }
 
     #[test]
