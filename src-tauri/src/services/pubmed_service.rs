@@ -350,7 +350,19 @@ pub async fn natural_language_to_author_query(
         Err(error) => return Err(error),
     };
 
-    let mut result = parse_author_ai_response(&output.content, author_name, affiliation)?;
+    let mut result = match parse_author_ai_response(&output.content, author_name, affiliation) {
+        Ok(result) => result,
+        Err(error) => {
+            let result = build_fallback_author_query_result(
+                author_name,
+                affiliation,
+                start_date,
+                end_date,
+                &error,
+            )?;
+            return Ok((result, output.usage));
+        }
+    };
     if let Some(date_clause) = date_clause {
         for candidate in &mut result.candidates {
             candidate.query =
@@ -1042,6 +1054,33 @@ mod tests {
         );
         assert_eq!(result.candidates.len(), 1);
         assert!(result.warning.unwrap().contains("已生成基础检索式"));
+    }
+
+    #[test]
+    fn fallback_warning_preserves_ai_validation_failure() {
+        let result = build_fallback_author_query_result(
+            "张泽民",
+            Some("北京大学"),
+            None,
+            None,
+            "AI 生成的作者检索式不安全：每条 OR 路径都必须包含目标作者姓名。请重新生成",
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.query,
+            "张泽民[Author] AND \"北京大学\"[Affiliation:~50]"
+        );
+        assert!(result
+            .warning
+            .as_deref()
+            .unwrap_or_default()
+            .contains("不安全"));
+        assert!(result
+            .warning
+            .as_deref()
+            .unwrap_or_default()
+            .contains("已生成基础检索式"));
     }
 
     #[test]

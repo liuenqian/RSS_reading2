@@ -415,6 +415,24 @@ mod tests {
     }
 
     #[test]
+    fn accepts_name_and_affiliation_alternative_groups() {
+        let query = "(\"Lyu Lingchun\"[Full Author Name] OR \"Lv Lingchun\"[Full Author Name]) AND (\"Lishui Central Hospital\"[Affiliation] OR \"Lishui City Central Hospital\"[Affiliation])";
+        let evidence = AuthorQueryEvidence {
+            target_names: ["lyu lingchun", "lv lingchun"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            affiliations: ["lishui central hospital", "lishui city central hospital"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            coauthors: HashSet::new(),
+        };
+
+        validate_author_query(query, AuthorQueryPhase::Initial, &evidence).unwrap();
+    }
+
+    #[test]
     fn rejects_any_or_path_with_unconstrained_initials() {
         let query = "\"Lyu Lingchun\"[Full Author Name] OR Lyu L[Author] OR (Lyu L[Author] AND \"Lishui Central Hospital\"[Affiliation])";
 
