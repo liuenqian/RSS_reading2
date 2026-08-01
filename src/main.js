@@ -4,7 +4,12 @@ import {
 } from './translation_queue.js';
 import { normalizeEntrySortMode, sortEntries } from './entry_sort.js';
 import { shortJournalDisplayName } from './journal_name.js';
-import { buildPubmedSearchUrl, feedSourceLink } from './source_link.js';
+import {
+  buildMedciteSearchUrl,
+  buildMedreadingSearchUrl,
+  buildPubmedSearchUrl,
+  feedSourceLink,
+} from './source_link.js';
 import { normalizeBriefingReferencesMarkdown } from './briefing_references.js';
 import {
   groupPmcFiguresByArticle,
@@ -1767,7 +1772,7 @@ let detailReadingNotesContent;
 let manualReadingNoteInput, btnManualReadingNote;
 let detailPaperChatHint, detailPaperChatMessages, detailPaperChatScopes, paperChatInput, paperChatComposer;
 let paperChatScopeCaption, btnSendPaperChat, btnClearPaperChat, btnTogglePaperChat, btnShowPaperChat;
-let paperChatPickedList, btnPaperChatAddCurrent, btnPaperChatClearPicked;
+let paperChatPickedList, btnPaperChatAddCurrent, btnPaperChatTogglePicked, btnPaperChatClearPicked;
 let paperChatPickedLabel;
 let paperChatProfileSelect;
 let paperChatAttachmentsEl, paperChatAttachmentList, btnPaperChatAddFiles, btnPaperChatAddFolder;
@@ -1925,6 +1930,7 @@ let paperChatScope = 'single';
 let paperChatPinnedEntries = [];
 let currentPaperChatProfileId = '';
 let paperChatCollapsed = false;
+let paperChatPickedCollapsed = false;
 let paperChatAttachments = [];
 let paperChatAttachmentsBusy = false;
 let activePaperChatRequest = null;
@@ -1947,6 +1953,7 @@ const LIST_MIN_WIDTH = 320;
 const LIST_MAX_WIDTH = 760;
 const PAPER_CHAT_WIDTH_STORAGE_KEY = 'paper-chat-width-v1';
 const PAPER_CHAT_COLLAPSED_STORAGE_KEY = 'paper-chat-collapsed-v1';
+const PAPER_CHAT_PICKED_COLLAPSED_STORAGE_KEY = 'paper-chat-picked-collapsed-v1';
 const PAPER_CHAT_DEFAULT_WIDTH = 430;
 const PAPER_CHAT_MIN_WIDTH = 320;
 const PAPER_CHAT_MIN_APP_WIDTH = 1420;
@@ -5512,6 +5519,8 @@ function showPubmedSearchContextMenu(x, y, search) {
     ${localImport ? '' : '<div class="context-item" data-action="refresh">更新检索批次</div>'}
     ${isAuthorPubmedSearch(search) ? '<div class="context-item" data-action="author-identity">作者身份审核</div>' : ''}
     ${localImport ? '' : '<div class="context-item" data-action="open-source">在 PubMed 打开</div>'}
+    ${localImport ? '' : '<div class="context-item" data-action="open-medcite">在 MedCite 打开</div>'}
+    ${localImport ? '' : '<div class="context-item" data-action="open-medreading">在 MedReading 打开</div>'}
     <div class="context-item" data-action="generate-briefing">生成此检索简报</div>
     <div class="context-separator"></div>
     <div class="context-item" data-action="translate-title">批量翻译标题</div>
@@ -5538,6 +5547,14 @@ function showPubmedSearchContextMenu(x, y, search) {
       const url = buildPubmedSearchUrl(search.query);
       if (url) openUrl(url);
       else setGlobalStatus('当前检索没有可打开的 PubMed 检索式', 'error');
+    } else if (action === 'open-medcite') {
+      const url = buildMedciteSearchUrl(search.query);
+      if (url) openUrl(url);
+      else setGlobalStatus('当前检索没有可打开的 MedCite 检索式', 'error');
+    } else if (action === 'open-medreading') {
+      const url = buildMedreadingSearchUrl(search.query);
+      if (url) openUrl(url);
+      else setGlobalStatus('当前检索没有可打开的 MedReading 检索式', 'error');
     } else if (action === 'generate-briefing') {
       await generateBriefingForSource('pubmed', search.id);
     } else if (action === 'translate-title') {
@@ -9387,6 +9404,30 @@ function renderPaperChatPinnedEntries() {
     </div>
   `).join('')}
   `;
+}
+
+function loadPaperChatPickedCollapsed() {
+  try {
+    return localStorage.getItem(PAPER_CHAT_PICKED_COLLAPSED_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function setPaperChatPickedCollapsed(collapsed, { persist = true } = {}) {
+  paperChatPickedCollapsed = !!collapsed;
+  paperChatPickedList?.toggleAttribute('hidden', paperChatPickedCollapsed);
+  paperChatPickedList?.closest('.detail-paper-chat-picker')?.classList.toggle('is-collapsed', paperChatPickedCollapsed);
+  if (btnPaperChatTogglePicked) {
+    btnPaperChatTogglePicked.textContent = paperChatPickedCollapsed ? '展开文献' : '折叠文献';
+    btnPaperChatTogglePicked.title = paperChatPickedCollapsed ? '展开本轮文献' : '折叠本轮文献';
+    btnPaperChatTogglePicked.setAttribute('aria-expanded', String(!paperChatPickedCollapsed));
+  }
+  if (persist) {
+    try {
+      localStorage.setItem(PAPER_CHAT_PICKED_COLLAPSED_STORAGE_KEY, paperChatPickedCollapsed ? '1' : '0');
+    } catch {}
+  }
 }
 
 function getPaperChatScopeMeta(scope = paperChatScope) {
@@ -15459,6 +15500,7 @@ window.addEventListener('DOMContentLoaded', () => {
   paperChatScopeCaption = document.getElementById('paper-chat-scope-caption');
   paperChatPickedList = document.getElementById('paper-chat-picked-list');
   paperChatPickedLabel = document.getElementById('paper-chat-picked-label');
+  btnPaperChatTogglePicked = document.getElementById('btn-toggle-paper-chat-picked');
   paperChatProfileSelect = document.getElementById('paper-chat-profile-select');
   paperChatAttachmentsEl = document.getElementById('paper-chat-attachments');
   paperChatAttachmentList = document.getElementById('paper-chat-attachment-list');
@@ -15650,6 +15692,9 @@ window.addEventListener('DOMContentLoaded', () => {
   btnTogglePaperChat?.addEventListener('click', () => setPaperChatCollapsed(true));
   btnShowPaperChat?.addEventListener('click', () => setPaperChatCollapsed(false));
   btnPaperChatAddCurrent?.addEventListener('click', () => addCurrentEntryToPaperChat());
+  btnPaperChatTogglePicked?.addEventListener('click', () => {
+    setPaperChatPickedCollapsed(!paperChatPickedCollapsed);
+  });
   btnPaperChatClearPicked?.addEventListener('click', () => clearPaperChatPinnedEntries());
   btnPaperChatAddFiles?.addEventListener('click', () => choosePaperChatAttachments());
   btnPaperChatAddFolder?.addEventListener('click', () => choosePaperChatAttachments({ directory: true }));
@@ -16374,6 +16419,7 @@ window.addEventListener('DOMContentLoaded', () => {
   loadJournalMetrics();
   loadReadingProfiles();
   renderPaperChatProfileOptions();
+  setPaperChatPickedCollapsed(loadPaperChatPickedCollapsed(), { persist: false });
   refreshPaperChatScopeControls();
   renderPaperChatMessages([]);
   renderPaperChatPinnedEntries();
