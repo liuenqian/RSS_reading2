@@ -902,6 +902,26 @@ pub fn reading_stats(conn: &Connection) -> Result<ReadingStats, String> {
         .map_err(|e| format!("统计订阅源阅读失败: {}", e))?
         .filter_map(|r| r.ok())
         .collect();
+
+    let mut tag_stmt = conn
+        .prepare(
+            "SELECT COALESCE(
+                (SELECT et.tag FROM entry_tags et
+                  WHERE et.entry_id = e.id
+                  ORDER BY lower(et.tag), et.tag LIMIT 1),
+                '未标签'
+             ) AS primary_tag, COUNT(*)
+             FROM entries e
+             WHERE e.read_at IS NOT NULL
+             GROUP BY primary_tag
+             ORDER BY COUNT(*) DESC, primary_tag COLLATE NOCASE",
+        )
+        .map_err(|e| format!("准备阅读主题统计失败: {}", e))?;
+    let tag_read_counts = tag_stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| format!("统计阅读主题失败: {}", e))?
+        .filter_map(|row| row.ok())
+        .collect();
     let growth_sources = literature_growth_sources(conn)?;
 
     Ok(ReadingStats {
@@ -910,7 +930,132 @@ pub fn reading_stats(conn: &Connection) -> Result<ReadingStats, String> {
         day_counts,
         fetched_day_counts,
         read_hour_counts,
+        tag_read_counts,
         feed_read_counts,
+        growth_sources,
+    })
+}
+
+pub fn source_reading_stats(
+    conn: &Connection,
+    source_kind: &str,
+    source_id: i64,
+) -> Result<ReadingStats, String> {
+    let scope_cte = match source_kind {
+        "feed" => {
+            "WITH scoped_entries AS (
+                SELECT e.id, m.first_seen_at AS fetched_at, e.read_at
+                FROM entry_feed_memberships m
+                JOIN entries e ON e.id = m.entry_id
+                WHERE m.feed_id = ?1
+            )"
+        }
+        "pubmed" => {
+            "WITH scoped_entries AS (
+                SELECT e.id, pse.first_seen_at AS fetched_at, e.read_at
+                FROM pubmed_search_entries pse
+                JOIN entries e ON e.id = pse.entry_id
+                WHERE pse.search_id = ?1 AND pse.is_current_match = 1
+            )"
+        }
+        _ => return Err("不支持的阅读统计来源".to_string()),
+    };
+
+    let totals_sql = format!(
+        "{} SELECT COUNT(*), COUNT(read_at) FROM scoped_entries",
+        scope_cte
+    );
+    let (total_entries, total_read) = conn
+        .query_row(&totals_sql, [source_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .map_err(|e| format!("统计来源阅读概览失败: {}", e))?;
+
+    let day_sql = format!(
+        "{} SELECT date(read_at, 'localtime') AS day, COUNT(*)
+         FROM scoped_entries WHERE read_at IS NOT NULL
+         GROUP BY day ORDER BY day",
+        scope_cte
+    );
+    let mut day_stmt = conn
+        .prepare(&day_sql)
+        .map_err(|e| format!("准备来源每日阅读统计失败: {}", e))?;
+    let day_counts = day_stmt
+        .query_map([source_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| format!("统计来源每日阅读失败: {}", e))?
+        .filter_map(|row| row.ok())
+        .collect();
+
+    let fetched_day_sql = format!(
+        "{} SELECT date(fetched_at, 'localtime') AS day, COUNT(*)
+         FROM scoped_entries WHERE fetched_at IS NOT NULL
+         GROUP BY day ORDER BY day",
+        scope_cte
+    );
+    let mut fetched_day_stmt = conn
+        .prepare(&fetched_day_sql)
+        .map_err(|e| format!("准备来源每日收录统计失败: {}", e))?;
+    let fetched_day_counts = fetched_day_stmt
+        .query_map([source_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| format!("统计来源每日收录失败: {}", e))?
+        .filter_map(|row| row.ok())
+        .collect();
+
+    let hour_sql = format!(
+        "{} SELECT CAST(strftime('%H', read_at, 'localtime') AS INTEGER), COUNT(*)
+         FROM scoped_entries WHERE read_at IS NOT NULL
+         GROUP BY 1",
+        scope_cte
+    );
+    let mut hour_stmt = conn
+        .prepare(&hour_sql)
+        .map_err(|e| format!("准备来源阅读时段统计失败: {}", e))?;
+    let mut read_hour_counts = vec![0i64; 24];
+    let hour_rows = hour_stmt
+        .query_map([source_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|e| format!("统计来源阅读时段失败: {}", e))?;
+    for (hour, count) in hour_rows.flatten() {
+        if (0..24).contains(&hour) {
+            read_hour_counts[hour as usize] = count;
+        }
+    }
+
+    let tag_sql = format!(
+        "{} SELECT COALESCE(
+            (SELECT et.tag FROM entry_tags et
+              WHERE et.entry_id = scoped_entries.id
+              ORDER BY lower(et.tag), et.tag LIMIT 1),
+            '未标签'
+         ) AS primary_tag, COUNT(*)
+         FROM scoped_entries WHERE read_at IS NOT NULL
+         GROUP BY primary_tag
+         ORDER BY COUNT(*) DESC, primary_tag COLLATE NOCASE",
+        scope_cte
+    );
+    let mut tag_stmt = conn
+        .prepare(&tag_sql)
+        .map_err(|e| format!("准备来源阅读主题统计失败: {}", e))?;
+    let tag_read_counts = tag_stmt
+        .query_map([source_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| format!("统计来源阅读主题失败: {}", e))?
+        .filter_map(|row| row.ok())
+        .collect();
+
+    let growth_sources = literature_growth_sources(conn)?
+        .into_iter()
+        .filter(|source| source.source_kind == source_kind && source.source_id == source_id)
+        .collect();
+
+    Ok(ReadingStats {
+        total_entries,
+        total_read,
+        day_counts,
+        fetched_day_counts,
+        read_hour_counts,
+        tag_read_counts,
+        feed_read_counts: Vec::new(),
         growth_sources,
     })
 }
@@ -981,7 +1126,7 @@ mod tests {
     use super::{
         analyze_word_frequency, english_word_frequency_terms, escape_like_pattern,
         literature_growth_sources, normalize_entry_tag, normalize_search_terms, parse_entry_tags,
-        search_entries,
+        search_entries, source_reading_stats,
     };
     use rusqlite::Connection;
 
@@ -1163,31 +1308,38 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE feeds (id INTEGER PRIMARY KEY, title TEXT, url TEXT NOT NULL);
-             CREATE TABLE entries (id INTEGER PRIMARY KEY, publication_date TEXT, published_at TEXT);
+             CREATE TABLE entries (id INTEGER PRIMARY KEY, publication_date TEXT, published_at TEXT, read_at TEXT);
              CREATE TABLE entry_feed_memberships (entry_id INTEGER, feed_id INTEGER, first_seen_at TEXT NOT NULL);
+             CREATE TABLE entry_tags (entry_id INTEGER, tag TEXT NOT NULL);
              CREATE TABLE pubmed_searches (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
-             CREATE TABLE pubmed_search_entries (search_id INTEGER, entry_id INTEGER, first_seen_at TEXT NOT NULL);
+             CREATE TABLE pubmed_search_entries (
+                search_id INTEGER,
+                entry_id INTEGER,
+                first_seen_at TEXT NOT NULL,
+                is_current_match INTEGER NOT NULL DEFAULT 1
+             );
              INSERT INTO feeds VALUES (1, 'Nature RSS', 'https://example.com/rss');
              INSERT INTO entries VALUES
-                (1, date('now', '-1 day'), NULL),
-                (2, date('now', '-8 days'), NULL),
-                (3, date('now', '-20 days'), NULL),
-                (4, date('now'), NULL),
-                (5, date('now', '-2 days'), NULL),
-                (6, date('now', '-3 days'), NULL),
-                (7, date('now', '-10 days'), NULL),
-                (8, date('now', '-40 days'), NULL);
+                (1, date('now', '-1 day'), NULL, datetime('now', '-1 day')),
+                (2, date('now', '-8 days'), NULL, datetime('now', '-2 days')),
+                (3, date('now', '-20 days'), NULL, NULL),
+                (4, date('now'), NULL, datetime('now')),
+                (5, date('now', '-2 days'), NULL, datetime('now', '-3 hours')),
+                (6, date('now', '-3 days'), NULL, NULL),
+                (7, date('now', '-10 days'), NULL, NULL),
+                (8, date('now', '-40 days'), NULL, NULL);
              INSERT INTO entry_feed_memberships VALUES
                 (1, 1, datetime('now')),
                 (2, 1, datetime('now')),
                 (3, 1, datetime('now'));
+             INSERT INTO entry_tags VALUES (1, '心肌损伤'), (4, '纤维化'), (5, '影像');
              INSERT INTO pubmed_searches VALUES (7, '心肌纤维化');
              INSERT INTO pubmed_search_entries VALUES
-                (7, 4, datetime('now')),
-                (7, 5, datetime('now')),
-                (7, 6, datetime('now')),
-                (7, 7, datetime('now')),
-                (7, 8, datetime('now'));",
+                (7, 4, datetime('now'), 1),
+                (7, 5, datetime('now'), 1),
+                (7, 6, datetime('now'), 1),
+                (7, 7, datetime('now'), 1),
+                (7, 8, datetime('now'), 1);",
         )
         .unwrap();
 
@@ -1214,6 +1366,30 @@ mod tests {
                 .sum::<i64>(),
             4
         );
+
+        let feed_stats = source_reading_stats(&conn, "feed", 1).unwrap();
+        assert_eq!((feed_stats.total_entries, feed_stats.total_read), (3, 2));
+        assert_eq!(
+            feed_stats
+                .day_counts
+                .iter()
+                .map(|(_, count)| count)
+                .sum::<i64>(),
+            2
+        );
+        assert!(feed_stats
+            .tag_read_counts
+            .iter()
+            .any(|(tag, count)| tag == "心肌损伤" && *count == 1));
+
+        let pubmed_stats = source_reading_stats(&conn, "pubmed", 7).unwrap();
+        assert_eq!(
+            (pubmed_stats.total_entries, pubmed_stats.total_read),
+            (5, 2)
+        );
+        assert_eq!(pubmed_stats.read_hour_counts.iter().sum::<i64>(), 2);
+        assert_eq!(pubmed_stats.tag_read_counts.len(), 2);
+        assert!(source_reading_stats(&conn, "pmc", 7).is_err());
     }
 }
 

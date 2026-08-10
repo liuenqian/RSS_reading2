@@ -16,7 +16,9 @@ export function renderScreeningTable(container, page, config, options = {}) {
   toolbar.className = 'screening-table-toolbar';
   toolbar.innerHTML = `<label class="screening-table-search"><span aria-hidden="true">⌕</span><input type="search" value="${escapeHtml(options.searchQuery || '')}" placeholder="搜索标题、作者、期刊、PMID、DOI、标签" aria-label="搜索初筛结果"></label>
     <span class="screening-table-result-count">共 ${page?.total || 0} 篇</span>
-    <span class="screening-table-file-actions"><button type="button" class="btn btn-secondary btn-sm" data-screening-action="export">导出 Excel</button><button type="button" class="btn btn-secondary btn-sm" data-screening-action="import">导入 Excel</button></span>
+    <button type="button" class="btn btn-secondary btn-sm" data-screening-action="open-workbook">打开 Excel</button>
+    <button type="button" class="btn btn-secondary btn-sm" data-screening-action="sync-workbook">同步 Excel</button>
+    <button type="button" class="btn btn-secondary btn-sm" data-screening-action="manage-workbooks">工作簿汇总</button>
     <details class="screening-table-columns-menu">
       <summary class="btn btn-secondary btn-sm">列设置</summary>
       <div class="screening-table-columns-panel">
@@ -176,8 +178,9 @@ export function renderScreeningTable(container, page, config, options = {}) {
   });
   const searchInput = container.querySelector('.screening-table-search input');
   searchInput?.addEventListener('input', () => options.onSearch?.(searchInput.value));
-  container.querySelector('[data-screening-action="export"]')?.addEventListener('click', () => options.onExport?.());
-  container.querySelector('[data-screening-action="import"]')?.addEventListener('click', () => options.onImport?.());
+  container.querySelector('[data-screening-action="open-workbook"]')?.addEventListener('click', () => options.onOpenWorkbook?.());
+  container.querySelector('[data-screening-action="sync-workbook"]')?.addEventListener('click', () => options.onSyncWorkbook?.());
+  container.querySelector('[data-screening-action="manage-workbooks"]')?.addEventListener('click', () => options.onManageWorkbooks?.());
   container.querySelector('[data-screening-page="prev"]')?.addEventListener('click', () => options.onPageChange?.(Math.max(0, (page.offset || 0) - rows.length)));
   container.querySelector('[data-screening-page="next"]')?.addEventListener('click', () => options.onPageChange?.((page.offset || 0) + rows.length));
   container.querySelectorAll('[data-column-move]').forEach(button => {

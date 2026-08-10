@@ -50,11 +50,20 @@
             <div class="pubmed-batch-heading" data-window-drag-region>
                 <div id="pubmed-batch-meta" class="pubmed-batch-meta" data-window-drag-region></div>
                 <div class="pubmed-batch-actions">
-                    <button id="btn-export-pubmed" class="btn btn-secondary btn-sm" type="button" title="导出当前结果">
-                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2.5v7M5.2 6.8 8 9.6l2.8-2.8M3 12.5h10" /></svg>
-                        <span>导出</span>
+                    <button id="btn-pubmed-data-transfer" class="btn btn-secondary btn-sm" type="button" title="导入或导出文献数据">
+                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 6 3-3 3 3M8 3v10M11 10l-3 3-3-3" /></svg>
+                        <span>导入/导出</span>
                     </button>
-                    <button id="btn-run-pubmed-search" class="btn btn-secondary btn-sm" type="button">检查更新</button>
+                    <button id="btn-run-pubmed-search" class="btn btn-secondary btn-sm" type="button" title="更新当前 PubMed 检索" disabled>检查更新</button>
+                    <button id="btn-clear-current-pubmed-search" class="btn btn-danger btn-sm" type="button" title="清空当前检索已导入的文献，保留检索词" disabled>
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M2.5 4h11" />
+                            <path d="M6 2.5h4" />
+                            <path d="M4.5 4.5 5 13h6l.5-8.5" />
+                            <path d="M6.5 6.5v4M9.5 6.5v4" />
+                        </svg>
+                        <span>清空结果</span>
+                    </button>
                 </div>
             </div>
 
@@ -177,7 +186,8 @@
                     </div>
                     <button id="btn-screening-window-close" class="btn btn-secondary" type="button">关闭窗口</button>
                 </div>
-                <div id="screening-window-table" class="screening-table-shell" aria-label="独立初筛表格"></div>
+                <div id="screening-workbook-manager" class="screening-workbook-manager hidden" aria-label="Excel 初筛工作簿管理"></div>
+                <div id="screening-window-table" class="screening-table-shell hidden" aria-label="独立初筛表格"></div>
             </section>
             <!-- ── Settings view ─────────────────────── -->
             <div id="settings-view" class="settings-view hidden">
@@ -1720,10 +1730,16 @@
                                 </svg>
                                 阅读统计
                             </div>
-                            <h1 class="section-title">你的阅读节律</h1>
-                            <p class="section-subtitle">
+                            <h1 id="reading-stats-title" class="section-title">你的阅读节律</h1>
+                            <p id="reading-stats-subtitle" class="section-subtitle">
                                 基于本地缓存的阅读记录，统计基于已读时间戳。
                             </p>
+                            <div id="reading-stats-scope" class="reading-stats-scope hidden">
+                                <span id="reading-stats-scope-label"></span>
+                                <button id="btn-reading-stats-all" class="btn btn-secondary btn-sm" type="button">
+                                    查看全部统计
+                                </button>
+                            </div>
                         </div>
 
                         <div class="settings-card">
@@ -1791,6 +1807,23 @@
                         </div>
 
                         <div class="settings-card">
+                            <div class="settings-card-header reading-rhythm-header">
+                                <span>阅读节律</span>
+                                <span>按标记已读的篇数统计</span>
+                            </div>
+                            <div class="settings-card-body reading-rhythm-grid">
+                                <section class="reading-rhythm-panel" aria-labelledby="reading-weekday-title">
+                                    <div id="reading-weekday-title" class="reading-rhythm-panel-title">一周分布</div>
+                                    <div id="reading-weekday-chart" class="reading-weekday-chart"></div>
+                                </section>
+                                <section class="reading-rhythm-panel" aria-labelledby="reading-hour-title">
+                                    <div id="reading-hour-title" class="reading-rhythm-panel-title">一天分布</div>
+                                    <div id="reading-hour-chart" class="reading-hour-chart"></div>
+                                </section>
+                            </div>
+                        </div>
+
+                        <div class="settings-card">
                             <div class="settings-card-header heatmap-card-header">
                                 <span>文献更新监测</span>
                                 <select
@@ -1827,6 +1860,31 @@
                         </div>
 
                         <div class="settings-card">
+                            <div class="settings-card-header">阅读结构</div>
+                            <div class="settings-card-body reading-structure-grid">
+                                <section class="reading-structure-panel" aria-labelledby="reading-topic-title">
+                                    <div id="reading-topic-title" class="reading-structure-title">已读文献主题占比</div>
+                                    <div class="reading-daypart-layout">
+                                        <div id="reading-topic-ring" class="reading-ring" aria-label="已读文献主题占比"></div>
+                                        <div id="reading-topic-legend" class="reading-daypart-legend"></div>
+                                    </div>
+                                </section>
+                                <section class="reading-structure-panel" aria-labelledby="reading-progress-title">
+                                    <div id="reading-progress-title" class="reading-structure-title">文库阅读进度</div>
+                                    <div class="reading-progress-layout">
+                                        <div id="reading-progress-ring" class="reading-progress-ring" aria-label="文库阅读进度">
+                                            <strong id="reading-progress-percent">0%</strong>
+                                        </div>
+                                        <div class="reading-progress-copy">
+                                            <strong id="reading-progress-count">0 / 0 篇</strong>
+                                            <span>当前范围内已读 / 已收录</span>
+                                        </div>
+                                    </div>
+                                </section>
+                            </div>
+                        </div>
+
+                        <div id="reading-preference-card" class="settings-card">
                             <div class="settings-card-header">阅读偏好</div>
                             <div class="settings-card-body">
                                 <div

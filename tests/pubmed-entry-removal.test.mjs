@@ -23,3 +23,13 @@ test('selected PubMed entries can be permanently removed from the current search
   assert.match(commands, /pub fn remove_pubmed_search_entries/);
   assert.match(lib, /pubmed_search_cmd::remove_pubmed_search_entries/);
 });
+
+test('the active PubMed search can clear its imported results without deleting the search', () => {
+  assert.match(html, /id="btn-clear-current-pubmed-search"[\s\S]*清空结果/);
+  assert.match(main, /async function clearCurrentPubmedSearchEntries\(\)/);
+  assert.match(main, /clearCurrentPubmedSearchEntries[\s\S]*confirmDialog\([\s\S]*okLabel: '清空结果'[\s\S]*danger: true/);
+  assert.match(main, /invoke\('clear_pubmed_search_entries'/);
+  assert.match(main, /btnClearCurrentPubmedSearch\?\.addEventListener\('click', clearCurrentPubmedSearchEntries\)/);
+  assert.match(commands, /pub fn clear_pubmed_search_entries/);
+  assert.match(lib, /pubmed_search_cmd::clear_pubmed_search_entries/);
+});

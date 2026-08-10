@@ -806,6 +806,74 @@ fn clean_text(text: &str) -> String {
         .join(" ")
 }
 
+pub(crate) fn export_plain_text(text: &str) -> String {
+    let decoded = decode_html_entities(text).replace("&apos;", "'");
+    let decoded = decode_numeric_html_entities(&decoded);
+    strip_export_html(&decoded)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn strip_export_html(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + 1..];
+        let Some(end) = after_open.find('>') else {
+            out.push('<');
+            rest = after_open;
+            continue;
+        };
+        let tag = after_open[..end].trim_start();
+        let tag_start = tag.strip_prefix('/').unwrap_or(tag).trim_start();
+        let is_tag = tag_start.chars().next().is_some_and(|character| {
+            character.is_ascii_alphabetic() || matches!(character, '!' | '?')
+        });
+        if is_tag {
+            out.push(' ');
+            rest = &after_open[end + 1..];
+        } else {
+            out.push('<');
+            rest = after_open;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_numeric_html_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("&#") {
+        out.push_str(&rest[..start]);
+        let entity = &rest[start + 2..];
+        let Some(end) = entity.find(';').filter(|end| *end <= 8) else {
+            out.push_str("&#");
+            rest = entity;
+            continue;
+        };
+        let code = &entity[..end];
+        let parsed = if let Some(hex) = code.strip_prefix('x').or_else(|| code.strip_prefix('X')) {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            code.parse::<u32>().ok()
+        }
+        .and_then(char::from_u32)
+        .filter(|character| *character != '\0');
+        if let Some(character) = parsed {
+            out.push(character);
+            rest = &entity[end + 1..];
+        } else {
+            out.push_str("&#");
+            rest = entity;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn strip_html(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
@@ -927,6 +995,16 @@ fn normalize_pmc_section(section_type: &str, passage_type: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_plain_text_removes_html_and_decodes_entities() {
+        let html = "<div><p>BACKGROUND:&nbsp; Injury &amp; repair.</p><p>p < 0.05; &#x03B1; = &#945;.</p></div>&lt;p&gt;Encoded tags.&lt;/p&gt;";
+
+        assert_eq!(
+            export_plain_text(html),
+            "BACKGROUND: Injury & repair. p < 0.05; α = α. Encoded tags."
+        );
+    }
 
     #[test]
     fn extracts_sciencedirect_metadata_without_treating_it_as_abstract() {

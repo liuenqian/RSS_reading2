@@ -16,9 +16,20 @@ const entries = [
 
 const ids = mode => sortEntries(entries, mode, entry => entry.metrics).map(entry => entry.id);
 
-test('sorts publication year in both directions and keeps missing years last', () => {
+test('sorts precise publication time in both directions and keeps missing dates last', () => {
   assert.deepEqual(ids('year-desc'), [2, 1, 4, 3]);
   assert.deepEqual(ids('year-asc'), [4, 1, 2, 3]);
+
+  const sameYear = [
+    { id: 1, published_at: '2024-01-10T08:00:00Z' },
+    { id: 2, published_at: '2024-01-10T09:00:00Z' },
+    { id: 3, publication_sort_key: 20231231 },
+    { id: 4 },
+  ];
+  assert.deepEqual(sortEntries(sameYear, 'year-desc').map(entry => entry.id), [2, 1, 3, 4]);
+  assert.deepEqual(sortEntries(sameYear, 'year-asc').map(entry => entry.id), [3, 1, 2, 4]);
+  assert.deepEqual(sortEntries(sameYear, 'default-desc').map(entry => entry.id), [2, 1, 3, 4]);
+  assert.deepEqual(sortEntries(sameYear, 'default-asc').map(entry => entry.id), [3, 1, 2, 4]);
 });
 
 test('sorts impact factor and keeps unavailable metrics last', () => {
@@ -33,9 +44,9 @@ test('sorts JCR and CAS partitions in both directions', () => {
   assert.deepEqual(ids('cas-desc'), [4, 1, 2, 3]);
 });
 
-test('normalizes unknown modes and preserves default order', () => {
+test('normalizes unknown modes to precise publication time descending', () => {
   assert.equal(normalizeEntrySortMode('unknown'), 'default');
-  assert.deepEqual(ids('unknown'), [1, 2, 3, 4]);
+  assert.deepEqual(ids('unknown'), [2, 1, 4, 3]);
 });
 
 test('wires all entry sorting modes into the feed list and persists the selection', () => {
@@ -46,11 +57,13 @@ test('wires all entry sorting modes into the feed list and persists the selectio
     assert.match(html, new RegExp(`value="${field}"`));
   }
   const sortSelect = html.match(/<select id="entry-sort"[\s\S]*?<\/select>/)?.[0] || '';
-  for (const mode of ['year-desc', 'year-asc', 'if-desc', 'if-asc', 'jcr-asc', 'jcr-desc', 'cas-asc', 'cas-desc']) {
+  for (const mode of ['default-desc', 'default-asc', 'year-desc', 'year-asc', 'if-desc', 'if-asc', 'jcr-asc', 'jcr-desc', 'cas-asc', 'cas-desc']) {
     assert.doesNotMatch(sortSelect, new RegExp(`value="${mode}"`));
   }
   assert.match(source, /ENTRY_SORT_STORAGE_KEY\s*=\s*'entry-sort-v2'/);
   assert.match(source, /entrySortDirectionMode\s*=\s*entrySortDirectionMode === 'asc' \? 'desc' : 'asc'/);
+  assert.doesNotMatch(source, /if \(entrySortField === 'default'\) return/);
+  assert.doesNotMatch(source, /entrySortDirection\.disabled\s*=\s*entrySortField === 'default'/);
   assert.match(source, /sortEntries\(filtered, entrySortMode, lookupJournalMetrics\)/);
   assert.match(source, /function getFilteredPubmedEntries[\s\S]*return sortPubmedEntriesForCurrentView\(filtered\)/);
   assert.match(source, /function sortPubmedEntriesForCurrentView[\s\S]*return sortEntries\(sorted, entrySortMode, lookupJournalMetrics\)/);

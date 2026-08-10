@@ -17,6 +17,7 @@ test('PubMed file import is wired from settings to both Tauri commands', () => {
   assert.doesNotMatch(html, /id="btn-(?:import|export)-opml"/);
   assert.match(main, /function showDataTransferMenu/);
   assert.match(main, /data-action="import-pubmed"/);
+  assert.match(main, /导入 PubMed 文件[\s\S]*\.nbib \/ \.txt \/ \.csv/);
   assert.match(main, /data-action="import-opml"/);
   assert.match(main, /data-action="export-opml"/);
   assert.match(main, /extensions: \['txt', 'nbib', 'csv'\]/);

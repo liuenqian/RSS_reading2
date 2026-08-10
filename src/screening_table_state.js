@@ -1,4 +1,4 @@
-export const SCREENING_TABLE_SCHEMA_VERSION = 1;
+export const SCREENING_TABLE_SCHEMA_VERSION = 2;
 
 export const SCREENING_TABLE_COLUMNS = [
   { key: 'position', label: '#', width: 48, visible: true, pinned: true },
@@ -42,7 +42,41 @@ export function defaultScreeningTableConfig() {
     searchQuery: '',
     scrollTop: 0,
     sorts: [{ field: 'publication', direction: 'desc' }],
+    workbooks: [],
   };
+}
+
+function workbookNameFromPath(path) {
+  return path.split(/[\\/]/).filter(Boolean).pop() || '初筛工作簿';
+}
+
+function normalizeScreeningWorkbook(input, index) {
+  const path = typeof input?.path === 'string' ? input.path.trim() : '';
+  if (!path) return null;
+  return {
+    id: typeof input.id === 'string' && input.id.trim() ? input.id.trim() : `workbook-${index + 1}`,
+    name: typeof input.name === 'string' && input.name.trim() ? input.name.trim().slice(0, 120) : workbookNameFromPath(path),
+    path,
+    lastExportedAt: typeof input.lastExportedAt === 'string' ? input.lastExportedAt : '',
+    lastImportedAt: typeof input.lastImportedAt === 'string' ? input.lastImportedAt : '',
+    articleCount: Math.max(0, Number(input.articleCount) || 0),
+    managed: input?.managed === 'cento' ? 'cento' : 'manual',
+  };
+}
+
+function normalizeScreeningWorkbooks(input, legacyWorkbook) {
+  const candidates = Array.isArray(input) ? input : (legacyWorkbook ? [legacyWorkbook] : []);
+  const paths = new Set();
+  const ids = new Set();
+  return candidates
+    .map((workbook, index) => normalizeScreeningWorkbook(workbook, index))
+    .filter(workbook => {
+      if (!workbook || paths.has(workbook.path) || ids.has(workbook.id)) return false;
+      paths.add(workbook.path);
+      ids.add(workbook.id);
+      return true;
+    })
+    .slice(0, 40);
 }
 
 export function normalizeScreeningTableConfig(input = {}) {
@@ -65,14 +99,16 @@ export function normalizeScreeningTableConfig(input = {}) {
       pinned: column.pinned === true,
     };
   });
+  const { workbook: legacyWorkbook, workbooks: sourceWorkbooks, ...otherInput } = input;
   return {
     ...defaults,
-    ...input,
+    ...otherInput,
     schemaVersion: SCREENING_TABLE_SCHEMA_VERSION,
     columns,
     rowDensity: input.rowDensity === 'summary' ? 'summary' : 'compact',
     rowHeight: Math.max(34, Math.min(140, Number(input.rowHeight) || defaults.rowHeight)),
     scrollTop: Math.max(0, Number(input.scrollTop) || 0),
+    workbooks: normalizeScreeningWorkbooks(sourceWorkbooks, legacyWorkbook),
     sorts: Array.isArray(input.sorts) && input.sorts.length
       ? input.sorts.slice(0, 3).map(sort => ({
           field: String(sort.field || 'publication'),

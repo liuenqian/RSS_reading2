@@ -11,7 +11,7 @@ const service = await readFile(new URL('../src-tauri/src/services/google_transla
 
 test('merges Google translation into the existing PubMed export dialog', () => {
   assert.doesNotMatch(html, /id="pubmed-export-format"/);
-  assert.match(html, /id="btn-export-pubmed"/);
+  assert.match(html, /id="btn-pubmed-data-transfer"/);
   assert.match(main, /function choosePubmedExportFields/);
   assert.match(main, /data-standard-format/);
   assert.match(main, /value="xlsx"[\s\S]*Excel \(\.xlsx\)/);

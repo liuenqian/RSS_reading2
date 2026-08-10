@@ -15,3 +15,11 @@ test('already-read PubMed clicks and note loading preserve list position', () =>
   assert.match(source, /else renderEntryList\(allEntries, \{ preserveScrollTop: entryItemsEl\?\.scrollTop \?\? 0 \}\);/);
   assert.match(source, /async function loadReadingNotes\(entryId\)[\s\S]*const listScrollTop = entryItemsEl\?\.scrollTop \?\? 0;[\s\S]*renderEntryList\(allEntries, \{ preserveScrollTop: listScrollTop \}\);/);
 });
+
+test('starring from every article surface preserves the list position', () => {
+  assert.match(source, /function rerenderEntryListPreservingScroll\(\)[\s\S]*const scrollTop = entryItemsEl\?\.scrollTop \?\? 0;[\s\S]*renderEntryList\(allEntries, \{ preserveScrollTop: scrollTop \}\);/);
+  assert.match(source, /function toggleStar\(entryId\)[\s\S]*write\.catch[\s\S]*rerenderEntryListPreservingScroll\(\)/);
+  assert.match(source, /action === 'star' \|\| action === 'unstar'[\s\S]*toggleStar\(entry\.id\);[\s\S]*rerenderEntryListPreservingScroll\(\)/);
+  assert.match(source, /\.pubmed-star-button'[\s\S]*toggleStar\(entry\.id\);[\s\S]*rerenderEntryListPreservingScroll\(\)/);
+  assert.match(source, /btn-star'\)\?\.addEventListener\('click'[\s\S]*toggleStar\(currentEntry\.id\);[\s\S]*rerenderEntryListPreservingScroll\(\)/);
+});

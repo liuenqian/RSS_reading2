@@ -151,6 +151,16 @@ pub fn get_reading_stats(state: State<DbState>) -> Result<ReadingStats, String> 
 }
 
 #[tauri::command]
+pub fn get_source_reading_stats(
+    state: State<DbState>,
+    source_kind: String,
+    source_id: i64,
+) -> Result<ReadingStats, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    entry_service::source_reading_stats(&conn, &source_kind, source_id)
+}
+
+#[tauri::command]
 pub async fn generate_stats_flavor_pool(
     state: State<'_, DbState>,
     fetched: i64,

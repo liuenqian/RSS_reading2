@@ -816,6 +816,9 @@ pub struct ReadingStats {
     /// surface the user's peak reading hour. Global across all history —
     /// peak hour is treated as identity-level, not period-dependent.
     pub read_hour_counts: Vec<i64>,
+    /// Primary tag distribution among currently readable entries. Each read
+    /// entry contributes to its first tag, or "未标签" when it has no tag.
+    pub tag_read_counts: Vec<(String, i64)>,
     /// Per-feed read counts. Tuple: (feed_id, snapshot_title, count). The
     /// snapshot lets the UI still show a name for feeds the user has since
     /// deleted — the frontend prefers the live feed title when available and

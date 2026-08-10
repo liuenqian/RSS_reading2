@@ -57,6 +57,30 @@ pub fn get_table_preferences(
     .map_err(|error| format!("读取初筛表格配置失败: {error}"))
 }
 
+pub fn list_table_preferences(conn: &Connection) -> Result<Vec<ScreeningTablePreferences>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT scope_kind, scope_id, schema_version, config_json, updated_at
+             FROM screening_table_preferences
+             ORDER BY updated_at DESC, scope_kind ASC, scope_id ASC",
+        )
+        .map_err(|error| format!("读取初筛表格配置列表失败: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ScreeningTablePreferences {
+                scope_kind: row.get(0)?,
+                scope_id: row.get(1)?,
+                schema_version: row.get(2)?,
+                config_json: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })
+        .map_err(|error| format!("读取初筛表格配置列表失败: {error}"))?;
+    rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("读取初筛表格配置列表失败: {error}"))
+}
+
 pub fn save_table_preferences(
     conn: &Connection,
     scope_kind: &str,
@@ -424,5 +448,16 @@ mod tests {
             r#"{"columns":[]}"#
         );
         assert!(get_table_preferences(&conn, "feed", 8).unwrap().is_none());
+    }
+
+    #[test]
+    fn table_preferences_list_returns_each_scope_once() {
+        let conn = database();
+        save_table_preferences(&conn, "feed", 7, 1, r#"{"columns":[]}"#).unwrap();
+        save_table_preferences(&conn, "project", 8, 1, r#"{"columns":[]}"#).unwrap();
+        save_table_preferences(&conn, "feed", 7, 2, r#"{"columns":["title"]}"#).unwrap();
+        let all = list_table_preferences(&conn).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.iter().find(|item| item.scope_kind == "feed").unwrap().schema_version, 2);
     }
 }

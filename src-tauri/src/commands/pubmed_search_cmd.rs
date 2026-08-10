@@ -228,6 +228,12 @@ pub fn remove_pubmed_search_entries(
 }
 
 #[tauri::command]
+pub fn clear_pubmed_search_entries(state: State<DbState>, search_id: i64) -> Result<usize, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    pubmed_search_service::clear_search_entries(&conn, search_id)
+}
+
+#[tauri::command]
 pub fn get_pubmed_author_identity_state(
     state: State<DbState>,
     search_id: i64,

@@ -1263,7 +1263,11 @@ pub fn update_search_with_options(
     let query = normalize_query(query)?;
     let question = question.map(str::trim).filter(|value| !value.is_empty());
     let options = normalize_retrieval_options(options)?;
-    let changed = conn
+    let query_changed = get_search(conn, id)?.query != query;
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("开始更新 PubMed 检索失败: {}", e))?;
+    let changed = tx
         .execute(
             "UPDATE pubmed_searches SET
                 name = ?1, question = ?2, query = ?3, retrieval_scope = ?4,
@@ -1286,6 +1290,15 @@ pub fn update_search_with_options(
     if changed == 0 {
         return Err("PubMed 检索不存在".to_string());
     }
+    if query_changed {
+        tx.execute(
+            "DELETE FROM pubmed_search_ignored_pmids WHERE search_id = ?1",
+            [id],
+        )
+        .map_err(|e| format!("重置 PubMed 忽略文献失败: {}", e))?;
+    }
+    tx.commit()
+        .map_err(|e| format!("提交 PubMed 检索更新失败: {}", e))?;
     get_search(conn, id)
 }
 
@@ -2702,6 +2715,45 @@ pub fn remove_search_entries(
     Ok(removed)
 }
 
+pub fn clear_search_entries(conn: &Connection, search_id: i64) -> Result<usize, String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("开始清空 PubMed 检索结果失败: {}", e))?;
+    let search_exists = tx
+        .query_row(
+            "SELECT 1 FROM pubmed_searches WHERE id = ?1",
+            [search_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| format!("读取 PubMed 检索失败: {}", e))?
+        .is_some();
+    if !search_exists {
+        return Err("PubMed 检索不存在".to_string());
+    }
+
+    tx.execute(
+        "INSERT OR IGNORE INTO pubmed_search_ignored_pmids (search_id, pmid)
+         SELECT pse.search_id, e.pmid
+         FROM pubmed_search_entries pse
+         JOIN entries e ON e.id = pse.entry_id
+         WHERE pse.search_id = ?1 AND pse.is_current_match = 1
+           AND e.pmid IS NOT NULL AND length(trim(e.pmid)) > 0",
+        [search_id],
+    )
+    .map_err(|e| format!("保存 PubMed 忽略文献失败: {}", e))?;
+    let removed = tx
+        .execute(
+            "DELETE FROM pubmed_search_entries
+             WHERE search_id = ?1 AND is_current_match = 1",
+            [search_id],
+        )
+        .map_err(|e| format!("清空 PubMed 检索结果失败: {}", e))?;
+    tx.commit()
+        .map_err(|e| format!("提交 PubMed 检索结果清空失败: {}", e))?;
+    Ok(removed)
+}
+
 fn load_search_entry_structured_authors(
     conn: &Connection,
     search_id: i64,
@@ -3350,8 +3402,16 @@ fn export_field_value(
         "screening_status" => screening_status_label(&entry.screening_status).to_string(),
         "title_translated" => entry.title_translated.clone().unwrap_or_default(),
         "title" => entry.title.clone(),
-        "summary_translated" => entry.summary_translated.clone().unwrap_or_default(),
-        "summary" => entry.summary.clone().unwrap_or_default(),
+        "summary_translated" => entry
+            .summary_translated
+            .as_deref()
+            .map(article_service::export_plain_text)
+            .unwrap_or_default(),
+        "summary" => entry
+            .summary
+            .as_deref()
+            .map(article_service::export_plain_text)
+            .unwrap_or_default(),
         "authors" => entry.authors.clone().unwrap_or_default(),
         "journal" => entry.journal.clone().unwrap_or_default(),
         "publication_date" => entry.publication_date.clone().unwrap_or_default(),
@@ -4862,6 +4922,29 @@ mod tests {
     }
 
     #[test]
+    fn export_renderers_remove_html_from_abstracts() {
+        let conn = search_db();
+        let search = create_search(&conn, "Clean export", None, "ischemia").unwrap();
+        let run = begin_run(&conn, search.id).unwrap();
+        snapshot_run_items(&conn, run, &["1".to_string()]).unwrap();
+        let mut source = record("1", "English title");
+        source.abstract_text =
+            Some("<div><p>BACKGROUND:&nbsp; Injury &#38; repair.</p></div>".to_string());
+        finish_item(&conn, run, search.id, &source);
+        complete_run(&conn, search.id, run).unwrap();
+        let entries = list_search_entries(&conn, search.id).unwrap();
+        let fields = vec!["summary".to_string()];
+
+        let csv = render_export_csv(&entries, &fields, &HashMap::new(), &HashMap::new()).unwrap();
+        let txt = render_export_txt(&entries, &fields, &HashMap::new(), &HashMap::new()).unwrap();
+
+        assert!(csv.contains("BACKGROUND: Injury & repair."));
+        assert!(txt.contains("AB  - BACKGROUND: Injury & repair."));
+        assert!(!csv.contains("<div>"));
+        assert!(!txt.contains("&nbsp;"));
+    }
+
+    #[test]
     fn xlsx_export_uses_pubmed_downloader_columns_and_keeps_extra_fields() {
         let conn = search_db();
         let search = create_search(&conn, "Export", None, "sepsis").unwrap();
@@ -5277,6 +5360,73 @@ mod tests {
             second_branches[0].pmids,
             vec!["10".to_string(), "11".to_string()]
         );
+    }
+
+    #[test]
+    fn clearing_search_entries_preserves_the_search_and_shared_article_data() {
+        let conn = search_db();
+        let first = create_search(&conn, "First", None, "sepsis").unwrap();
+        let second = create_search(&conn, "Second", None, "immune").unwrap();
+
+        let first_run = begin_run(&conn, first.id).unwrap();
+        snapshot_run_items(&conn, first_run, &["10".to_string(), "11".to_string()]).unwrap();
+        let (shared_entry_id, _) = finish_item(&conn, first_run, first.id, &record("10", "Shared"));
+        finish_item(&conn, first_run, first.id, &record("11", "First only"));
+        complete_run(&conn, first.id, first_run).unwrap();
+
+        let second_run = begin_run(&conn, second.id).unwrap();
+        snapshot_run_items(&conn, second_run, &["10".to_string()]).unwrap();
+        reuse_local_run_items(&conn, second.id, second_run, &["10".to_string()]).unwrap();
+        complete_run(&conn, second.id, second_run).unwrap();
+        conn.execute(
+            "INSERT INTO reading_notes (entry_id) VALUES (?1)",
+            [shared_entry_id],
+        )
+        .unwrap();
+
+        assert_eq!(clear_search_entries(&conn, first.id).unwrap(), 2);
+        assert!(list_search_entries(&conn, first.id).unwrap().is_empty());
+        assert_eq!(get_search(&conn, first.id).unwrap().name, "First");
+        assert_eq!(list_search_entries(&conn, second.id).unwrap().len(), 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM reading_notes WHERE entry_id = ?1",
+                [shared_entry_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+
+        let mut unchanged_query = vec!["10".to_string(), "11".to_string(), "12".to_string()];
+        filter_ignored_pmids(&conn, first.id, &mut unchanged_query).unwrap();
+        assert_eq!(unchanged_query, vec!["12".to_string()]);
+
+        update_search(&conn, first.id, "First", None, "immune repair").unwrap();
+        let mut edited_query = vec!["10".to_string(), "11".to_string(), "12".to_string()];
+        filter_ignored_pmids(&conn, first.id, &mut edited_query).unwrap();
+        assert_eq!(edited_query, vec!["10", "11", "12"]);
+    }
+
+    #[test]
+    fn edited_query_resets_removed_entry_ignores() {
+        let conn = search_db();
+        let search = create_search(&conn, "Original", None, "sepsis").unwrap();
+        let run = begin_run(&conn, search.id).unwrap();
+        snapshot_run_items(&conn, run, &["10".to_string()]).unwrap();
+        let (entry_id, _) = finish_item(&conn, run, search.id, &record("10", "Shared"));
+        complete_run(&conn, search.id, run).unwrap();
+        remove_search_entries(&conn, search.id, &[entry_id]).unwrap();
+
+        update_search(&conn, search.id, "Renamed", None, "sepsis").unwrap();
+        let mut unchanged_query = vec!["10".to_string(), "11".to_string()];
+        filter_ignored_pmids(&conn, search.id, &mut unchanged_query).unwrap();
+        assert_eq!(unchanged_query, vec!["11".to_string()]);
+
+        update_search(&conn, search.id, "Edited", None, "immune").unwrap();
+        let mut edited_query = vec!["10".to_string(), "11".to_string()];
+        filter_ignored_pmids(&conn, search.id, &mut edited_query).unwrap();
+        assert_eq!(edited_query, vec!["10".to_string(), "11".to_string()]);
     }
 
     #[test]

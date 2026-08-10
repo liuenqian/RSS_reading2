@@ -1,4 +1,5 @@
 use crate::db::DbState;
+use crate::services::pubmed_search_service;
 use crate::services::screening_scope_service::{
     self, ScreeningPage, ScreeningScopeRequest, ScreeningSelection, ScreeningSort,
 };
@@ -7,8 +8,20 @@ use crate::services::screening_state_service::{
 };
 use crate::services::screening_xlsx_service;
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedScreeningWorkbook {
+    pub scope_id: i64,
+    pub name: String,
+    pub path: String,
+    pub article_count: usize,
+    pub created: bool,
+}
 
 #[tauri::command]
 pub fn open_screening_window(
@@ -47,6 +60,25 @@ pub fn open_screening_window(
         .build()
         .map_err(|error| format!("创建初筛窗口失败: {error}"))?;
     Ok(())
+}
+
+#[tauri::command]
+pub fn open_screening_xlsx(app: AppHandle, path: String) -> Result<(), String> {
+    let workbook_path = Path::new(&path);
+    let is_xlsx = workbook_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("xlsx"));
+    if !is_xlsx {
+        return Err("只能打开初筛 Excel (.xlsx) 文件".to_string());
+    }
+    if !workbook_path.is_file() {
+        return Err("已绑定的 Excel 文件不存在或已移动，请重新选择文件".to_string());
+    }
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_path(path, None::<&str>)
+        .map_err(|error| format!("打开 Excel 文件失败: {error}"))
 }
 
 #[tauri::command]
@@ -145,6 +177,14 @@ pub fn get_screening_table_preferences(
 }
 
 #[tauri::command]
+pub fn list_screening_table_preferences(
+    state: State<DbState>,
+) -> Result<Vec<ScreeningTablePreferences>, String> {
+    let conn = state.conn.lock().map_err(|error| error.to_string())?;
+    screening_state_service::list_table_preferences(&conn)
+}
+
+#[tauri::command]
 pub fn save_screening_table_preferences(
     state: State<DbState>,
     scope_kind: String,
@@ -180,6 +220,53 @@ pub fn export_screening_xlsx(
         &selection,
         &sorts,
     )
+}
+
+#[tauri::command]
+pub fn ensure_pubmed_screening_workbooks(
+    app: AppHandle,
+    state: State<DbState>,
+) -> Result<Vec<ManagedScreeningWorkbook>, String> {
+    let directory = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取初筛工作簿目录: {error}"))?
+        .join("screening-workbooks");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("无法创建初筛工作簿目录: {error}"))?;
+    let conn = state.conn.lock().map_err(|error| error.to_string())?;
+    let searches = pubmed_search_service::list_searches(&conn)?;
+    let sorts = vec![ScreeningSort {
+        field: "publication".to_string(),
+        direction: "desc".to_string(),
+    }];
+    searches
+        .into_iter()
+        .map(|search| {
+            let path = directory.join(format!("pubmed-{}-screening.xlsx", search.id));
+            let created = !path.is_file();
+            if created {
+                screening_xlsx_service::export_xlsx(
+                    &conn,
+                    &path,
+                    "pubmed",
+                    search.id,
+                    &ScreeningSelection::AllFiltered {
+                        filters: Default::default(),
+                        excluded_entry_ids: vec![],
+                    },
+                    &sorts,
+                )?;
+            }
+            Ok(ManagedScreeningWorkbook {
+                scope_id: search.id,
+                name: format!("{} · 初筛.xlsx", search.name),
+                path: path.to_string_lossy().to_string(),
+                article_count: usize::try_from(search.total_entries).unwrap_or(0),
+                created,
+            })
+        })
+        .collect()
 }
 
 #[tauri::command]

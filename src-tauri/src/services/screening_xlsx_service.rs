@@ -1,3 +1,4 @@
+use crate::services::article_service;
 use crate::services::screening_scope_service::{
     self, ScreeningRow, ScreeningSelection, ScreeningSort,
 };
@@ -74,9 +75,6 @@ pub fn export_xlsx(
     let ids =
         screening_scope_service::resolve_selection(conn, scope_kind, scope_id, selection, sorts)?;
     let rows = load_rows_for_ids(conn, scope_kind, scope_id, &ids, sorts)?;
-    if rows.is_empty() {
-        return Err("当前没有可导出的初筛文献".to_string());
-    }
     let bytes = render_workbook(scope_kind, scope_id, &rows)?;
     fs::write(path, bytes).map_err(|error| format!("保存初筛 Excel 失败: {error}"))?;
     Ok(ScreeningXlsxExportReport {
@@ -229,21 +227,33 @@ fn render_workbook(
         .set_name("初筛表格")
         .map_err(|error| format!("设置初筛工作表失败: {error}"))?;
     let headers = [
-        "_cento_entry_id",
-        "PMID",
-        "标题",
-        "摘要",
+        "#",
+        "中文标题",
+        "英文标题",
+        "中文摘要",
+        "英文摘要",
         "作者",
         "期刊",
         "发表日期",
+        "发表日期原文",
+        "加入时间",
+        "PMID",
+        "PMCID",
         "DOI",
+        "作者单位",
+        "免费全文",
+        "IF",
+        "JCR",
+        "中科院分区",
+        "Top 期刊",
         "标星",
-        "已读",
-        "标签",
         "筛选状态",
         "排除原因",
         "筛选备注",
         "阅读笔记（只读）",
+        "已读",
+        "标签",
+        "_cento_entry_id",
         "_cento_scope_kind",
         "_cento_scope_id",
         "_cento_format",
@@ -264,21 +274,59 @@ fn render_workbook(
         let excel_row = u32::try_from(index + 1).map_err(|_| "初筛 Excel 行数过多".to_string())?;
         let values = current_values_from_row(row);
         let cells = [
-            row.entry_id.to_string(),
-            row.pmid.clone().unwrap_or_default(),
+            row.position.to_string(),
+            row.title_translated.clone().unwrap_or_default(),
             row.title.clone(),
-            row.summary.clone().unwrap_or_default(),
+            row.summary_translated
+                .as_deref()
+                .map(article_service::export_plain_text)
+                .unwrap_or_default(),
+            row.summary
+                .as_deref()
+                .map(article_service::export_plain_text)
+                .unwrap_or_default(),
             row.authors.clone().unwrap_or_default(),
             row.journal.clone().unwrap_or_default(),
-            row.publication_date.clone().unwrap_or_default(),
+            row.publication_date
+                .clone()
+                .or_else(|| row.published_at.clone())
+                .unwrap_or_default(),
+            row.publication_date_raw.clone().unwrap_or_default(),
+            row.first_seen_at.clone().unwrap_or_default(),
+            row.pmid.clone().unwrap_or_default(),
+            row.pmcid.clone().unwrap_or_default(),
             row.doi.clone().unwrap_or_default(),
+            row.affiliation.clone().unwrap_or_default(),
+            if row.has_free_fulltext { "是" } else { "否" }.to_string(),
+            row.metrics
+                .as_ref()
+                .and_then(|metric| metric.impact_factor.clone())
+                .unwrap_or_default(),
+            row.metrics
+                .as_ref()
+                .and_then(|metric| metric.q.clone())
+                .unwrap_or_default(),
+            row.metrics
+                .as_ref()
+                .and_then(|metric| metric.b.clone())
+                .unwrap_or_default(),
+            row.metrics
+                .as_ref()
+                .and_then(|metric| metric.top.as_deref())
+                .map(|value| match value {
+                    "1" => "是".to_string(),
+                    "0" => "否".to_string(),
+                    value => value.to_string(),
+                })
+                .unwrap_or_default(),
             values["starred"].clone(),
-            values["read"].clone(),
-            values["tags"].clone(),
             row.screening_status.clone(),
             row.exclusion_reason.clone().unwrap_or_default(),
             row.screening_note.clone().unwrap_or_default(),
-            "（只读）".to_string(),
+            if row.has_reading_note { "有" } else { "无" }.to_string(),
+            values["read"].clone(),
+            values["tags"].clone(),
+            row.entry_id.to_string(),
             scope_kind.to_string(),
             scope_id.to_string(),
             FORMAT_CODE.to_string(),
@@ -296,15 +344,12 @@ fn render_workbook(
         }
     }
     worksheet
-        .set_freeze_panes(1, 2)
+        .set_freeze_panes(1, 1)
         .map_err(|error| format!("设置初筛冻结窗格失败: {error}"))?;
     worksheet
         .autofilter(0, 0, rows.len() as u32, (headers.len() - 1) as u16)
         .map_err(|error| format!("设置初筛筛选失败: {error}"))?;
-    worksheet
-        .set_column_hidden(0)
-        .map_err(|error| format!("隐藏 Cento ID 失败: {error}"))?;
-    for column in 15..headers.len() as u16 {
+    for column in 26..headers.len() as u16 {
         worksheet
             .set_column_hidden(column)
             .map_err(|error| format!("隐藏初筛元数据失败: {error}"))?;
@@ -571,9 +616,9 @@ mod tests {
             scope_kind: "feed".to_string(),
             scope_id: 7,
             title: "Original title".to_string(),
-            title_translated: None,
+            title_translated: Some("中文标题".to_string()),
             summary: Some("Abstract".to_string()),
-            summary_translated: None,
+            summary_translated: Some("中文摘要".to_string()),
             authors: Some("Author A".to_string()),
             journal: Some("Nature".to_string()),
             publication_date: Some("2025-01-01".to_string()),
@@ -606,19 +651,53 @@ mod tests {
 
     #[test]
     fn screening_workbook_contains_format_and_hidden_baseline_headers() {
-        let bytes = render_workbook("feed", 7, &[row()]).unwrap();
+        let mut source = row();
+        source.summary =
+            Some("<div><p>BACKGROUND:&nbsp; Injury &#38; repair.</p></div>".to_string());
+        source.summary_translated = Some("<p>中文&nbsp;摘要</p>".to_string());
+        let bytes = render_workbook("feed", 7, &[source]).unwrap();
         assert!(bytes.starts_with(b"PK"));
         let mut workbook = Xlsx::new(Cursor::new(bytes)).unwrap();
         let range = workbook.worksheet_range("初筛表格").unwrap();
         let header = range.rows().next().unwrap();
-        assert_eq!(value_string(&header[0]).as_deref(), Some("_cento_entry_id"));
-        assert_eq!(value_string(&header[17]).as_deref(), Some("_cento_format"));
+        assert_eq!(value_string(&header[0]).as_deref(), Some("#"));
+        assert_eq!(value_string(&header[1]).as_deref(), Some("中文标题"));
+        assert_eq!(value_string(&header[2]).as_deref(), Some("英文标题"));
+        assert_eq!(value_string(&header[3]).as_deref(), Some("中文摘要"));
+        assert_eq!(value_string(&header[4]).as_deref(), Some("英文摘要"));
+        assert_eq!(value_string(&header[11]).as_deref(), Some("PMCID"));
+        assert_eq!(value_string(&header[15]).as_deref(), Some("IF"));
+        assert_eq!(value_string(&header[23]).as_deref(), Some("阅读笔记（只读）"));
+        assert_eq!(value_string(&header[26]).as_deref(), Some("_cento_entry_id"));
+        assert_eq!(value_string(&header[29]).as_deref(), Some("_cento_format"));
         assert_eq!(
-            value_string(&header[18]).as_deref(),
+            value_string(&header[30]).as_deref(),
             Some("_cento_baseline_starred")
         );
         let data = range.rows().nth(1).unwrap();
-        assert_eq!(value_string(&data[0]).as_deref(), Some("42"));
-        assert_eq!(value_string(&data[17]).as_deref(), Some(FORMAT_CODE));
+        assert_eq!(value_string(&data[0]).as_deref(), Some("1"));
+        assert_eq!(value_string(&data[1]).as_deref(), Some("中文标题"));
+        assert_eq!(
+            value_string(&data[4]).as_deref(),
+            Some("BACKGROUND: Injury & repair.")
+        );
+        assert_eq!(value_string(&data[3]).as_deref(), Some("中文 摘要"));
+        assert_eq!(value_string(&data[14]).as_deref(), Some("是"));
+        assert_eq!(value_string(&data[15]).as_deref(), Some("50"));
+        assert_eq!(value_string(&data[18]).as_deref(), Some("是"));
+        assert_eq!(value_string(&data[23]).as_deref(), Some("有"));
+        assert_eq!(value_string(&data[29]).as_deref(), Some(FORMAT_CODE));
+    }
+
+    #[test]
+    fn empty_screening_workbook_keeps_the_import_headers() {
+        let bytes = render_workbook("pubmed", 9, &[]).unwrap();
+        let mut workbook = Xlsx::new(Cursor::new(bytes)).unwrap();
+        let range = workbook.worksheet_range("初筛表格").unwrap();
+        assert_eq!(range.height(), 1);
+        let header = range.rows().next().unwrap();
+        assert_eq!(value_string(&header[0]).as_deref(), Some("#"));
+        assert_eq!(value_string(&header[26]).as_deref(), Some("_cento_entry_id"));
+        assert_eq!(value_string(&header[29]).as_deref(), Some("_cento_format"));
     }
 }

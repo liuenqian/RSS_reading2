@@ -1,3 +1,4 @@
+use crate::services::article_service;
 use calamine::{open_workbook, Data, DataType, Reader, Xlsx};
 use rusqlite::{params, Connection, OptionalExtension};
 use rust_xlsxwriter::Workbook;
@@ -118,7 +119,9 @@ pub fn render_workbook(rows: &[GoogleTranslateXlsxRow]) -> Result<Vec<u8>, Strin
             .write_number(row, 0, item.entry_id as f64)
             .and_then(|sheet| sheet.write_string(row, 1, field_code(&item.field)?))
             .and_then(|sheet| sheet.write_string(row, 2, &item.original_hash))
-            .and_then(|sheet| sheet.write_string(row, 3, &item.text))
+            .and_then(|sheet| {
+                sheet.write_string(row, 3, article_service::export_plain_text(&item.text))
+            })
             .and_then(|sheet| sheet.write_string(row, 4, FORMAT_CODE))
             .map_err(|error| format!("写入 Google 翻译内容失败: {error}"))?;
     }
@@ -627,6 +630,17 @@ mod tests {
         let parsed = parse_workbook_bytes(render_workbook(&rows).unwrap()).unwrap();
         assert_eq!(parsed.rows, rows);
         assert!(parsed.issues.is_empty());
+    }
+
+    #[test]
+    fn google_translate_xlsx_exports_plain_text_without_changing_source_hash() {
+        let source = "<div><p>BACKGROUND:&nbsp; Injury &#38; repair.</p></div>";
+        let rows = vec![row(11, "summary", source)];
+
+        let parsed = parse_workbook_bytes(render_workbook(&rows).unwrap()).unwrap();
+
+        assert_eq!(parsed.rows[0].text, "BACKGROUND: Injury & repair.");
+        assert_eq!(parsed.rows[0].original_hash, original_text_hash(source));
     }
 
     #[test]

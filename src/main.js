@@ -39,6 +39,7 @@ import {
   toggleScreeningTableSort,
 } from './screening_table_state.js';
 import { renderScreeningTable } from './screening_table_view.js';
+import { renderScreeningWorkbookManager } from './screening_workbook_manager.js';
 import { SCI_REVIEW_STAGES, SciReviewWorkspace } from './sci_review_workspace.js';
 import {
   addPubmedQuestionHistory,
@@ -1745,7 +1746,7 @@ let literatureSearchInput, btnClearLiteratureSearch, literatureSearchRow;
 let pubmedSearchListEl, pubmedBatchHeader, pubmedBatchMeta;
 let pubmedStatusFilter, pubmedSort, pubmedStarFilter, pubmedDateFilters, pubmedPublishedFrom, pubmedPublishedTo, pubmedAddedFrom, pubmedAddedTo;
 let pubmedProgressEl, pubmedProgressFill, pubmedProgressLabel, btnRunPubmedSearch, btnCancelPubmedRun;
-let btnExportPubmed;
+let btnPubmedDataTransfer, btnClearCurrentPubmedSearch;
 let pubmedSnapshotSelect, btnSavePubmedSnapshot, btnDeletePubmedSnapshot;
 let pubmedBulkStatus, btnPubmedAiScreen, btnPubmedAuthorIdentity, btnPubmedRemoveSelected;
 let entryListEl, briefingListEl, briefingItemsEl, briefingSortSelect, briefingSortDirection;
@@ -1755,7 +1756,7 @@ let annotationLibraryColorFilter, annotationLibrarySort;
 let annotationColorMeaningMenu, annotationColorMeaningRows, btnSaveColorMeanings;
 let annotationNewColorInput, annotationNewColorHexInput, btnAddAnnotationColor;
 let entryItemsEl, entryFilter, screeningTableEl, btnScreeningTableToggle;
-let screeningWindowView, screeningWindowTitle, screeningWindowSubtitle, btnScreeningWindowClose;
+let screeningWindowView, screeningWindowTitle, screeningWindowSubtitle, screeningWorkbookManagerEl, btnScreeningWindowClose;
 let entrySortSelect, entrySortDirection, entryMetricIfFilter, entryMetricQFilter, entryMetricBFilter, entryMetricTopFilter, entryTagFilter;
 let entryMetricFilterSummaryCount;
 let entryBulkActions, entryBulkCount, btnEntrySelectMode, btnEntryBulkSelectAll, btnEntryBulkSelectUnnoted, btnEntryBulkSelectNoted, btnEntryBulkInvert, btnEntryBulkDeselect, entryBulkExportFormat, btnEntryBulkExport, entryBulkExistingMode, btnEntryBulkGenerate, btnEntryBulkClear;
@@ -1807,7 +1808,7 @@ let hasConfiguredApiKey = false;
 let sidebarCollapsed = false;
 let entryFilterValue = 'all';   // 'all' | 'unread' | 'starred' | 'reading-notes'
 let entryTagFilterValue = 'all';
-let entrySortMode = 'default';
+let entrySortMode = 'default-desc';
 let entrySortField = 'default';
 let entrySortDirectionMode = 'desc';
 let briefingSortField = 'date';
@@ -1877,7 +1878,6 @@ const screeningTableOffsets = new Map();
 const screeningTableSearchQueries = new Map();
 let screeningTableRequestId = 0;
 let screeningTableSearchTimer = null;
-let standaloneScreeningLaunchFilters = null;
 
 const SCI_HUB_BASE_URL = 'https://www.sci-hub.st/';
 const SCI_HUB_LAST_RELIABLE_PUBLICATION_YEAR = 2020;
@@ -2173,7 +2173,7 @@ function toggleStar(entryId) {
     : Promise.resolve();
   return write.catch(error => {
     starredEntryIds = previous;
-    renderEntryList(allEntries);
+    rerenderEntryListPreservingScroll();
     updateOverviewCounts();
     setGlobalStatus(`保存星标失败：${error}`, 'error');
   });
@@ -2270,7 +2270,7 @@ function persistCurrentFilterScope() {
     localStorage.setItem(ENTRY_METRIC_FILTER_STORAGE_KEY, JSON.stringify(entryMetricFilters));
     localStorage.setItem(
       ENTRY_SORT_STORAGE_KEY,
-      entrySortField === 'default' ? 'default' : `${entrySortField}-${entrySortDirectionMode}`,
+      `${entrySortField}-${entrySortDirectionMode}`,
     );
   }
 }
@@ -4018,7 +4018,7 @@ async function importGoogleTranslateXlsx() {
   }
 }
 
-async function exportCurrentPubmedEntries(formatOverride = null, sourceButton = btnExportPubmed) {
+async function exportCurrentPubmedEntries(formatOverride = null, sourceButton = btnPubmedDataTransfer) {
   if (!['pubmed', 'kept'].includes(mode)) return;
   const selected = getSelectedEntries();
   const filtered = getFilteredPubmedEntries(allEntries);
@@ -4381,15 +4381,19 @@ async function importOpml() {
   }
 }
 
-function showDataTransferMenu(button, event) {
+function showDataTransferMenu(button, event, { includeCurrentEntries = false } = {}) {
   event?.stopPropagation();
   hideContextMenu();
   const menu = document.createElement('div');
   menu.className = 'context-menu';
   menu.innerHTML = `
-    <div class="context-item" data-action="import-pubmed">导入 PubMed 文件</div>
+    <div class="context-item context-item-with-meta" data-action="import-pubmed" title="支持 PubMed 导出的 NBIB、MEDLINE 文本和 CSV 文件">
+      <span class="context-item-label">导入 PubMed 文件</span>
+      <span class="context-item-meta">.nbib / .txt / .csv</span>
+    </div>
     <div class="context-item" data-action="import-opml">导入 OPML 订阅</div>
     <div class="context-separator"></div>
+    ${includeCurrentEntries ? '<div class="context-item" data-action="export-current">导出当前结果</div>' : ''}
     <div class="context-item" data-action="export-opml">导出 OPML 订阅</div>
   `;
   menu.addEventListener('click', async clickEvent => {
@@ -4398,6 +4402,7 @@ function showDataTransferMenu(button, event) {
     hideContextMenu();
     if (action === 'import-pubmed') await importPubmedFile();
     else if (action === 'import-opml') await importOpml();
+    else if (action === 'export-current') await exportCurrentPubmedEntries(null, button);
     else if (action === 'export-opml') await exportOpml();
   });
   const rect = button.getBoundingClientRect();
@@ -5510,6 +5515,56 @@ function renderPubmedSearchList() {
   });
 }
 
+async function deletePubmedSearch(search) {
+  if (!search?.id) return false;
+  const confirmed = await confirmDialog(`删除检索批次“${search.name}”？筛选记录会删除，但文献阅读记录会保留。`, {
+    okLabel: '删除', cancelLabel: '取消', danger: true,
+  });
+  if (!confirmed) return false;
+
+  try {
+    await invoke('delete_pubmed_search', { id: search.id });
+    if (currentPubmedSearch?.id === search.id) await enterKeptMode();
+    await loadPubmedSearches();
+    setGlobalStatus(`已删除检索“${search.name}”`, 'success');
+    return true;
+  } catch (error) {
+    setGlobalStatus(`删除检索失败：${error}`, 'error');
+    return false;
+  }
+}
+
+async function clearCurrentPubmedSearchEntries() {
+  const search = currentPubmedSearch;
+  if (!search?.id) return;
+  const visibleCount = allEntries.length || Number(search.total_entries || 0);
+  if (!visibleCount) {
+    setGlobalStatus('当前检索结果已经为空', 'info');
+    return;
+  }
+  const confirmed = await confirmDialog(
+    `清空“${search.name}”已导入的 ${visibleCount} 篇文献？检索词会保留；修改检索词后可重新抓取。`,
+    { okLabel: '清空结果', cancelLabel: '取消', danger: true },
+  );
+  if (!confirmed) return;
+
+  btnClearCurrentPubmedSearch.disabled = true;
+  setGlobalStatus(`正在清空“${search.name}”的检索结果…`, 'progress');
+  try {
+    const removed = await invoke('clear_pubmed_search_entries', { searchId: search.id });
+    currentEntry = null;
+    detailContent?.classList.add('hidden');
+    detailEmpty?.classList.remove('hidden');
+    await loadPubmedSearches();
+    await selectPubmedSearch(search.id);
+    setGlobalStatus(`已清空“${search.name}”的 ${removed} 篇检索结果`, 'success');
+  } catch (error) {
+    setGlobalStatus(`清空检索结果失败：${error}`, 'error');
+  } finally {
+    btnClearCurrentPubmedSearch.disabled = false;
+  }
+}
+
 function showPubmedSearchContextMenu(x, y, search) {
   hideContextMenu();
   const menu = document.createElement('div');
@@ -5522,6 +5577,7 @@ function showPubmedSearchContextMenu(x, y, search) {
     ${localImport ? '' : '<div class="context-item" data-action="open-medcite">在 MedCite 打开</div>'}
     ${localImport ? '' : '<div class="context-item" data-action="open-medreading">在 MedReading 打开</div>'}
     <div class="context-item" data-action="generate-briefing">生成此检索简报</div>
+    <div class="context-item" data-action="reading-stats">查看阅读统计</div>
     <div class="context-separator"></div>
     <div class="context-item" data-action="translate-title">批量翻译标题</div>
     <div class="context-item" data-action="translate-summary">批量翻译摘要</div>
@@ -5557,6 +5613,8 @@ function showPubmedSearchContextMenu(x, y, search) {
       else setGlobalStatus('当前检索没有可打开的 MedReading 检索式', 'error');
     } else if (action === 'generate-briefing') {
       await generateBriefingForSource('pubmed', search.id);
+    } else if (action === 'reading-stats') {
+      openReadingStatsForSource('pubmed', search.id, search.name);
     } else if (action === 'translate-title') {
       await translatePubmedSearchEntries(search, 'title');
     } else if (action === 'translate-summary') {
@@ -5570,13 +5628,7 @@ function showPubmedSearchContextMenu(x, y, search) {
     } else if (action === 'convert-to-rss') {
       await convertPubmedSearchToFeed(search);
     } else if (action === 'delete') {
-      const confirmed = await confirmDialog(`删除检索批次“${search.name}”？筛选记录会删除，但文献阅读记录会保留。`, {
-        okLabel: '删除', cancelLabel: '取消', danger: true,
-      });
-      if (!confirmed) return;
-      await invoke('delete_pubmed_search', { id: search.id });
-      if (currentPubmedSearch?.id === search.id) await enterKeptMode();
-      await loadPubmedSearches();
+      await deletePubmedSearch(search);
     }
   });
   mountContextMenu(menu, x, y);
@@ -6444,18 +6496,22 @@ function useSciReviewStrategy({ project, option, pubmedQuery }) {
 function updatePubmedBatchHeader() {
   if (!pubmedBatchHeader) return;
   pubmedBatchHeader.classList.toggle('hidden', !['pubmed', 'kept'].includes(mode));
+  const hasCurrentSearch = mode === 'pubmed' && !!currentPubmedSearch;
+  const localImport = hasCurrentSearch && isLocalPubmedImport(currentPubmedSearch);
+  btnRunPubmedSearch.disabled = !hasCurrentSearch || localImport;
+  btnRunPubmedSearch.title = localImport
+    ? '本地导入批次不能在线更新'
+    : (hasCurrentSearch ? '更新当前 PubMed 检索' : '请先选择一个 PubMed 检索');
+  btnClearCurrentPubmedSearch.disabled = !hasCurrentSearch;
   if (mode === 'kept') {
     pubmedBatchMeta.textContent = '';
-    btnRunPubmedSearch?.classList.add('hidden');
   } else if (currentPubmedSearch) {
-    const localImport = isLocalPubmedImport(currentPubmedSearch);
     const updated = localImport
       ? `本地导入 · ${currentPubmedSearch.total_entries || 0} 篇`
       : currentPubmedSearch.last_success_at
         ? `上次更新 ${formatCompactDateTime(currentPubmedSearch.last_success_at)}`
         : '尚未完成首次抓取';
     pubmedBatchMeta.textContent = updated;
-    btnRunPubmedSearch?.classList.toggle('hidden', localImport);
   }
   refreshPubmedSnapshotControls();
 }
@@ -7213,6 +7269,7 @@ function showContextMenu(x, y, feed) {
     <div class="context-item" data-action="refresh">更新订阅源</div>
     <div class="context-item" data-action="open-source">${sourceLink.label}</div>
     <div class="context-item" data-action="generate-briefing">生成此订阅简报</div>
+    <div class="context-item" data-action="reading-stats">查看阅读统计</div>
     <div class="context-separator"></div>
     <div class="context-item" data-action="translate-title">翻译标题</div>
     <div class="context-item" data-action="translate-summary">翻译摘要</div>
@@ -7233,6 +7290,8 @@ function showContextMenu(x, y, feed) {
       else setGlobalStatus('当前订阅源没有可打开的地址', 'error');
     } else if (action === 'generate-briefing') {
       await generateBriefingForSource('feed', feed.id);
+    } else if (action === 'reading-stats') {
+      openReadingStatsForSource('feed', feed.id, feed.title || feed.url);
     } else if (action === 'translate-title') {
       await translateFeedEntries(feed, 'title');
     } else if (action === 'translate-summary') {
@@ -7418,7 +7477,7 @@ function showEntryContextMenu(x, y, entry) {
     else if (action === 'mark-unread') await setEntryRead(entry, false);
     else if (action === 'star' || action === 'unstar') {
       toggleStar(entry.id);
-      renderEntryList(allEntries);
+      rerenderEntryListPreservingScroll();
       updateOverviewCounts();
     } else if (action === 'reading-note') {
       if (isBatch) await generateReadingNotesForEntries(targetEntries, target.dataset.profileId);
@@ -8102,7 +8161,7 @@ function restoreEntrySortMode() {
       entrySortDirectionMode = 'desc';
     } else {
       const [field, direction] = normalized.split('-');
-      entrySortField = ['year', 'if', 'jcr', 'cas'].includes(field) ? field : 'default';
+      entrySortField = ['default', 'year', 'if', 'jcr', 'cas'].includes(field) ? field : 'default';
       entrySortDirectionMode = direction === 'asc' ? 'asc' : 'desc';
     }
     syncEntrySortMode();
@@ -8115,9 +8174,7 @@ function restoreEntrySortMode() {
 }
 
 function syncEntrySortMode() {
-  entrySortMode = entrySortField === 'default'
-    ? 'default'
-    : `${entrySortField}-${entrySortDirectionMode}`;
+  entrySortMode = `${entrySortField}-${entrySortDirectionMode}`;
 }
 
 function defaultEntrySortDirection(field) {
@@ -8134,7 +8191,7 @@ function syncEntrySortControl() {
     entrySortDirection.setAttribute('aria-pressed', String(isAscending));
     entrySortDirection.title = isAscending ? '当前为升序，点击切换为降序' : '当前为降序，点击切换为升序';
     entrySortDirection.querySelector('.entry-sort-direction-label').textContent = isAscending ? '↑' : '↓';
-    entrySortDirection.disabled = entrySortField === 'default';
+    entrySortDirection.disabled = false;
   }
 }
 
@@ -9832,26 +9889,27 @@ function screeningTableFilters(scopeKey = '') {
   const filters = {};
   const query = screeningTableSearchQueries.get(scopeKey)?.trim();
   if (query) filters.query = query;
-  if (mode === 'pubmed' && pubmedFilters.status && pubmedFilters.status !== 'all') {
-    filters.screeningStatus = pubmedFilters.status;
+  if (!isStandaloneScreeningWorkspace()) {
+    if (mode === 'pubmed' && pubmedFilters.status && pubmedFilters.status !== 'all') {
+      filters.screeningStatus = pubmedFilters.status;
+    }
+    if (entryFilterValue === 'unread') filters.read = false;
+    if (entryFilterValue === 'starred') filters.starred = true;
+    if (entryFilterValue === 'reading-notes') filters.hasReadingNote = true;
+    if (pubmedFilters.star === 'starred') filters.starred = true;
+    if (pubmedFilters.star === 'unstarred') filters.starred = false;
+    if (pubmedFilters.publishedFrom) filters.publishedFrom = pubmedFilters.publishedFrom;
+    if (pubmedFilters.publishedTo) filters.publishedTo = pubmedFilters.publishedTo;
+    const metricIf = entryMetricFilters.if;
+    if (metricIf === 'ge5') filters.minImpactFactor = 5;
+    if (metricIf === 'ge10') filters.minImpactFactor = 10;
+    if (metricIf === 'ge20') filters.minImpactFactor = 20;
+    if (entryMetricFilters.q !== 'all' && entryMetricFilters.q !== 'na') filters.q = [entryMetricFilters.q];
+    if (entryMetricFilters.b !== 'all' && entryMetricFilters.b !== 'na') filters.b = [entryMetricFilters.b];
+    if (entryMetricFilters.top === 'top') filters.top = true;
+    if (entryMetricFilters.top === 'non-top') filters.top = false;
+    if (entryTagFilterValue !== 'all') filters.tags = [entryTagFilterValue];
   }
-  if (entryFilterValue === 'unread') filters.read = false;
-  if (entryFilterValue === 'starred') filters.starred = true;
-  if (entryFilterValue === 'reading-notes') filters.hasReadingNote = true;
-  if (pubmedFilters.star === 'starred') filters.starred = true;
-  if (pubmedFilters.star === 'unstarred') filters.starred = false;
-  if (pubmedFilters.publishedFrom) filters.publishedFrom = pubmedFilters.publishedFrom;
-  if (pubmedFilters.publishedTo) filters.publishedTo = pubmedFilters.publishedTo;
-  const metricIf = entryMetricFilters.if;
-  if (metricIf === 'ge5') filters.minImpactFactor = 5;
-  if (metricIf === 'ge10') filters.minImpactFactor = 10;
-  if (metricIf === 'ge20') filters.minImpactFactor = 20;
-  if (entryMetricFilters.q !== 'all' && entryMetricFilters.q !== 'na') filters.q = [entryMetricFilters.q];
-  if (entryMetricFilters.b !== 'all' && entryMetricFilters.b !== 'na') filters.b = [entryMetricFilters.b];
-  if (entryMetricFilters.top === 'top') filters.top = true;
-  if (entryMetricFilters.top === 'non-top') filters.top = false;
-  if (entryTagFilterValue !== 'all') filters.tags = [entryTagFilterValue];
-  if (standaloneScreeningLaunchFilters) Object.assign(filters, standaloneScreeningLaunchFilters);
   if (query) filters.query = query;
   return filters;
 }
@@ -9895,29 +9953,69 @@ async function saveScreeningTableConfig(scope, config) {
   }
 }
 
-async function exportScreeningTable() {
-  const scope = currentScreeningTableScope();
+function screeningWorkbookName(path) {
+  return String(path || '').split(/[\\/]/).filter(Boolean).pop() || '初筛工作簿';
+}
+
+function newScreeningWorkbookId() {
+  return `workbook-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function saveScreeningWorkbook(scope, workbook) {
+  const config = await loadScreeningTableConfig(scope);
+  const workbooks = (config.workbooks || [])
+    .filter(item => item.id !== workbook.id && item.path !== workbook.path)
+    .concat(workbook)
+    .slice(-40);
+  await saveScreeningTableConfig(scope, { ...config, workbooks });
+  return workbook;
+}
+
+async function removeScreeningWorkbook(scope, workbookId) {
+  const config = await loadScreeningTableConfig(scope);
+  await saveScreeningTableConfig(scope, {
+    ...config,
+    workbooks: (config.workbooks || []).filter(workbook => workbook.id !== workbookId),
+  });
+}
+
+async function exportScreeningTable({ workbookId = '', scopeOverride = null } = {}) {
+  const scope = scopeOverride || currentScreeningTableScope();
   const dialog = window.__TAURI__?.dialog;
   if (!scope || !dialog) return setGlobalStatus('当前范围不支持初筛 Excel 导出', 'error');
+  const config = await loadScreeningTableConfig(scope);
+  const existing = (config.workbooks || []).find(workbook => workbook.id === workbookId);
   const path = await dialog.save({
-    title: '导出初筛 Excel',
-    defaultPath: `${safeExportFileName(currentPubmedSearch?.name || 'RSS初筛')}-screening.xlsx`,
+    title: existing ? '另存初筛 Excel' : '新建初筛 Excel 工作簿',
+    defaultPath: existing?.path || `${safeExportFileName(currentPubmedSearch?.name || 'RSS初筛')}-screening.xlsx`,
     filters: [{ name: 'Excel', extensions: ['xlsx'] }],
   });
   if (!path) return;
   try {
-    const config = await loadScreeningTableConfig(scope);
     const report = await invoke('export_screening_xlsx', {
       path,
       ...scope,
       selection: {
         mode: 'allFiltered',
-        filters: screeningTableFilters(screeningScopeKey(scope.scopeKind, scope.scopeId)),
+        filters: currentScreeningTableScope()?.scopeKind === scope.scopeKind
+          && currentScreeningTableScope()?.scopeId === scope.scopeId
+          ? screeningTableFilters(screeningScopeKey(scope.scopeKind, scope.scopeId))
+          : {},
         excludedEntryIds: [],
       },
       sorts: screeningTableSorts(config),
     });
+    await saveScreeningWorkbook(scope, {
+      id: existing?.id || newScreeningWorkbookId(),
+      name: screeningWorkbookName(path),
+      path,
+      articleCount: report.articleCount,
+      lastExportedAt: new Date().toISOString(),
+      lastImportedAt: existing?.path === path ? existing.lastImportedAt : '',
+    });
     setGlobalStatus(`初筛 Excel 已导出：${report.articleCount} 篇`, 'success');
+    if (isStandaloneScreeningWorkspace()) await showScreeningWorkbookManager();
+    else refreshScreeningTable();
   } catch (error) {
     setGlobalStatus(`导出初筛 Excel 失败：${error}`, 'error');
   }
@@ -9949,11 +10047,11 @@ function screeningImportReview(preview) {
   });
 }
 
-async function importScreeningTable() {
-  const scope = currentScreeningTableScope();
+async function importScreeningTable(pathOverride = '', { workbookId = '', scopeOverride = null, returnToManager = true } = {}) {
+  const scope = scopeOverride || currentScreeningTableScope();
   const dialog = window.__TAURI__?.dialog;
-  if (!scope || !dialog) return setGlobalStatus('当前范围不支持初筛 Excel 导入', 'error');
-  const selected = await dialog.open({ title: '选择初筛 Excel', multiple: false, filters: [{ name: 'Excel', extensions: ['xlsx'] }] });
+  if (!scope || (!dialog && !pathOverride)) return setGlobalStatus('当前范围不支持初筛 Excel 导入', 'error');
+  const selected = pathOverride || await dialog.open({ title: '选择初筛 Excel', multiple: false, filters: [{ name: 'Excel', extensions: ['xlsx'] }] });
   const path = Array.isArray(selected) ? selected[0] : selected;
   if (!path) return;
   try {
@@ -9965,13 +10063,248 @@ async function importScreeningTable() {
       candidates: preview.candidates || [],
       resolutions,
     });
+    const config = await loadScreeningTableConfig(scope);
+    const existing = (config.workbooks || []).find(workbook => workbook.id === workbookId || workbook.path === path);
+    await saveScreeningWorkbook(scope, {
+      id: existing?.id || newScreeningWorkbookId(),
+      name: existing?.name || screeningWorkbookName(path),
+      path,
+      articleCount: preview.articleCount || existing?.articleCount || 0,
+      lastExportedAt: existing?.path === path ? existing.lastExportedAt : '',
+      lastImportedAt: new Date().toISOString(),
+    });
     setGlobalStatus(`初筛 Excel 导入完成：更新 ${report.updatedEntries} 篇、${report.updatedFields} 个字段`, 'success');
-    if (scope.scopeKind === 'feed') await loadEntries(scope.scopeId);
-    else await selectPubmedSearch(scope.scopeId);
-    refreshScreeningTable();
+    const currentScope = currentScreeningTableScope();
+    if (currentScope?.scopeKind === scope.scopeKind && currentScope?.scopeId === scope.scopeId) {
+      if (scope.scopeKind === 'feed') await loadEntries(scope.scopeId);
+      else await selectPubmedSearch(scope.scopeId);
+    }
+    if (isStandaloneScreeningWorkspace() && returnToManager) await showScreeningWorkbookManager();
+    else refreshScreeningTable();
   } catch (error) {
     setGlobalStatus(`导入初筛 Excel 失败：${error}`, 'error');
   }
+}
+
+function scopeForScreeningWorkbook(workbook) {
+  const scopeKind = workbook?.scopeKind;
+  const scopeId = Number(workbook?.scopeId);
+  if (!['pubmed', 'feed'].includes(scopeKind) || !Number.isInteger(scopeId) || scopeId <= 0) return null;
+  return { scopeKind, scopeId };
+}
+
+async function openScreeningWorkbook(workbook) {
+  if (!scopeForScreeningWorkbook(workbook)) return setGlobalStatus('该 Excel 工作簿范围无效', 'error');
+  try {
+    await invoke('open_screening_xlsx', { path: workbook.path });
+  } catch (error) {
+    setGlobalStatus(`打开 Excel 失败：${error}`, 'error');
+  }
+}
+
+async function currentScreeningWorkbook() {
+  const scope = currentScreeningTableScope();
+  if (!scope) return null;
+  let config = await loadScreeningTableConfig(scope);
+  let workbook = (config.workbooks || []).find(item => item.managed === 'cento') || config.workbooks?.[0];
+  if (!workbook && scope.scopeKind === 'pubmed') {
+    try {
+      await ensureAutomaticScreeningWorkbooks();
+      config = await loadScreeningTableConfig(scope);
+      workbook = (config.workbooks || []).find(item => item.managed === 'cento') || config.workbooks?.[0];
+    } catch (error) {
+      setGlobalStatus(`初始化初筛 Excel 失败：${error}`, 'error');
+      return null;
+    }
+  }
+  return workbook ? { ...workbook, ...scope } : null;
+}
+
+async function openCurrentScreeningWorkbook() {
+  const workbook = await currentScreeningWorkbook();
+  if (!workbook) return setGlobalStatus('当前范围尚未登记 Excel，请在工作簿汇总中导入或新建副本', 'info');
+  await openScreeningWorkbook(workbook);
+}
+
+async function syncCurrentScreeningWorkbook() {
+  const workbook = await currentScreeningWorkbook();
+  if (!workbook) return setGlobalStatus('当前范围尚未登记 Excel，请在工作簿汇总中导入或新建副本', 'info');
+  await importScreeningTable(workbook.path, {
+    workbookId: workbook.id,
+    scopeOverride: scopeForScreeningWorkbook(workbook),
+    returnToManager: false,
+  });
+}
+
+async function syncScreeningWorkbook(workbook) {
+  const scope = scopeForScreeningWorkbook(workbook);
+  if (!scope) return setGlobalStatus('该 Excel 工作簿范围无效', 'error');
+  await importScreeningTable(workbook.path, { workbookId: workbook.id, scopeOverride: scope });
+}
+
+async function removeScreeningWorkbookRecord(workbook) {
+  const scope = scopeForScreeningWorkbook(workbook);
+  if (!scope) return setGlobalStatus('该 Excel 工作簿范围无效', 'error');
+  const confirmed = await confirmDialog(`从初筛工作台移除“${workbook.name}”的记录？Excel 文件不会被删除。`, {
+    okLabel: '移除记录', cancelLabel: '取消', danger: true,
+  });
+  if (!confirmed) return;
+  await removeScreeningWorkbook(scope, workbook.id);
+  setGlobalStatus('已移除 Excel 工作簿记录，文件本身未删除', 'success');
+  await showScreeningWorkbookManager();
+}
+
+function screeningWorkspaceScopeLabel(scope, searches, feeds) {
+  if (scope.scopeKind === 'pubmed') {
+    const search = searches.find(item => Number(item.id) === scope.scopeId);
+    return `PubMed · ${search?.name || `检索 #${scope.scopeId}`}`;
+  }
+  const feed = feeds.find(item => Number(item.id) === scope.scopeId);
+  return `RSS · ${feed?.title || feed?.name || `订阅 #${scope.scopeId}`}`;
+}
+
+function screeningWorkspaceScopes(searches, feeds) {
+  return [
+    ...(searches || []).map(search => ({
+      scopeKind: 'pubmed',
+      scopeId: Number(search.id),
+      label: `PubMed · ${search.name || `检索 #${search.id}`}`,
+    })),
+    ...(feeds || []).map(feed => ({
+      scopeKind: 'feed',
+      scopeId: Number(feed.id),
+      label: `RSS · ${feed.title || feed.name || `订阅 #${feed.id}`}`,
+    })),
+  ].filter(scope => scopeForScreeningWorkbook(scope));
+}
+
+async function ensureAutomaticScreeningWorkbooks() {
+  const workbooks = await invoke('ensure_pubmed_screening_workbooks');
+  for (const workbook of workbooks || []) {
+    const scope = { scopeKind: 'pubmed', scopeId: Number(workbook.scopeId) };
+    if (!scopeForScreeningWorkbook(scope)) continue;
+    const config = await loadScreeningTableConfig(scope);
+    if ((config.workbooks || []).some(item => item.path === workbook.path)) continue;
+    await saveScreeningWorkbook(scope, {
+      id: `cento-pubmed-${scope.scopeId}`,
+      name: workbook.name || `PubMed 检索 #${scope.scopeId} · 初筛.xlsx`,
+      path: workbook.path,
+      articleCount: Number(workbook.articleCount) || 0,
+      lastExportedAt: workbook.created ? new Date().toISOString() : '',
+      lastImportedAt: '',
+      managed: 'cento',
+    });
+  }
+}
+
+async function loadScreeningWorkspaceData() {
+  const [preferences, searches, feeds] = await Promise.all([
+    invoke('list_screening_table_preferences'),
+    invoke('list_pubmed_searches'),
+    invoke('list_feeds'),
+  ]);
+  const scopes = screeningWorkspaceScopes(searches, feeds);
+  const scopesByKey = new Map(scopes.map(scope => [screeningScopeKey(scope.scopeKind, scope.scopeId), scope]));
+  const workbooks = (preferences || []).flatMap(preference => {
+    const scope = { scopeKind: preference.scopeKind, scopeId: Number(preference.scopeId) };
+    if (!scopeForScreeningWorkbook({ ...scope })) return [];
+    try {
+      const config = normalizeScreeningTableConfig(JSON.parse(preference.configJson || '{}'));
+      const scopeLabel = scopesByKey.get(screeningScopeKey(scope.scopeKind, scope.scopeId))?.label
+        || screeningWorkspaceScopeLabel(scope, searches || [], feeds || []);
+      return config.workbooks.map(workbook => ({ ...workbook, ...scope, scopeLabel }));
+    } catch (error) {
+      console.warn('跳过无法读取的初筛工作簿配置', error);
+      return [];
+    }
+  }).sort((left, right) => String(right.lastImportedAt || right.lastExportedAt || '').localeCompare(String(left.lastImportedAt || left.lastExportedAt || '')));
+  return { scopes, workbooks };
+}
+
+async function activateScreeningScope(scope) {
+  if (!scopeForScreeningWorkbook({ ...scope })) return;
+  if (scope.scopeKind === 'pubmed') {
+    mode = 'pubmed';
+    currentPubmedSearch = { id: scope.scopeId, name: `PubMed 检索 #${scope.scopeId}` };
+    selectedFeedId = null;
+    try {
+      const searches = await invoke('list_pubmed_searches');
+      const search = (searches || []).find(item => Number(item.id) === scope.scopeId);
+      if (search) currentPubmedSearch = search;
+    } catch (error) {
+      console.warn('读取初筛工作台检索名称失败', error);
+    }
+  } else {
+    mode = 'feed';
+    currentPubmedSearch = null;
+    selectedFeedId = scope.scopeId;
+    try {
+      const feeds = await invoke('list_feeds');
+      const feed = (feeds || []).find(item => Number(item.id) === scope.scopeId);
+      if (feed) screeningWindowSubtitle.textContent = `${feed.title || feed.name || 'RSS 订阅'} · 完整结果初筛`;
+    } catch (error) {
+      console.warn('读取初筛工作台订阅名称失败', error);
+    }
+  }
+  const title = scope.scopeKind === 'pubmed'
+    ? (currentPubmedSearch?.name || 'PubMed 检索初筛')
+    : 'RSS 订阅初筛';
+  if (screeningWindowTitle) screeningWindowTitle.textContent = title;
+  if (screeningWindowSubtitle && scope.scopeKind === 'pubmed') {
+    screeningWindowSubtitle.textContent = `范围 ID：${scope.scopeId} · 可分页查看完整结果`;
+  }
+}
+
+function isStandaloneScreeningWorkspace() {
+  return Boolean(standaloneScreeningScopeFromUrl() && document.body.classList.contains('screening-window-mode'));
+}
+
+async function showScreeningWorkbookManager() {
+  const scope = currentScreeningTableScope();
+  if (!scope) return;
+  if (!isStandaloneScreeningWorkspace() || !screeningWorkbookManagerEl) {
+    await openStandaloneScreeningWindow();
+    return;
+  }
+  screeningTableMode = false;
+  screeningTableEl?.classList.add('hidden');
+  screeningWorkbookManagerEl.classList.remove('hidden');
+  if (screeningWindowTitle) screeningWindowTitle.textContent = '初筛工作簿汇总';
+  if (screeningWindowSubtitle) screeningWindowSubtitle.textContent = '查看和同步所有检索词的初筛 Excel';
+  let initializationError = '';
+  try {
+    await ensureAutomaticScreeningWorkbooks();
+  } catch (error) {
+    console.warn('自动初始化初筛 Excel 失败', error);
+    initializationError = '部分检索的自动工作簿未能初始化，请稍后重新打开工作台。';
+  }
+  const { scopes, workbooks } = await loadScreeningWorkspaceData();
+  renderScreeningWorkbookManager(screeningWorkbookManagerEl, {
+    escapeHtml,
+    workbooks,
+    scopes,
+    activeScopeKey: screeningScopeKey(scope.scopeKind, scope.scopeId),
+    scopeLabel: '每个 PubMed 检索均有独立工作簿；这里仅用于汇总管理。',
+    initializationError,
+    onReturnToCurrent: () => openScreeningTableFromManager(scope),
+    onOpenTable: openScreeningTableFromManager,
+    onCreate: targetScope => exportScreeningTable({ scopeOverride: targetScope || scope }),
+    onImport: targetScope => importScreeningTable('', { scopeOverride: targetScope || scope }),
+    onOpen: openScreeningWorkbook,
+    onSync: syncScreeningWorkbook,
+    onExport: workbook => exportScreeningTable({ workbookId: workbook.id, scopeOverride: scopeForScreeningWorkbook(workbook) }),
+    onRemove: removeScreeningWorkbookRecord,
+  });
+}
+
+async function openScreeningTableFromManager(workbook = null) {
+  if (!isStandaloneScreeningWorkspace()) return;
+  const scope = scopeForScreeningWorkbook(workbook);
+  if (scope) await activateScreeningScope(scope);
+  screeningWorkbookManagerEl?.classList.add('hidden');
+  screeningTableEl?.classList.remove('hidden');
+  screeningTableMode = true;
+  await refreshScreeningTable();
 }
 
 async function refreshScreeningTable() {
@@ -10025,8 +10358,9 @@ async function refreshScreeningTable() {
         await saveScreeningTableConfig(scope, next);
         refreshScreeningTable();
       },
-      onExport: exportScreeningTable,
-      onImport: importScreeningTable,
+      onOpenWorkbook: openCurrentScreeningWorkbook,
+      onSyncWorkbook: syncCurrentScreeningWorkbook,
+      onManageWorkbooks: showScreeningWorkbookManager,
       onPageChange: nextOffset => {
         screeningTableOffsets.set(scopeKey, Math.max(0, nextOffset));
         refreshScreeningTable();
@@ -10072,10 +10406,6 @@ function standaloneScreeningScopeFromUrl() {
   return { scopeKind, scopeId };
 }
 
-function screeningWindowLaunchKey(scope) {
-  return `screening-window-launch-v1:${scope.scopeKind}:${scope.scopeId}`;
-}
-
 async function activateStandaloneScreeningWindow() {
   const scope = standaloneScreeningScopeFromUrl();
   if (!scope || !screeningWindowView) return false;
@@ -10084,53 +10414,17 @@ async function activateStandaloneScreeningWindow() {
   mainView?.classList.add('hidden');
   screeningWindowView.classList.remove('hidden');
   document.body.classList.add('screening-window-mode');
-  screeningTableMode = true;
+  screeningTableMode = false;
   screeningTableEl = document.getElementById('screening-window-table');
-  try {
-    const launch = JSON.parse(localStorage.getItem(screeningWindowLaunchKey(scope)) || 'null');
-    standaloneScreeningLaunchFilters = launch?.filters || null;
-    if (standaloneScreeningLaunchFilters?.query) {
-      screeningTableSearchQueries.set(
-        screeningScopeKey(scope.scopeKind, scope.scopeId),
-        standaloneScreeningLaunchFilters.query,
-      );
-    }
-  } catch (error) {
-    standaloneScreeningLaunchFilters = null;
-    console.warn('读取初筛工作台启动范围失败', error);
-  }
-  if (scope.scopeKind === 'pubmed') {
-    mode = 'pubmed';
-    currentPubmedSearch = { id: scope.scopeId, name: `PubMed 检索 #${scope.scopeId}` };
-    selectedFeedId = null;
-    try {
-      const searches = await invoke('list_pubmed_searches');
-      const search = (searches || []).find(item => Number(item.id) === scope.scopeId);
-      if (search) currentPubmedSearch = search;
-    } catch (error) {
-      console.warn('读取初筛工作台检索名称失败', error);
-    }
-  } else {
-    mode = 'feed';
-    currentPubmedSearch = null;
-    selectedFeedId = scope.scopeId;
-    try {
-      const feeds = await invoke('list_feeds');
-      const feed = (feeds || []).find(item => Number(item.id) === scope.scopeId);
-      if (feed) screeningWindowSubtitle.textContent = `${feed.title || feed.name || 'RSS 订阅'} · 完整结果初筛`;
-    } catch (error) {
-      console.warn('读取初筛工作台订阅名称失败', error);
-    }
-  }
-  const title = scope.scopeKind === 'pubmed'
-    ? (currentPubmedSearch?.name || 'PubMed 检索初筛')
-    : 'RSS 订阅初筛';
-  if (screeningWindowTitle) screeningWindowTitle.textContent = title;
-  if (screeningWindowSubtitle && scope.scopeKind === 'pubmed') {
-    screeningWindowSubtitle.textContent = `范围 ID：${scope.scopeId} · 可分页查看完整结果`;
-  }
+  screeningWorkbookManagerEl = document.getElementById('screening-workbook-manager');
+  await activateScreeningScope(scope);
   btnScreeningWindowClose?.addEventListener('click', () => window.__TAURI__?.window?.getCurrentWindow?.()?.close());
-  await refreshScreeningTable();
+  try {
+    await ensureAutomaticScreeningWorkbooks();
+  } catch (error) {
+    console.warn('自动初始化初筛 Excel 失败', error);
+  }
+  await openScreeningTableFromManager(scope);
   return true;
 }
 
@@ -10141,11 +10435,6 @@ async function openStandaloneScreeningWindow() {
     return;
   }
   try {
-    const scopeKey = screeningScopeKey(scope.scopeKind, scope.scopeId);
-    const filters = screeningTableFilters(scopeKey);
-    const selectedIds = [...selectedEntryIds].map(Number).filter(Number.isFinite);
-    if (selectedIds.length) filters.entryIds = selectedIds;
-    localStorage.setItem(screeningWindowLaunchKey(scope), JSON.stringify({ filters }));
     await invoke('open_screening_window', scope);
     setGlobalStatus('初筛工作台已打开', 'success');
   } catch (error) {
@@ -10396,7 +10685,7 @@ function renderPubmedEntryList(entries, options = {}) {
     li.querySelector('.pubmed-star-button')?.addEventListener('click', event => {
       event.stopPropagation();
       toggleStar(entry.id);
-      renderEntryList(allEntries);
+      rerenderEntryListPreservingScroll();
       updateOverviewCounts();
     });
     li.querySelector('.pubmed-status-select')?.addEventListener('change', async event => {
@@ -10441,6 +10730,11 @@ function restoreEntryListScrollTop(scrollTop) {
   requestAnimationFrame(() => {
     if (entryItemsEl) entryItemsEl.scrollTop = scrollTop;
   });
+}
+
+function rerenderEntryListPreservingScroll() {
+  const scrollTop = entryItemsEl?.scrollTop ?? 0;
+  renderEntryList(allEntries, { preserveScrollTop: scrollTop });
 }
 
 function formatPubmedPublicationDate(entry) {
@@ -13734,25 +14028,85 @@ function initBriefingSettings() {
 let heatmapDayCounts = new Map();
 let fetchedDayCounts = new Map();
 let readHourCounts = new Array(24).fill(0);
+let readTagCounts = [];
 let heatmapYear = new Date().getFullYear();
 let statsPeriod = 'all'; // 'all' | '30d' | '7d'
 let cachedReadingStats = null;
+let readingStatsScope = null;
+
+function setReadingStatsScope(scope = null) {
+  readingStatsScope = scope?.id ? {
+    kind: scope.kind,
+    id: Number(scope.id),
+    name: String(scope.name || '未命名来源'),
+  } : null;
+}
+
+function openReadingStatsForSource(kind, id, name) {
+  setReadingStatsScope({ kind, id, name });
+  showSettings('stats');
+}
+
+function syncReadingStatsScopeUi() {
+  const title = document.getElementById('reading-stats-title');
+  const subtitle = document.getElementById('reading-stats-subtitle');
+  const scopeWrap = document.getElementById('reading-stats-scope');
+  const scopeLabel = document.getElementById('reading-stats-scope-label');
+  const preferenceCard = document.getElementById('reading-preference-card');
+  const growthFilter = document.getElementById('literature-growth-filter');
+  const allButton = document.getElementById('btn-reading-stats-all');
+
+  if (readingStatsScope) {
+    const kindLabel = readingStatsScope.kind === 'pubmed' ? 'PubMed 检索' : 'RSS 订阅源';
+    if (title) title.textContent = readingStatsScope.name;
+    if (subtitle) subtitle.textContent = '当前页面仅统计这个检索源中的文献与阅读记录。';
+    if (scopeLabel) scopeLabel.textContent = `${kindLabel} · 来源统计`;
+    scopeWrap?.classList.remove('hidden');
+    preferenceCard?.classList.add('hidden');
+    if (growthFilter) {
+      growthFilter.value = 'all';
+      growthFilter.disabled = true;
+    }
+  } else {
+    if (title) title.textContent = '你的阅读节律';
+    if (subtitle) subtitle.textContent = '基于本地缓存的阅读记录，统计基于已读时间戳。';
+    scopeWrap?.classList.add('hidden');
+    preferenceCard?.classList.remove('hidden');
+    if (growthFilter) growthFilter.disabled = false;
+  }
+
+  if (allButton && !allButton.dataset.bound) {
+    allButton.dataset.bound = '1';
+    allButton.addEventListener('click', () => {
+      setReadingStatsScope(null);
+      renderReadingStats();
+    });
+  }
+}
 
 async function renderReadingStats() {
   let stats;
   try {
-    stats = await invoke('get_reading_stats');
+    stats = readingStatsScope
+      ? await invoke('get_source_reading_stats', {
+        sourceKind: readingStatsScope.kind,
+        sourceId: readingStatsScope.id,
+      })
+      : await invoke('get_reading_stats');
   } catch (e) {
-    console.error('get_reading_stats 失败:', e);
+    console.error('加载阅读统计失败:', e);
+    setGlobalStatus(`加载阅读统计失败：${e}`, 'error');
     return;
   }
 
+  syncReadingStatsScopeUi();
   cachedReadingStats = stats;
   heatmapDayCounts = new Map(stats.day_counts || []);
   fetchedDayCounts = new Map(stats.fetched_day_counts || []);
   readHourCounts = Array.isArray(stats.read_hour_counts) && stats.read_hour_counts.length === 24
     ? stats.read_hour_counts.slice()
     : new Array(24).fill(0);
+  readTagCounts = Array.isArray(stats.tag_read_counts) ? stats.tag_read_counts.slice() : [];
 
   setupStatsPeriodSwitch();
   setupHeatmapYearSelect();
@@ -13763,7 +14117,7 @@ async function renderReadingStats() {
 
   // Easter-egg copy refresh runs detached so a slow provider round trip never
   // blocks the stats render — local pool always paints first.
-  maybeRefreshFlavorPool();
+  if (!readingStatsScope) maybeRefreshFlavorPool();
 }
 
 function setupLiteratureGrowthFilter() {
@@ -13983,7 +14337,111 @@ function applyStatsPeriod() {
     renderHeatmapStrip(heatmapDayCounts, periodDays(statsPeriod));
   }
 
+  renderReadingRhythm();
+  renderReadingStructure();
   renderStatsFlavor(ps);
+}
+
+function readingCountsInCurrentPeriod() {
+  const days = periodDays(statsPeriod);
+  if (!days) return [...heatmapDayCounts.entries()];
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const start = new Date(today);
+  start.setDate(today.getDate() - days + 1);
+  const startKey = ymdLocal(start);
+  const todayKey = ymdLocal(today);
+  return [...heatmapDayCounts.entries()].filter(([key]) => key >= startKey && key <= todayKey);
+}
+
+function renderReadingRhythm() {
+  const weekdayChart = document.getElementById('reading-weekday-chart');
+  const hourChart = document.getElementById('reading-hour-chart');
+  if (!weekdayChart || !hourChart) return;
+
+  const weekdays = new Array(7).fill(0);
+  readingCountsInCurrentPeriod().forEach(([key, count]) => {
+    const date = new Date(`${key}T12:00:00`);
+    if (Number.isNaN(date.getTime())) return;
+    weekdays[(date.getDay() + 6) % 7] += Number(count || 0);
+  });
+  const weekdayMax = Math.max(1, ...weekdays);
+  const weekdayNames = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+  weekdayChart.innerHTML = weekdays.map((count, index) => `
+    <div class="reading-weekday-column" title="${weekdayNames[index]}：${count} 篇">
+      <strong>${count}</strong>
+      <span class="reading-weekday-track"><i style="height:${Math.max(count ? 8 : 2, Math.round(count / weekdayMax * 100))}%"></i></span>
+      <small>${weekdayNames[index]}</small>
+    </div>
+  `).join('');
+
+  const counts = readHourCounts.map(value => Number(value || 0));
+  const max = Math.max(1, ...counts);
+  const width = 520;
+  const height = 150;
+  const left = 18;
+  const right = width - 12;
+  const top = 14;
+  const bottom = height - 25;
+  const points = counts.map((count, hour) => {
+    const x = left + (right - left) * hour / 23;
+    const y = bottom - (bottom - top) * count / max;
+    return { count, hour, x, y };
+  });
+  hourChart.innerHTML = `
+    <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="0 点至 23 点阅读篇数分布">
+      <line class="reading-hour-axis" x1="${left}" y1="${bottom}" x2="${right}" y2="${bottom}"></line>
+      <polyline class="reading-hour-line" points="${points.map(point => `${point.x},${point.y}`).join(' ')}"></polyline>
+      ${points.map(point => `<circle class="reading-hour-point" cx="${point.x}" cy="${point.y}" r="${point.count ? 3.2 : 2}" data-hour="${point.hour}" data-count="${point.count}"><title>${point.hour} 点：${point.count} 篇</title></circle>`).join('')}
+      ${[0, 6, 12, 18, 23].map(hour => {
+        const point = points[hour];
+        return `<text class="reading-hour-label" x="${point.x}" y="${height - 5}" text-anchor="middle">${hour}</text>`;
+      }).join('')}
+    </svg>
+    <div class="reading-hour-caption">全部记录 · 横轴为 0–23 时 · 纵轴为已读篇数</div>
+  `;
+}
+
+function renderReadingStructure() {
+  const topicRing = document.getElementById('reading-topic-ring');
+  const topicLegend = document.getElementById('reading-topic-legend');
+  const progressRing = document.getElementById('reading-progress-ring');
+  const progressPercent = document.getElementById('reading-progress-percent');
+  const progressCount = document.getElementById('reading-progress-count');
+  if (!topicRing || !topicLegend || !progressRing || !progressPercent || !progressCount) return;
+
+  const colors = ['var(--accent)', '#4f9a78', '#66738f', '#d0a13a', '#4f86b9', '#b36a88'];
+  const ranked = readTagCounts
+    .map(([label, count]) => ({ label: String(label || '未标签'), count: Number(count || 0) }))
+    .filter(item => item.count > 0)
+    .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label, 'zh-CN'));
+  const topics = ranked.slice(0, 5).map((topic, index) => ({ ...topic, color: colors[index] }));
+  const remaining = ranked.slice(5).reduce((sum, topic) => sum + topic.count, 0);
+  if (remaining) topics.push({ label: '其他', count: remaining, color: colors[5] });
+  const total = topics.reduce((sum, topic) => sum + topic.count, 0);
+  let cursor = 0;
+  const segments = topics.map(topic => {
+    const start = cursor;
+    cursor += total ? topic.count / total * 360 : 0;
+    return `${topic.color} ${start}deg ${cursor}deg`;
+  });
+  topicRing.style.background = total
+    ? `conic-gradient(${segments.join(', ')})`
+    : 'var(--control-bg)';
+  topicRing.innerHTML = `<span><strong>${total}</strong><small>篇</small></span>`;
+  topicLegend.innerHTML = topics.length ? topics.map(topic => {
+    const percent = total ? Math.round(topic.count / total * 100) : 0;
+    return `<div title="${escapeHtml(topic.label)}：${topic.count} 篇"><i style="background:${topic.color}"></i><span>${escapeHtml(topic.label)}</span><strong>${percent}%</strong></div>`;
+  }).join('') : '<div class="reading-topic-empty">暂无已读标签</div>';
+
+  const libraryStats = computePeriodStats('all');
+  const fetched = Number(libraryStats.fetched || 0);
+  const read = Number(libraryStats.read || 0);
+  const percent = fetched ? Math.min(100, Math.round(read / fetched * 100)) : 0;
+  progressRing.style.background = `conic-gradient(var(--accent) ${percent * 3.6}deg, var(--control-bg) 0deg)`;
+  progressPercent.textContent = `${percent}%`;
+  progressCount.textContent = `${read.toLocaleString('zh-CN')} / ${fetched.toLocaleString('zh-CN')} 篇`;
+  progressRing.setAttribute('aria-label', `文库阅读进度 ${percent}%`);
 }
 
 function setupHeatmapYearSelect() {
@@ -15394,6 +15852,7 @@ window.addEventListener('DOMContentLoaded', () => {
   screeningWindowView = document.getElementById('screening-window-view');
   screeningWindowTitle = document.getElementById('screening-window-title');
   screeningWindowSubtitle = document.getElementById('screening-window-subtitle');
+  screeningWorkbookManagerEl = document.getElementById('screening-workbook-manager');
   btnScreeningWindowClose = document.getElementById('btn-screening-window-close');
   entryFilter     = document.getElementById('entry-filter');
   entrySortSelect = document.getElementById('entry-sort');
@@ -15435,7 +15894,8 @@ window.addEventListener('DOMContentLoaded', () => {
   pubmedProgressLabel = document.getElementById('pubmed-progress-label');
   btnRunPubmedSearch = document.getElementById('btn-run-pubmed-search');
   btnCancelPubmedRun = document.getElementById('btn-cancel-pubmed-run');
-  btnExportPubmed = document.getElementById('btn-export-pubmed');
+  btnPubmedDataTransfer = document.getElementById('btn-pubmed-data-transfer');
+  btnClearCurrentPubmedSearch = document.getElementById('btn-clear-current-pubmed-search');
   pubmedSnapshotSelect = document.getElementById('pubmed-snapshot-select');
   btnSavePubmedSnapshot = document.getElementById('btn-save-pubmed-snapshot');
   btnDeletePubmedSnapshot = document.getElementById('btn-delete-pubmed-snapshot');
@@ -15586,7 +16046,10 @@ window.addEventListener('DOMContentLoaded', () => {
 
   // Wire events
   btnSettings.addEventListener('click', () => {
-    if (!mainView.classList.contains('hidden')) showSettings('feeds');
+    if (!mainView.classList.contains('hidden')) {
+      setReadingStatsScope(null);
+      showSettings('feeds');
+    }
     else showMain();
   });
 
@@ -15870,7 +16333,7 @@ window.addEventListener('DOMContentLoaded', () => {
     toggleStar(currentEntry.id);
     const isStarred = starredIds().has(currentEntry.id);
     document.getElementById('btn-star').classList.toggle('active', isStarred);
-    renderEntryList(allEntries);
+    rerenderEntryListPreservingScroll();
     updateOverviewCounts();
   });
 
@@ -15926,7 +16389,6 @@ window.addEventListener('DOMContentLoaded', () => {
   });
 
   entrySortDirection?.addEventListener('click', () => {
-    if (entrySortField === 'default') return;
     clearEntrySelection({ render: false, syncPaperChat: false });
     entrySortDirectionMode = entrySortDirectionMode === 'asc' ? 'desc' : 'asc';
     syncEntrySortMode();
@@ -16291,8 +16753,11 @@ window.addEventListener('DOMContentLoaded', () => {
     invalidatePubmedPreview();
   });
   document.getElementById('pubmed-question')?.addEventListener('input', invalidatePubmedPreview);
+  btnPubmedDataTransfer?.addEventListener('click', event => {
+    showDataTransferMenu(event.currentTarget, event, { includeCurrentEntries: true });
+  });
   btnRunPubmedSearch?.addEventListener('click', runCurrentPubmedSearch);
-  btnExportPubmed?.addEventListener('click', () => exportCurrentPubmedEntries());
+  btnClearCurrentPubmedSearch?.addEventListener('click', clearCurrentPubmedSearchEntries);
   btnEntryBulkExport?.addEventListener('click', () => {
     exportCurrentPubmedEntries(entryBulkExportFormat?.value, btnEntryBulkExport);
   });
