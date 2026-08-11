@@ -587,20 +587,25 @@ pub struct PubmedExportMetric {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NatureDownloadItem {
+#[serde(rename_all = "camelCase")]
+pub struct OpenAccessPdfDownloadResult {
+    pub entry_id: i64,
     pub title: String,
-    pub doi: Option<String>,
-    pub pmid: Option<String>,
-    pub pmcid: Option<String>,
+    pub status: String,
+    pub source: Option<String>,
+    pub source_url: Option<String>,
+    pub file_path: Option<String>,
+    pub sha256: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NatureDownloadReport {
+#[serde(rename_all = "camelCase")]
+pub struct OpenAccessPdfDownloadReport {
     pub total: usize,
     pub downloaded: usize,
-    pub needs_user_action: usize,
     pub output_dir: String,
-    pub results: Vec<serde_json::Value>,
+    pub results: Vec<OpenAccessPdfDownloadResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

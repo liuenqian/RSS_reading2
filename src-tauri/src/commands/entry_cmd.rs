@@ -1,14 +1,19 @@
 use crate::db::DbState;
 use crate::models::{
-    Entry, EntryIdentifiers, ReadingStats, WordFrequencyResult, WordFrequencyTranslation,
+    Entry, EntryIdentifiers, OpenAccessPdfDownloadReport, OpenAccessPdfDownloadResult,
+    ReadingStats, WordFrequencyResult, WordFrequencyTranslation,
 };
 use crate::services::{
     article_service, cost_service, entry_service, fulltext_service, settings_service,
     translate_service,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use tauri::{ipc::Response, State};
+use std::path::{Path, PathBuf};
+use tauri::{ipc::Response, AppHandle, State};
 use tracing::{info, warn};
+
+const MAX_OPEN_ACCESS_PDF_DOWNLOADS: usize = 20;
 
 #[tauri::command]
 pub fn list_entries(state: State<DbState>, feed_id: Option<i64>) -> Result<Vec<Entry>, String> {
@@ -508,6 +513,266 @@ pub async fn fetch_entry_pdf(state: State<'_, DbState>, entry_id: i64) -> Result
 }
 
 #[tauri::command]
+pub fn get_entry_local_pdf_path(
+    state: State<'_, DbState>,
+    entry_id: i64,
+) -> Result<Option<String>, String> {
+    get_valid_entry_local_pdf_path(&state, entry_id)
+}
+
+#[tauri::command]
+pub fn open_entry_local_pdf(
+    app: AppHandle,
+    state: State<'_, DbState>,
+    entry_id: i64,
+) -> Result<(), String> {
+    let path = get_valid_entry_local_pdf_path(&state, entry_id)?
+        .ok_or_else(|| "尚未下载该文献的本地 PDF，或文件已被移动".to_string())?;
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_path(path, None::<&str>)
+        .map_err(|error| format!("无法用本地阅读器打开 PDF: {error}"))
+}
+
+fn get_valid_entry_local_pdf_path(
+    state: &State<'_, DbState>,
+    entry_id: i64,
+) -> Result<Option<String>, String> {
+    if entry_id <= 0 {
+        return Err("文献 ID 不正确".to_string());
+    }
+    let path = {
+        let conn = state.conn.lock().map_err(|error| error.to_string())?;
+        entry_service::get_pdf_local_path(&conn, entry_id)?
+    };
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if Path::new(&path).is_file() {
+        return Ok(Some(path));
+    }
+
+    let conn = state.conn.lock().map_err(|error| error.to_string())?;
+    entry_service::set_pdf_local_path(&conn, entry_id, None)?;
+    Ok(None)
+}
+
+#[tauri::command]
+pub async fn download_open_access_pdfs(
+    state: State<'_, DbState>,
+    entry_ids: Vec<i64>,
+    output_dir: String,
+) -> Result<OpenAccessPdfDownloadReport, String> {
+    let entry_ids = normalize_open_access_download_ids(entry_ids)?;
+    let output_dir = PathBuf::from(output_dir.trim());
+    if !output_dir.is_dir() {
+        return Err("PDF 保存文件夹不存在".to_string());
+    }
+
+    let mut results = Vec::with_capacity(entry_ids.len());
+    for entry_id in entry_ids {
+        results.push(download_open_access_pdf_for_entry(&state, entry_id, &output_dir).await);
+    }
+    let downloaded = results
+        .iter()
+        .filter(|result| result.status == "downloaded")
+        .count();
+    Ok(OpenAccessPdfDownloadReport {
+        total: results.len(),
+        downloaded,
+        output_dir: output_dir.to_string_lossy().to_string(),
+        results,
+    })
+}
+
+async fn download_open_access_pdf_for_entry(
+    state: &State<'_, DbState>,
+    entry_id: i64,
+    output_dir: &Path,
+) -> OpenAccessPdfDownloadResult {
+    let entry = {
+        let conn = match state.conn.lock() {
+            Ok(conn) => conn,
+            Err(error) => return open_access_download_failure(entry_id, "", error.to_string()),
+        };
+        conn.query_row(
+            "SELECT title, doi, pmid, pmcid, publication_date, published_at
+             FROM entries WHERE id = ?1",
+            [entry_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+    };
+    let (title, doi, pmid, pmcid, _publication_date, _published_at) = match entry {
+        Ok(entry) => entry,
+        Err(_) => return open_access_download_failure(entry_id, "", "文章不存在".to_string()),
+    };
+
+    let candidate = match fulltext_service::resolve_open_access_pdf(
+        &title,
+        doi.as_deref(),
+        pmid.as_deref(),
+        pmcid.as_deref(),
+    )
+    .await
+    {
+        Ok(Some(candidate)) => candidate,
+        Ok(None) => {
+            return open_access_download_failure(
+                entry_id,
+                &title,
+                "未找到可公开访问的 PDF".to_string(),
+            )
+        }
+        Err(error) => return open_access_download_failure(entry_id, &title, error),
+    };
+
+    let bytes = match fulltext_service::fetch_pdf_bytes(&candidate.url).await {
+        Ok(bytes) => bytes,
+        Err(error) => return open_access_download_failure(entry_id, &title, error),
+    };
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let file_path = match write_open_access_pdf(output_dir, &title, entry_id, &bytes) {
+        Ok(path) => path,
+        Err(error) => return open_access_download_failure(entry_id, &title, error),
+    };
+    let text = match pdf_extract::extract_text_from_mem(&bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            warn!(%error, entry_id, "PDF 文字提取失败，仍保留已验证的开放 PDF");
+            String::new()
+        }
+    };
+    let saved_path = file_path.to_string_lossy().to_string();
+    let index_result = {
+        let conn = match state.conn.lock() {
+            Ok(conn) => conn,
+            Err(error) => {
+                let _ = std::fs::remove_file(&file_path);
+                return open_access_download_failure(entry_id, &title, error.to_string());
+            }
+        };
+        entry_service::upsert_pdf_fulltext(&conn, entry_id, &candidate.url, &text)
+            .and_then(|_| entry_service::set_pdf_local_path(&conn, entry_id, Some(&saved_path)))
+    };
+    if let Err(error) = index_result {
+        let _ = std::fs::remove_file(&file_path);
+        return open_access_download_failure(entry_id, &title, error);
+    }
+
+    OpenAccessPdfDownloadResult {
+        entry_id,
+        title,
+        status: "downloaded".to_string(),
+        source: Some(candidate.source),
+        source_url: Some(candidate.url),
+        file_path: Some(saved_path),
+        sha256: Some(sha256),
+        error: None,
+    }
+}
+
+fn normalize_open_access_download_ids(entry_ids: Vec<i64>) -> Result<Vec<i64>, String> {
+    let mut seen = HashSet::new();
+    let ids = entry_ids
+        .into_iter()
+        .filter(|entry_id| *entry_id > 0 && seen.insert(*entry_id))
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Err("请至少选择 1 篇文献".to_string());
+    }
+    if ids.len() > MAX_OPEN_ACCESS_PDF_DOWNLOADS {
+        return Err(format!(
+            "合法开放获取 PDF 下载单次最多支持 {} 篇文献",
+            MAX_OPEN_ACCESS_PDF_DOWNLOADS
+        ));
+    }
+    Ok(ids)
+}
+
+fn write_open_access_pdf(
+    output_dir: &Path,
+    title: &str,
+    entry_id: i64,
+    bytes: &[u8],
+) -> Result<PathBuf, String> {
+    let stem = safe_open_access_pdf_stem(title, entry_id);
+    let path = unique_open_access_pdf_path(output_dir, &stem)?;
+    let temporary = path.with_extension("pdf.part");
+    std::fs::write(&temporary, bytes).map_err(|error| format!("写入 PDF 临时文件失败: {error}"))?;
+    std::fs::rename(&temporary, &path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("保存 PDF 失败: {error}")
+    })?;
+    Ok(path)
+}
+
+fn safe_open_access_pdf_stem(title: &str, entry_id: i64) -> String {
+    let value = title
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+            {
+                '-'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let value = value.trim().trim_matches('.').trim();
+    let prefix = if value.is_empty() { "article" } else { value };
+    format!(
+        "{}-{}",
+        prefix.chars().take(100).collect::<String>(),
+        entry_id
+    )
+}
+
+fn unique_open_access_pdf_path(output_dir: &Path, stem: &str) -> Result<PathBuf, String> {
+    for suffix in 0..1000 {
+        let name = if suffix == 0 {
+            format!("{stem}.pdf")
+        } else {
+            format!("{stem}-{suffix}.pdf")
+        };
+        let path = output_dir.join(name);
+        if !path.exists() {
+            return Ok(path);
+        }
+    }
+    Err("同名 PDF 文件过多，无法创建新文件".to_string())
+}
+
+fn open_access_download_failure(
+    entry_id: i64,
+    title: &str,
+    error: String,
+) -> OpenAccessPdfDownloadResult {
+    OpenAccessPdfDownloadResult {
+        entry_id,
+        title: title.to_string(),
+        status: "unavailable".to_string(),
+        source: None,
+        source_url: None,
+        file_path: None,
+        sha256: None,
+        error: Some(error),
+    }
+}
+
+#[tauri::command]
 pub async fn ensure_free_fulltext_status(
     state: State<'_, DbState>,
     entry_id: i64,
@@ -575,4 +840,25 @@ pub async fn ensure_free_fulltext_status(
     .map_err(|e| format!("保存免费全文状态失败: {}", e))?;
 
     Ok(has_free_fulltext)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_access_download_ids_are_positive_unique_and_bounded() {
+        assert_eq!(
+            normalize_open_access_download_ids(vec![3, 3, -1, 8]).unwrap(),
+            vec![3, 8]
+        );
+        assert!(normalize_open_access_download_ids(Vec::new()).is_err());
+        assert!(normalize_open_access_download_ids((1..=21).collect()).is_err());
+    }
+
+    #[test]
+    fn open_access_pdf_filename_is_safe_and_keeps_entry_id() {
+        assert_eq!(safe_open_access_pdf_stem("A/B: test", 42), "A-B- test-42");
+        assert_eq!(safe_open_access_pdf_stem("...", 7), "article-7");
+    }
 }

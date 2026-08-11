@@ -12,6 +12,7 @@ const LEGACY_APP_DIRS: &[&str] = &["io.github.itsdrchen.cento"];
 
 pub struct DbState {
     pub conn: Mutex<Connection>,
+    pub db_path: PathBuf,
     /// Set to true while `briefing_service::generate_briefing` is in flight.
     /// Prevents the user from kicking off a second briefing (by clicking the
     /// button again while the first request is still pending against the slow
@@ -131,6 +132,7 @@ fn schema_sql() -> &'static str {
         entry_id    INTEGER PRIMARY KEY,
         content     TEXT NOT NULL,
         source_url  TEXT,
+        local_path  TEXT,
         indexed_at  TEXT NOT NULL DEFAULT (datetime('now')),
         FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
     );
@@ -355,6 +357,7 @@ pub fn initialize(app_data_dir: PathBuf) -> Result<DbState, String> {
     ensure_column(&conn, "entries", "publication_date_raw", "TEXT")?;
     ensure_column(&conn, "entries", "publication_date_precision", "TEXT")?;
     ensure_column(&conn, "entries", "publication_sort_key", "INTEGER")?;
+    ensure_column(&conn, "entry_pdf_fulltexts", "local_path", "TEXT")?;
     ensure_column(
         &conn,
         "feeds",
@@ -381,6 +384,7 @@ pub fn initialize(app_data_dir: PathBuf) -> Result<DbState, String> {
 
     Ok(DbState {
         conn: Mutex::new(conn),
+        db_path,
         briefing_in_flight: AtomicBool::new(false),
         pubmed_run_cancellations: Mutex::new(HashMap::new()),
     })

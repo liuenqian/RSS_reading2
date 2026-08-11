@@ -1,8 +1,8 @@
 pub mod briefing_cmd;
+pub mod data_transfer_cmd;
 pub mod entry_cmd;
 pub mod feed_cmd;
 pub mod fetch_cmd;
-pub mod nature_download_cmd;
 pub mod opml_cmd;
 pub mod paper_chat_cmd;
 pub mod paper_graph_cmd;

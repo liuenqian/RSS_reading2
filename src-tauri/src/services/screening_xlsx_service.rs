@@ -667,8 +667,14 @@ mod tests {
         assert_eq!(value_string(&header[4]).as_deref(), Some("英文摘要"));
         assert_eq!(value_string(&header[11]).as_deref(), Some("PMCID"));
         assert_eq!(value_string(&header[15]).as_deref(), Some("IF"));
-        assert_eq!(value_string(&header[23]).as_deref(), Some("阅读笔记（只读）"));
-        assert_eq!(value_string(&header[26]).as_deref(), Some("_cento_entry_id"));
+        assert_eq!(
+            value_string(&header[23]).as_deref(),
+            Some("阅读笔记（只读）")
+        );
+        assert_eq!(
+            value_string(&header[26]).as_deref(),
+            Some("_cento_entry_id")
+        );
         assert_eq!(value_string(&header[29]).as_deref(), Some("_cento_format"));
         assert_eq!(
             value_string(&header[30]).as_deref(),
@@ -697,7 +703,10 @@ mod tests {
         assert_eq!(range.height(), 1);
         let header = range.rows().next().unwrap();
         assert_eq!(value_string(&header[0]).as_deref(), Some("#"));
-        assert_eq!(value_string(&header[26]).as_deref(), Some("_cento_entry_id"));
+        assert_eq!(
+            value_string(&header[26]).as_deref(),
+            Some("_cento_entry_id")
+        );
         assert_eq!(value_string(&header[29]).as_deref(), Some("_cento_format"));
     }
 }

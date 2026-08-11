@@ -76,8 +76,7 @@ pub fn list_table_preferences(conn: &Connection) -> Result<Vec<ScreeningTablePre
             })
         })
         .map_err(|error| format!("读取初筛表格配置列表失败: {error}"))?;
-    rows
-        .collect::<Result<Vec<_>, _>>()
+    rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("读取初筛表格配置列表失败: {error}"))
 }
 
@@ -458,6 +457,12 @@ mod tests {
         save_table_preferences(&conn, "feed", 7, 2, r#"{"columns":["title"]}"#).unwrap();
         let all = list_table_preferences(&conn).unwrap();
         assert_eq!(all.len(), 2);
-        assert_eq!(all.iter().find(|item| item.scope_kind == "feed").unwrap().schema_version, 2);
+        assert_eq!(
+            all.iter()
+                .find(|item| item.scope_kind == "feed")
+                .unwrap()
+                .schema_version,
+            2
+        );
     }
 }

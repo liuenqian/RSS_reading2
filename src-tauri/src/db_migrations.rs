@@ -239,6 +239,7 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
                 entry_id    INTEGER PRIMARY KEY,
                 content     TEXT NOT NULL,
                 source_url  TEXT,
+                local_path  TEXT,
                 indexed_at  TEXT NOT NULL DEFAULT (datetime('now')),
                 FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
              );
@@ -602,6 +603,7 @@ fn create_pubmed_tables(conn: &Connection) -> Result<(), String> {
             entry_id    INTEGER PRIMARY KEY,
             content     TEXT NOT NULL,
             source_url  TEXT,
+            local_path  TEXT,
             indexed_at  TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
         );

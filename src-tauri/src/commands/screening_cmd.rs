@@ -232,8 +232,7 @@ pub fn ensure_pubmed_screening_workbooks(
         .app_data_dir()
         .map_err(|error| format!("无法获取初筛工作簿目录: {error}"))?
         .join("screening-workbooks");
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("无法创建初筛工作簿目录: {error}"))?;
+    fs::create_dir_all(&directory).map_err(|error| format!("无法创建初筛工作簿目录: {error}"))?;
     let conn = state.conn.lock().map_err(|error| error.to_string())?;
     let searches = pubmed_search_service::list_searches(&conn)?;
     let sorts = vec![ScreeningSort {

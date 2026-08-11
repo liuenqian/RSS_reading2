@@ -66,3 +66,10 @@ test('wires source links into both context menus', () => {
   assert.match(source, /buildMedreadingSearchUrl\(search\.query\)/);
   assert.match(source, /openUrl\(sourceLink\.url\)/);
 });
+
+test('article detail prefers official DOI and PubMed access routes', () => {
+  assert.match(source, /function officialArticleAccess\(entry\)/);
+  assert.match(source, /https:\/\/doi\.org\/\$\{encodeURIComponent\(doi\)\}/);
+  assert.match(source, /https:\/\/pubmed\.ncbi\.nlm\.nih\.gov\/\$\{encodeURIComponent\(pmid\)\}\//);
+  assert.match(source, /syncDetailOfficialAccess\(entry\)/);
+});

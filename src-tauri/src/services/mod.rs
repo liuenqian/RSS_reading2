@@ -1,6 +1,7 @@
 pub mod article_service;
 pub mod briefing_service;
 pub mod cost_service;
+pub mod data_transfer_service;
 pub mod entry_identity_service;
 pub mod entry_service;
 pub mod feed_service;
@@ -8,7 +9,6 @@ pub mod fetch_service;
 pub mod fulltext_service;
 pub mod google_translate_xlsx_service;
 pub mod journal_metrics_service;
-pub mod nature_download_service;
 pub mod notify;
 pub mod opml_service;
 pub mod paper_chat_service;

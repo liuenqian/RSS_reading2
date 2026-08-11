@@ -10,48 +10,55 @@ const OPENALEX_WORKS_URL: &str = "https://api.openalex.org/works";
 const SEMANTIC_SCHOLAR_PAPER_URL: &str = "https://api.semanticscholar.org/graph/v1/paper";
 const UNPAYWALL_API_URL: &str = "https://api.unpaywall.org/v2";
 const UNPAYWALL_CONTACT_EMAIL: &str = "itsdrchen@users.noreply.github.com";
-const SCI_HUB_BASE_URL: &str = "https://www.sci-hub.st/";
-const SCI_HUB_LAST_RELIABLE_PUBLICATION_YEAR: i32 = 2020;
 const MAX_INLINE_PDF_BYTES: usize = 40 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenAccessPdfCandidate {
+    pub source: String,
+    pub url: String,
+}
 
 pub async fn resolve_pdf_url(
     title: &str,
     doi: Option<&str>,
     pmid: Option<&str>,
     pmcid: Option<&str>,
-    publication_year: Option<i32>,
+    _publication_year: Option<i32>,
 ) -> Result<Option<String>, String> {
+    Ok(resolve_open_access_pdf(title, doi, pmid, pmcid)
+        .await?
+        .map(|candidate| candidate.url))
+}
+
+pub async fn resolve_open_access_pdf(
+    title: &str,
+    doi: Option<&str>,
+    pmid: Option<&str>,
+    pmcid: Option<&str>,
+) -> Result<Option<OpenAccessPdfCandidate>, String> {
     let client = Client::builder()
         .timeout(Duration::from_secs(12))
-        .user_agent("RSSReading/1.0 (academic PDF resolver)")
+        .user_agent("Cento/1.1 (open-access PDF resolver)")
         .build()
         .map_err(|e| format!("创建全文解析客户端失败: {}", e))?;
-
-    if let Some(doi) = doi.filter(|value| !value.trim().is_empty()) {
-        match resolve_unpaywall_pdf(&client, doi).await {
-            Ok(Some(url)) => {
-                if let Some(url) = verify_pdf_candidate(&client, url).await {
-                    return Ok(Some(url));
-                }
-            }
-            Ok(None) => {}
-            Err(error) => warn!(%error, "Unpaywall 全文解析失败"),
-        }
-    }
 
     if let Some(pmcid) = pmcid.filter(|value| !value.trim().is_empty()) {
         match resolve_ncbi_pmc_pdf(&client, pmcid).await {
             Ok(Some(url)) => {
-                if let Some(url) = verify_pdf_candidate(&client, url).await {
-                    return Ok(Some(url));
+                if let Some(candidate) =
+                    verified_open_access_candidate(&client, "PMC Open Access", url).await
+                {
+                    return Ok(Some(candidate));
                 }
             }
             Ok(None) => {}
             Err(error) => warn!(%error, "NCBI PMC PDF 解析失败"),
         }
         if let Some(url) = europe_pmc_pdf_url(pmcid) {
-            if let Some(url) = verify_pdf_candidate(&client, url).await {
-                return Ok(Some(url));
+            if let Some(candidate) =
+                verified_open_access_candidate(&client, "Europe PMC", url).await
+            {
+                return Ok(Some(candidate));
             }
         }
     }
@@ -59,8 +66,10 @@ pub async fn resolve_pdf_url(
     match resolve_europe_pmc_pmcid(&client, doi, pmid).await {
         Ok(Some(value)) => match resolve_ncbi_pmc_pdf(&client, &value).await {
             Ok(Some(url)) => {
-                if let Some(url) = verify_pdf_candidate(&client, url).await {
-                    return Ok(Some(url));
+                if let Some(candidate) =
+                    verified_open_access_candidate(&client, "PMC Open Access", url).await
+                {
+                    return Ok(Some(candidate));
                 }
             }
             Ok(None) => {}
@@ -70,10 +79,25 @@ pub async fn resolve_pdf_url(
         Err(error) => warn!(%error, "Europe PMC 全文解析失败"),
     }
 
+    if let Some(doi) = doi.filter(|value| !value.trim().is_empty()) {
+        match resolve_unpaywall_pdf(&client, doi).await {
+            Ok(Some(url)) => {
+                if let Some(candidate) =
+                    verified_open_access_candidate(&client, "Unpaywall", url).await
+                {
+                    return Ok(Some(candidate));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => warn!(%error, "Unpaywall 全文解析失败"),
+        }
+    }
+
     match resolve_openalex_pdf(&client, doi, title).await {
         Ok(Some(url)) => {
-            if let Some(url) = verify_pdf_candidate(&client, url).await {
-                return Ok(Some(url));
+            if let Some(candidate) = verified_open_access_candidate(&client, "OpenAlex", url).await
+            {
+                return Ok(Some(candidate));
             }
         }
         Ok(None) => {}
@@ -83,8 +107,11 @@ pub async fn resolve_pdf_url(
     if let Some(doi) = doi.filter(|value| !value.trim().is_empty()) {
         match resolve_semantic_scholar_pdf(&client, doi).await {
             Ok(Some(url)) => {
-                if let Some(url) = verify_pdf_candidate(&client, url).await {
-                    return Ok(Some(url));
+                if let Some(candidate) =
+                    verified_open_access_candidate(&client, "Semantic Scholar Open Access", url)
+                        .await
+                {
+                    return Ok(Some(candidate));
                 }
             }
             Ok(None) => {}
@@ -92,22 +119,20 @@ pub async fn resolve_pdf_url(
         }
     }
 
-    let allow_sci_hub = publication_year
-        .map(|year| year <= SCI_HUB_LAST_RELIABLE_PUBLICATION_YEAR)
-        .unwrap_or(true);
-    if allow_sci_hub {
-        match resolve_sci_hub_pdf(&client, doi, pmid).await {
-            Ok(Some(url)) => {
-                if let Some(url) = verify_pdf_candidate(&client, url).await {
-                    return Ok(Some(url));
-                }
-            }
-            Ok(None) => {}
-            Err(error) => warn!(%error, "Sci-Hub PDF 解析失败"),
-        }
-    }
-
     Ok(None)
+}
+
+async fn verified_open_access_candidate(
+    client: &Client,
+    source: &str,
+    url: String,
+) -> Option<OpenAccessPdfCandidate> {
+    verify_pdf_candidate(client, url)
+        .await
+        .map(|url| OpenAccessPdfCandidate {
+            source: source.to_string(),
+            url,
+        })
 }
 
 async fn resolve_ncbi_pmc_pdf(client: &Client, pmcid: &str) -> Result<Option<String>, String> {
@@ -419,81 +444,6 @@ async fn resolve_semantic_scholar_pdf(
         .and_then(valid_http_url))
 }
 
-async fn resolve_sci_hub_pdf(
-    client: &Client,
-    doi: Option<&str>,
-    pmid: Option<&str>,
-) -> Result<Option<String>, String> {
-    if let Some(pmid) = pmid.filter(|value| !value.trim().is_empty()) {
-        let response = client
-            .post(SCI_HUB_BASE_URL)
-            .json(&serde_json::json!({
-                "sci-hub-plugin-check": true,
-                "request": pmid.trim()
-            }))
-            .send()
-            .await
-            .map_err(|e| format!("Sci-Hub PMID 请求失败: {}", e))?;
-        if response.status().is_success() {
-            let body = response
-                .text()
-                .await
-                .map_err(|e| format!("读取 Sci-Hub PMID 响应失败: {}", e))?;
-            if let Some(url) = parse_sci_hub_pdf(&body, SCI_HUB_BASE_URL) {
-                return Ok(Some(url));
-            }
-        }
-    }
-
-    let Some(doi) = doi.filter(|value| !value.trim().is_empty()) else {
-        return Ok(None);
-    };
-    let page_url = format!("{}{}", SCI_HUB_BASE_URL, doi.trim());
-    let response = client
-        .get(page_url)
-        .send()
-        .await
-        .map_err(|e| format!("Sci-Hub DOI 请求失败: {}", e))?;
-    if !response.status().is_success() {
-        return Ok(None);
-    }
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("读取 Sci-Hub DOI 响应失败: {}", e))?;
-    Ok(parse_sci_hub_pdf(&body, SCI_HUB_BASE_URL))
-}
-
-fn parse_sci_hub_pdf(html: &str, base_url: &str) -> Option<String> {
-    let lower = html.to_ascii_lowercase();
-    let mut offset = 0;
-    while let Some(relative_start) = lower[offset..].find("<embed") {
-        let start = offset + relative_start;
-        let end = lower[start..].find('>').map(|index| start + index)?;
-        let tag = &html[start..=end];
-        let tag_lower = &lower[start..=end];
-        offset = end + 1;
-        if !tag_lower.contains("application/pdf") && !tag_lower.contains("id=\"pdf\"") {
-            continue;
-        }
-        let source_start = tag_lower.find("src=\"")? + "src=\"".len();
-        let source_end = tag_lower[source_start..].find('"')? + source_start;
-        let raw_url = tag[source_start..source_end].trim();
-        if raw_url.is_empty() {
-            continue;
-        }
-        let absolute = if raw_url.starts_with("//") {
-            format!("https:{}", raw_url)
-        } else {
-            Url::parse(base_url).ok()?.join(raw_url).ok()?.to_string()
-        };
-        let mut url = Url::parse(&absolute).ok()?;
-        url.set_fragment(None);
-        return valid_http_url(url.as_str());
-    }
-    None
-}
-
 async fn fetch_json(client: &Client, url: &str) -> Result<Option<Value>, String> {
     let response = client
         .get(url)
@@ -574,15 +524,6 @@ mod tests {
             Some("https://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_pdf/8e/71/paper.PMC5334499.pdf")
         );
         assert_eq!(parse_ncbi_pmc_pdf("<OA><records/></OA>").unwrap(), None);
-    }
-
-    #[test]
-    fn parses_sci_hub_embed_pdf() {
-        let html = r#"<embed type="application/pdf" src="//cdn.example.test/paper.pdf#view=FitH" id="pdf">"#;
-        assert_eq!(
-            parse_sci_hub_pdf(html, SCI_HUB_BASE_URL).as_deref(),
-            Some("https://cdn.example.test/paper.pdf")
-        );
     }
 
     #[test]

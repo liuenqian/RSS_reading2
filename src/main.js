@@ -1768,7 +1768,7 @@ let detailIdentifierStrip;
 let detailPublicationDate, detailDateSub;
 let detailSummaryContent, detailSummarySection, detailSummaryRetry;
 let detailSummaryView, detailPdfView, btnDetailViewSummary, btnDetailViewPdf;
-let btnPdfOpenExternal, btnPdfDownload;
+let btnPdfOpenLocal, btnPdfOpenExternal, btnPdfDownload;
 let detailReadingNotesContent;
 let manualReadingNoteInput, btnManualReadingNote;
 let detailPaperChatHint, detailPaperChatMessages, detailPaperChatScopes, paperChatInput, paperChatComposer;
@@ -1780,7 +1780,7 @@ let paperChatAttachmentsEl, paperChatAttachmentList, btnPaperChatAddFiles, btnPa
 let btnClearPaperChatAttachments;
 let readingProfileSortSelect, btnReadingProfilesSort;
 let detailBadgeRow, detailSourceBadge, btnOpenUrl, btnRetrySummary, btnPaperGraph;
-let btnDetailPdf, btnDetailSciHub;
+let btnDetailPdf;
 let detailTagList, detailTagInput, btnDetailAddTag;
 let detailPaperGraphSection, paperGraphStage, paperGraphNodeDetail, paperGraphCounts;
 let briefingDetailEmpty, briefingDetailContent;
@@ -1845,6 +1845,8 @@ const entryPdfLinkCheckInFlight = new Map();
 let detailPdfReader = null;
 let detailPdfUrl = '';
 let detailPdfRequestId = 0;
+let detailLocalPdfPath = '';
+let detailLocalPdfRequestId = 0;
 let wordFrequencyResult = null;
 let wordFrequencyView = 'cloud';
 let wordFrequencyLanguage = 'en';
@@ -1879,8 +1881,6 @@ const screeningTableSearchQueries = new Map();
 let screeningTableRequestId = 0;
 let screeningTableSearchTimer = null;
 
-const SCI_HUB_BASE_URL = 'https://www.sci-hub.st/';
-const SCI_HUB_LAST_RELIABLE_PUBLICATION_YEAR = 2020;
 const WORD_FREQUENCY_TRANSLATION_CACHE_KEY = 'word-frequency-translations-v1';
 const PMC_GALLERY_HISTORY_KEY = 'pmc-gallery-search-history-v1';
 const AUTHOR_IDENTITY_STORAGE_PREFIX = 'pubmed-author-identity-v1';
@@ -1984,7 +1984,7 @@ const ENTRY_METRIC_FILTER_OPTIONS = {
 };
 const PUBMED_SNAPSHOT_STORAGE_KEY = 'pubmed-filter-snapshots-v1';
 const PUBMED_EXPORT_FIELDS_STORAGE_KEY = 'pubmed-export-fields-v1';
-const NATURE_DOWNLOAD_PREFS_STORAGE_KEY = 'nature-download-prefs-v1';
+const OPEN_ACCESS_PDF_DOWNLOAD_PREFS_STORAGE_KEY = 'open-access-pdf-download-prefs-v1';
 const TITLE_DISPLAY_STORAGE_KEY = 'title-display-mode-v1';
 const TITLE_DISPLAY_MODES = new Set(['both', 'zh', 'en']);
 const PUBMED_EXPORT_FIELDS = [
@@ -3734,25 +3734,20 @@ function orderPubmedXlsxFields(fields) {
   ];
 }
 
-function loadNatureDownloadPrefs() {
+function loadOpenAccessPdfDownloadPrefs() {
   try {
-    const value = JSON.parse(localStorage.getItem(NATURE_DOWNLOAD_PREFS_STORAGE_KEY) || '{}');
+    const value = JSON.parse(localStorage.getItem(OPEN_ACCESS_PDF_DOWNLOAD_PREFS_STORAGE_KEY) || '{}');
     return {
-      accessMode: value.accessMode === 'institution' ? 'institution' : 'oa',
       pathMode: value.pathMode === 'fixed' ? 'fixed' : 'ask',
       fixedFolder: typeof value.fixedFolder === 'string' ? value.fixedFolder : '',
     };
   } catch {
-    return { accessMode: 'oa', pathMode: 'ask', fixedFolder: '' };
+    return { pathMode: 'ask', fixedFolder: '' };
   }
 }
 
-function formatNatureDownloadError(error) {
+function formatOpenAccessPdfDownloadError(error) {
   const raw = String(error || '').trim();
-  if (/CDP proxy not reachable|healthCheck|127\.0\.0\.1:3456\/targets/i.test(raw)) {
-    return '未连接到 Chrome 下载会话，请启用 Chrome 远程调试后重试';
-  }
-
   const summary = raw
     .split(/\r?\n/, 1)[0]
     .replace(/\s+at\s+(?:async\s+)?[\s\S]*$/, '')
@@ -3761,9 +3756,9 @@ function formatNatureDownloadError(error) {
   return summary.length > 80 ? `${summary.slice(0, 80)}…` : summary;
 }
 
-function chooseNatureDownloadOptions(count) {
+function chooseOpenAccessPdfDownloadOptions(count) {
   return new Promise(resolve => {
-    const prefs = loadNatureDownloadPrefs();
+    const prefs = loadOpenAccessPdfDownloadPrefs();
     let fixedFolder = prefs.fixedFolder;
     const overlay = document.createElement('div');
     overlay.className = 'pubmed-modal';
@@ -3771,17 +3766,10 @@ function chooseNatureDownloadOptions(count) {
       <div class="pubmed-modal-backdrop"></div>
       <section class="pubmed-modal-panel nature-download-panel">
         <header class="pubmed-modal-header">
-          <div><h2>智能下载 PDF</h2><p>多源解析 · ${count} 篇文献</p></div>
+          <div><h2>合法开放获取 PDF 下载</h2><p>PMC、Europe PMC、Unpaywall 等公开来源 · ${count} 篇文献</p></div>
           <button class="pubmed-modal-close" data-close type="button" aria-label="关闭">×</button>
         </header>
         <div class="pubmed-modal-body">
-          <label class="pubmed-field">
-            <span>全文访问方式</span>
-            <select class="settings-select" data-access>
-              <option value="oa" ${prefs.accessMode === 'oa' ? 'selected' : ''}>仅使用开放获取来源</option>
-              <option value="institution" ${prefs.accessMode === 'institution' ? 'selected' : ''}>使用已配置的机构授权</option>
-            </select>
-          </label>
           <label class="pubmed-field">
             <span>保存位置</span>
             <select class="settings-select" data-path-mode>
@@ -3793,7 +3781,7 @@ function chooseNatureDownloadOptions(count) {
             <div class="nature-download-folder" data-folder>${escapeHtml(fixedFolder || '尚未选择文件夹')}</div>
             <button class="btn btn-secondary btn-sm" data-choose-folder type="button">选择文件夹</button>
           </div>
-          <p class="nature-download-note">机构授权模式只使用你本人已登录并获授权的浏览器会话；不会读取或保存账号、密码和验证码。</p>
+          <p class="nature-download-note">仅下载公开可访问的 PDF。下载后会校验 PDF 内容并记录来源与 SHA-256；未找到开放全文时不会尝试受限来源。</p>
           <p class="pubmed-export-field-status" data-status></p>
         </div>
         <footer class="pubmed-modal-footer">
@@ -3821,7 +3809,6 @@ function chooseNatureDownloadOptions(count) {
     });
     overlay.querySelector('[data-confirm]').addEventListener('click', () => {
       const value = {
-        accessMode: overlay.querySelector('[data-access]').value,
         pathMode: pathMode.value,
         fixedFolder,
       };
@@ -3829,20 +3816,20 @@ function chooseNatureDownloadOptions(count) {
         overlay.querySelector('[data-status]').textContent = '请先选择固定下载文件夹';
         return;
       }
-      localStorage.setItem(NATURE_DOWNLOAD_PREFS_STORAGE_KEY, JSON.stringify(value));
+      localStorage.setItem(OPEN_ACCESS_PDF_DOWNLOAD_PREFS_STORAGE_KEY, JSON.stringify(value));
       cleanup(value);
     });
     document.body.appendChild(overlay);
   });
 }
 
-async function downloadEntriesWithNature(entries) {
+async function downloadOpenAccessPdfs(entries) {
   if (!entries.length) return;
   if (entries.length > 20) {
-    setGlobalStatus('智能 PDF 下载单次最多支持 20 篇，请缩小勾选范围', 'error');
+    setGlobalStatus('合法开放获取 PDF 下载单次最多支持 20 篇，请缩小勾选范围', 'error');
     return;
   }
-  const options = await chooseNatureDownloadOptions(entries.length);
+  const options = await chooseOpenAccessPdfDownloadOptions(entries.length);
   if (!options) return;
   let outputDir = options.fixedFolder;
   if (options.pathMode === 'ask') {
@@ -3850,23 +3837,29 @@ async function downloadEntriesWithNature(entries) {
     if (!path) return;
     outputDir = Array.isArray(path) ? path[0] : path;
   }
-  setGlobalStatus(`正在下载 ${entries.length} 篇 PDF…`, 'progress');
+  setGlobalStatus(`正在从开放获取来源下载 ${entries.length} 篇 PDF…`, 'progress');
   try {
-    const report = await invoke('download_papers_with_nature', {
-      items: entries.map(entry => ({
-        title: entry.title || entry.title_translated || '',
-        doi: entry.doi || null,
-        pmid: entry.pmid || null,
-        pmcid: entry.pmcid || null,
-      })),
+    const report = await invoke('download_open_access_pdfs', {
+      entryIds: entries.map(entry => entry.id),
       outputDir,
-      openAccess: options.accessMode === 'oa',
     });
-    const handoff = report.needs_user_action ? `，${report.needs_user_action} 篇需要在浏览器完成登录或验证` : '';
-    setGlobalStatus(`PDF 下载完成：成功 ${report.downloaded}/${report.total}${handoff}`, report.needs_user_action ? 'error' : 'success');
+    const unavailable = report.total - report.downloaded;
+    const detail = report.results
+      .filter(result => result.status !== 'downloaded')
+      .slice(0, 2)
+      .map(result => result.error)
+      .filter(Boolean)
+      .join('；');
+    setGlobalStatus(
+      `开放获取 PDF 下载完成：成功 ${report.downloaded}/${report.total}${unavailable ? `，未获取 ${unavailable} 篇` : ''}${detail ? `。${detail}` : ''}`,
+      unavailable ? 'error' : 'success',
+    );
+    if (currentEntry && report.results?.some(result => result.entry_id === currentEntry.id && result.status === 'downloaded')) {
+      syncDetailLocalPdfAction(currentEntry);
+    }
   } catch (e) {
-    console.error('PDF 下载失败:', e);
-    setGlobalStatus(`PDF 下载失败：${formatNatureDownloadError(e)}`, 'error');
+    console.error('开放获取 PDF 下载失败:', e);
+    setGlobalStatus(`PDF 下载失败：${formatOpenAccessPdfDownloadError(e)}`, 'error');
   }
 }
 
@@ -4381,6 +4374,69 @@ async function importOpml() {
   }
 }
 
+function transferDatabaseDefaultName() {
+  const day = new Date().toISOString().slice(0, 10);
+  return `RSS-Reading-library-${day}.cento-db`;
+}
+
+async function exportTransferDatabase() {
+  const dialog = window.__TAURI__?.dialog;
+  if (!dialog) return setGlobalStatus('对话框插件不可用', 'error');
+  const path = await dialog.save({
+    title: '导出迁移数据库',
+    defaultPath: transferDatabaseDefaultName(),
+    filters: [{ name: 'RSS Reading 迁移数据库', extensions: ['cento-db'] }],
+  });
+  if (!path) return;
+  setGlobalStatus('正在生成脱敏迁移数据库…', 'progress');
+  try {
+    const report = await invoke('export_transfer_database', { path });
+    setGlobalStatus(
+      `迁移数据库已导出：${report.entryCount.toLocaleString('zh-CN')} 篇文献，不含 API Key 和本机 PDF 缓存`,
+      'success',
+    );
+  } catch (error) {
+    setGlobalStatus(`导出迁移数据库失败：${error}`, 'error');
+  }
+}
+
+async function importTransferDatabase() {
+  const dialog = window.__TAURI__?.dialog;
+  if (!dialog) return setGlobalStatus('对话框插件不可用', 'error');
+  const selected = await dialog.open({
+    title: '导入迁移数据库',
+    multiple: false,
+    directory: false,
+    filters: [{ name: 'RSS Reading 迁移数据库', extensions: ['cento-db'] }],
+  });
+  if (!selected) return;
+  const path = Array.isArray(selected) ? selected[0] : selected;
+  try {
+    setGlobalStatus('正在检查迁移数据库…', 'progress');
+    const preview = await invoke('preview_transfer_database', { path });
+    const confirmed = await confirmDialog(
+      `<strong>导入“${escapeHtml(preview.fileName)}”？</strong><br>` +
+      `将用其中 ${preview.entryCount.toLocaleString('zh-CN')} 篇文献、` +
+      `${preview.feedCount.toLocaleString('zh-CN')} 个订阅源覆盖本机研究数据。<br>` +
+      `本机 AI 设置和 Token 用量会保留，导入前数据库会自动备份。`,
+      { okLabel: '备份并导入', cancelLabel: '取消', danger: true },
+    );
+    if (!confirmed) {
+      setGlobalStatus('已取消数据库导入', '');
+      return;
+    }
+    setGlobalStatus('正在备份本机数据库并导入…', 'progress');
+    const report = await invoke('import_transfer_database', { path });
+    setGlobalStatus(
+      `数据库导入完成：${report.entryCount.toLocaleString('zh-CN')} 篇文献，正在重新载入…`,
+      'success',
+    );
+    setTimeout(() => window.location.reload(), 700);
+  } catch (error) {
+    setGlobalStatus(`导入迁移数据库失败：${error}`, 'error');
+  }
+}
+
 function showDataTransferMenu(button, event, { includeCurrentEntries = false } = {}) {
   event?.stopPropagation();
   hideContextMenu();
@@ -4392,9 +4448,17 @@ function showDataTransferMenu(button, event, { includeCurrentEntries = false } =
       <span class="context-item-meta">.nbib / .txt / .csv</span>
     </div>
     <div class="context-item" data-action="import-opml">导入 OPML 订阅</div>
+    <div class="context-item context-item-with-meta" data-action="import-database">
+      <span class="context-item-label">导入迁移数据库</span>
+      <span class="context-item-meta">覆盖恢复</span>
+    </div>
     <div class="context-separator"></div>
     ${includeCurrentEntries ? '<div class="context-item" data-action="export-current">导出当前结果</div>' : ''}
     <div class="context-item" data-action="export-opml">导出 OPML 订阅</div>
+    <div class="context-item context-item-with-meta" data-action="export-database">
+      <span class="context-item-label">导出迁移数据库</span>
+      <span class="context-item-meta">可分享 · 已脱敏</span>
+    </div>
   `;
   menu.addEventListener('click', async clickEvent => {
     const action = clickEvent.target.closest('[data-action]')?.dataset.action;
@@ -4402,8 +4466,10 @@ function showDataTransferMenu(button, event, { includeCurrentEntries = false } =
     hideContextMenu();
     if (action === 'import-pubmed') await importPubmedFile();
     else if (action === 'import-opml') await importOpml();
+    else if (action === 'import-database') await importTransferDatabase();
     else if (action === 'export-current') await exportCurrentPubmedEntries(null, button);
     else if (action === 'export-opml') await exportOpml();
+    else if (action === 'export-database') await exportTransferDatabase();
   });
   const rect = button.getBoundingClientRect();
   mountContextMenu(menu, rect.left, rect.bottom + 4);
@@ -7466,7 +7532,7 @@ function showEntryContextMenu(x, y, entry) {
     if (!action) return;
     hideContextMenu();
     if (action === 'download-pdf') {
-      await downloadEntriesWithNature(targetEntries);
+      await downloadOpenAccessPdfs(targetEntries);
     } else if (action === 'translate-title') {
       await translateEntries(targetEntries, 'title');
     } else if (action === 'translate-summary') {
@@ -10806,6 +10872,8 @@ function showDetail(entry) {
     resetPaperGraph();
     detailPdfRequestId += 1;
     detailPdfUrl = '';
+    detailLocalPdfRequestId += 1;
+    detailLocalPdfPath = '';
     setDetailViewMode('summary');
   }
   paperChatScope = 'single';
@@ -10873,30 +10941,47 @@ function showDetail(entry) {
   loadPaperChatMessages();
   if (!entry.summary && !entry.summary_translated) loadAbstract(entry);
 
-  btnOpenUrl.onclick = () => openUrl(entry.link);
+  syncDetailOfficialAccess(entry);
   syncDetailExternalActions(entry);
+}
+
+function officialArticleAccess(entry) {
+  const doi = (entry?.doi || '').trim();
+  if (doi) {
+    return {
+      url: `https://doi.org/${encodeURIComponent(doi)}`,
+      label: '在浏览器打开 DOI / 出版社全文页',
+    };
+  }
+  const pmid = (entry?.pmid || '').trim();
+  if (pmid) {
+    return {
+      url: `https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(pmid)}/`,
+      label: '在浏览器打开 PubMed',
+    };
+  }
+  return {
+    url: entry?.link || '',
+    label: '在浏览器打开文章来源',
+  };
+}
+
+function syncDetailOfficialAccess(entry) {
+  if (!btnOpenUrl) return;
+  const access = officialArticleAccess(entry);
+  btnOpenUrl.disabled = !access.url;
+  btnOpenUrl.title = access.label;
+  btnOpenUrl.setAttribute('aria-label', access.label);
+  btnOpenUrl.onclick = access.url ? () => openUrl(access.url) : null;
 }
 
 function syncDetailExternalActions(entry) {
   syncDetailPdfAction(entry);
-
-  const sciHubUrl = buildSciHubUrl(entry.doi);
-  const publicationYear = entryPublicationYear(entry);
-  const isTooRecent = publicationYear !== null
-    && publicationYear > SCI_HUB_LAST_RELIABLE_PUBLICATION_YEAR;
-  btnDetailSciHub.disabled = !sciHubUrl || isTooRecent;
-  if (!sciHubUrl) {
-    btnDetailSciHub.title = '缺少 DOI，无法打开 Sci-Hub';
-  } else if (isTooRecent) {
-    btnDetailSciHub.title = `${publicationYear} 年发表；Sci-Hub 自 2021 年起通常不再收录新论文`;
-  } else {
-    btnDetailSciHub.title = '通过 Sci-Hub 查找全文';
-  }
-  btnDetailSciHub.onclick = btnDetailSciHub.disabled ? null : () => openUrl(sciHubUrl);
+  syncDetailLocalPdfAction(entry);
 }
 
 function setDetailViewMode(view) {
-  const showPdf = view === 'pdf' && !!detailPdfUrl;
+  const showPdf = view === 'pdf' && !!(detailPdfUrl || detailLocalPdfPath);
   detailSummaryView?.classList.toggle('hidden', showPdf);
   detailPdfView?.classList.toggle('hidden', !showPdf);
   btnDetailViewSummary?.classList.toggle('active', !showPdf);
@@ -10951,7 +11036,11 @@ async function ensureDetailPdfReader() {
 }
 
 async function openDetailPdfView() {
-  if (!currentEntry || !detailPdfUrl) return;
+  if (!currentEntry) return;
+  if (!detailPdfUrl) {
+    if (detailLocalPdfPath) setDetailViewMode('pdf');
+    return;
+  }
   const entry = currentEntry;
   const requestId = ++detailPdfRequestId;
   setDetailViewMode('pdf');
@@ -11006,10 +11095,60 @@ function applyDetailPdfUrl(url) {
   btnDetailPdf.title = url ? '在详情中阅读 PDF' : '未找到可直接打开的全文 PDF';
   btnDetailPdf.onclick = url ? openDetailPdfView : null;
   if (btnDetailViewPdf) {
-    btnDetailViewPdf.disabled = !url;
-    btnDetailViewPdf.title = url ? '在详情中阅读 PDF' : '未找到可直接打开的全文 PDF';
+    btnDetailViewPdf.disabled = !(url || detailLocalPdfPath);
+    btnDetailViewPdf.title = url
+      ? '在详情中阅读 PDF'
+      : detailLocalPdfPath
+        ? '已下载本地 PDF'
+        : '未找到可直接打开的全文 PDF';
   }
-  if (!url) setDetailViewMode('summary');
+  if (!url && !detailLocalPdfPath) setDetailViewMode('summary');
+}
+
+function syncDetailLocalPdfAction(entry) {
+  const requestId = ++detailLocalPdfRequestId;
+  detailLocalPdfPath = '';
+  btnPdfOpenLocal.disabled = true;
+  btnPdfOpenLocal.setAttribute('aria-busy', 'true');
+  btnPdfOpenLocal.title = '正在检查已下载的本地 PDF…';
+  invoke('get_entry_local_pdf_path', { entryId: entry.id })
+    .then(path => {
+      if (requestId !== detailLocalPdfRequestId || currentEntry?.id !== entry.id) return;
+      detailLocalPdfPath = path || '';
+      btnPdfOpenLocal.disabled = !detailLocalPdfPath;
+      btnPdfOpenLocal.title = detailLocalPdfPath
+        ? '用本地默认 PDF 阅读器打开'
+        : '尚未下载本地 PDF';
+      if (btnDetailViewPdf) {
+        btnDetailViewPdf.disabled = !(detailPdfUrl || detailLocalPdfPath);
+        btnDetailViewPdf.title = detailPdfUrl
+          ? '在详情中阅读 PDF'
+          : detailLocalPdfPath
+            ? '已下载本地 PDF'
+            : '未找到可直接打开的全文 PDF';
+      }
+    })
+    .catch(error => {
+      console.error('检查本地 PDF 失败:', error);
+      if (requestId !== detailLocalPdfRequestId || currentEntry?.id !== entry.id) return;
+      btnPdfOpenLocal.title = '本地 PDF 检查失败，请重新打开文章后重试';
+    })
+    .finally(() => {
+      if (requestId === detailLocalPdfRequestId && currentEntry?.id === entry.id) {
+        btnPdfOpenLocal.removeAttribute('aria-busy');
+      }
+    });
+}
+
+async function openDetailLocalPdf() {
+  if (!currentEntry || !detailLocalPdfPath) return;
+  try {
+    await invoke('open_entry_local_pdf', { entryId: currentEntry.id });
+  } catch (error) {
+    console.error('打开本地 PDF 失败:', error);
+    setGlobalStatus(`无法打开本地 PDF：${error}`, 'error');
+    syncDetailLocalPdfAction(currentEntry);
+  }
 }
 
 async function ensureEntryPdfLink(entry, identity) {
@@ -11038,24 +11177,6 @@ async function ensureEntryPdfLink(entry, identity) {
   try {
     await promise;
   } catch {}
-}
-
-function entryPublicationYear(entry) {
-  for (const value of [entry?.publication_date, entry?.publication_date_raw, entry?.published_at]) {
-    const match = String(value || '').match(/(?:19|20)\d{2}/);
-    if (match) return Number(match[0]);
-  }
-  return null;
-}
-
-function buildSciHubUrl(value) {
-  const doi = String(value || '')
-    .trim()
-    .replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, '')
-    .replace(/^doi:\s*/i, '');
-  if (!doi) return '';
-  const encodedDoi = doi.split('/').map(part => encodeURIComponent(part)).join('/');
-  return `${SCI_HUB_BASE_URL}${encodedDoi}`;
 }
 
 function resetPaperGraph() {
@@ -15947,6 +16068,7 @@ window.addEventListener('DOMContentLoaded', () => {
   detailPdfView = document.getElementById('detail-pdf-view');
   btnDetailViewSummary = document.getElementById('btn-detail-view-summary');
   btnDetailViewPdf = document.getElementById('btn-detail-view-pdf');
+  btnPdfOpenLocal = document.getElementById('btn-pdf-open-local');
   btnPdfOpenExternal = document.getElementById('btn-pdf-open-external');
   btnPdfDownload = document.getElementById('btn-pdf-download');
   detailReadingNotesContent = document.getElementById('detail-reading-notes-content');
@@ -15974,7 +16096,6 @@ window.addEventListener('DOMContentLoaded', () => {
   btnOpenUrl           = document.getElementById('btn-open-url');
   btnPaperGraph        = document.getElementById('btn-paper-graph');
   btnDetailPdf         = document.getElementById('btn-detail-pdf');
-  btnDetailSciHub      = document.getElementById('btn-detail-scihub');
   btnRetrySummary      = document.getElementById('btn-retry-summary');
   btnSendPaperChat     = document.getElementById('btn-send-paper-chat');
   btnClearPaperChat    = document.getElementById('btn-clear-paper-chat');
@@ -16340,11 +16461,12 @@ window.addEventListener('DOMContentLoaded', () => {
   // Abstract toggle
   btnDetailViewSummary?.addEventListener('click', () => setDetailViewMode('summary'));
   btnDetailViewPdf?.addEventListener('click', openDetailPdfView);
+  btnPdfOpenLocal?.addEventListener('click', openDetailLocalPdf);
   btnPdfOpenExternal?.addEventListener('click', () => {
     if (detailPdfUrl) openUrl(detailPdfUrl);
   });
   btnPdfDownload?.addEventListener('click', () => {
-    if (currentEntry) downloadEntriesWithNature([currentEntry]);
+    if (currentEntry) downloadOpenAccessPdfs([currentEntry]);
   });
 
   document.querySelectorAll('.abstract-toggle-btn').forEach(btn => {

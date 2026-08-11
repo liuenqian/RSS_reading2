@@ -5,7 +5,7 @@ mod models;
 mod services;
 
 use commands::{
-    briefing_cmd, entry_cmd, feed_cmd, fetch_cmd, nature_download_cmd, opml_cmd, paper_chat_cmd,
+    briefing_cmd, data_transfer_cmd, entry_cmd, feed_cmd, fetch_cmd, opml_cmd, paper_chat_cmd,
     paper_graph_cmd, pmc_gallery_cmd, pubmed_cmd, pubmed_conversion_cmd, pubmed_search_cmd,
     reading_cmd, sci_review_cmd, sci_skill_cmd, screening_cmd, settings_cmd, translate_cmd,
     tray_cmd, update_cmd,
@@ -104,6 +104,9 @@ pub fn run() {
             briefing_cmd::list_briefings,
             briefing_cmd::generate_briefing,
             briefing_cmd::delete_briefing,
+            data_transfer_cmd::export_transfer_database,
+            data_transfer_cmd::preview_transfer_database,
+            data_transfer_cmd::import_transfer_database,
             briefing_cmd::list_briefing_annotations,
             briefing_cmd::list_all_briefing_annotations,
             briefing_cmd::add_briefing_annotation,
@@ -114,6 +117,9 @@ pub fn run() {
             entry_cmd::fetch_affiliation,
             entry_cmd::fetch_entry_authors,
             entry_cmd::fetch_entry_pdf,
+            entry_cmd::download_open_access_pdfs,
+            entry_cmd::get_entry_local_pdf_path,
+            entry_cmd::open_entry_local_pdf,
             entry_cmd::fetch_entry_identifiers,
             entry_cmd::resolve_entry_pdf_url,
             entry_cmd::ensure_free_fulltext_status,
@@ -153,7 +159,6 @@ pub fn run() {
             feed_cmd::set_feed_notify,
             fetch_cmd::fetch_all_feeds,
             fetch_cmd::fetch_feed,
-            nature_download_cmd::download_papers_with_nature,
             opml_cmd::export_opml,
             opml_cmd::import_opml,
             paper_chat_cmd::list_paper_chat_messages,

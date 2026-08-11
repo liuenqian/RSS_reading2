@@ -3085,8 +3085,8 @@
                                         id="btn-detail-pdf"
                                         class="ghost-btn detail-external-action"
                                         type="button"
-                                        title="智能下载 PDF"
-                                        aria-label="智能下载 PDF"
+                                        title="读取开放获取 PDF"
+                                        aria-label="读取开放获取 PDF"
                                     >
                                         <svg
                                             width="13"
@@ -3103,30 +3103,6 @@
                                             <path d="M9 2.5v3h3" />
                                         </svg>
                                         <span>PDF</span>
-                                    </button>
-                                    <button
-                                        id="btn-detail-scihub"
-                                        class="ghost-btn detail-external-action"
-                                        type="button"
-                                        title="通过 Sci-Hub 查找全文"
-                                        aria-label="通过 Sci-Hub 查找全文"
-                                    >
-                                        <svg
-                                            width="13"
-                                            height="13"
-                                            viewBox="0 0 16 16"
-                                            fill="none"
-                                            stroke="currentColor"
-                                            stroke-width="1.5"
-                                            stroke-linecap="round"
-                                            stroke-linejoin="round"
-                                            aria-hidden="true"
-                                        >
-                                            <path d="M6.2 9.8 9.8 6.2" />
-                                            <path d="M5.2 11.8H4.5a2.5 2.5 0 0 1 0-5H7" />
-                                            <path d="M10.8 4.2h.7a2.5 2.5 0 0 1 0 5H9" />
-                                        </svg>
-                                        <span>Sci-Hub</span>
                                     </button>
                                     <button
                                         id="btn-open-url"
@@ -3452,6 +3428,9 @@
                                                 <span id="pdf-search-status" class="detail-pdf-search-status" role="status"></span>
                                             </div>
                                             <div class="detail-pdf-actions">
+                                                <button id="btn-pdf-open-local" class="btn-icon" type="button" title="用本地阅读器打开已下载 PDF" aria-label="用本地阅读器打开已下载 PDF" disabled>
+                                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 5.5h4l1.2 1.5h5.8v5.5a1 1 0 0 1-1 1h-10a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1Z" /><path d="M8 9.5h3.5M10 8l1.5 1.5L10 11" /></svg>
+                                                </button>
                                                 <button id="btn-pdf-open-external" class="btn-icon" type="button" title="在浏览器中打开 PDF" aria-label="在浏览器中打开 PDF">
                                                     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 3h4v4M13 3 7 9M12 9.5V12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h2.5" /></svg>
                                                 </button>

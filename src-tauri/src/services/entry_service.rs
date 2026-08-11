@@ -3,7 +3,7 @@ use crate::models::{
     WordFrequencyResult,
 };
 use crate::services::{article_service, pubmed_search_service, translate_service};
-use rusqlite::{params, types::Value, Connection};
+use rusqlite::{params, types::Value, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 
 pub fn list_entries(conn: &Connection, feed_id: Option<i64>) -> Result<Vec<Entry>, String> {
@@ -212,20 +212,44 @@ pub fn upsert_pdf_fulltext(
     content: &str,
 ) -> Result<(), String> {
     let cleaned = content.replace('\0', "").trim().to_string();
-    if cleaned.is_empty() {
-        return Ok(());
-    }
     conn.execute(
         "INSERT INTO entry_pdf_fulltexts (entry_id, content, source_url, indexed_at)
          VALUES (?1, ?2, ?3, datetime('now'))
          ON CONFLICT(entry_id) DO UPDATE SET
-            content = excluded.content,
+            content = CASE
+                WHEN length(trim(excluded.content)) > 0 THEN excluded.content
+                ELSE entry_pdf_fulltexts.content
+            END,
             source_url = excluded.source_url,
             indexed_at = excluded.indexed_at",
         params![entry_id, cleaned, source_url],
     )
     .map_err(|e| format!("保存 PDF 全文索引失败: {}", e))?;
     Ok(())
+}
+
+pub fn set_pdf_local_path(
+    conn: &Connection,
+    entry_id: i64,
+    local_path: Option<&str>,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE entry_pdf_fulltexts SET local_path = ?1 WHERE entry_id = ?2",
+        params![local_path, entry_id],
+    )
+    .map_err(|e| format!("保存本地 PDF 路径失败: {}", e))?;
+    Ok(())
+}
+
+pub fn get_pdf_local_path(conn: &Connection, entry_id: i64) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT local_path FROM entry_pdf_fulltexts WHERE entry_id = ?1",
+        [entry_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| format!("读取本地 PDF 路径失败: {}", e))
+    .map(|path: Option<Option<String>>| path.flatten())
 }
 
 pub fn analyze_word_frequency(
@@ -1125,8 +1149,9 @@ pub async fn generate_flavor_pool(
 mod tests {
     use super::{
         analyze_word_frequency, english_word_frequency_terms, escape_like_pattern,
-        literature_growth_sources, normalize_entry_tag, normalize_search_terms, parse_entry_tags,
-        search_entries, source_reading_stats,
+        get_pdf_local_path, literature_growth_sources, normalize_entry_tag, normalize_search_terms,
+        parse_entry_tags, search_entries, set_pdf_local_path, source_reading_stats,
+        upsert_pdf_fulltext,
     };
     use rusqlite::Connection;
 
@@ -1139,6 +1164,31 @@ mod tests {
     fn parse_entry_tags_splits_internal_separator() {
         let tags = parse_entry_tags(Some("综述\u{1f}方法学\u{1f}转化医学"));
         assert_eq!(tags, vec!["综述", "方法学", "转化医学"]);
+    }
+
+    #[test]
+    fn pdf_fulltext_persists_local_path() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE entry_pdf_fulltexts (
+                entry_id INTEGER PRIMARY KEY,
+                content TEXT NOT NULL,
+                source_url TEXT,
+                local_path TEXT,
+                indexed_at TEXT
+            );",
+        )
+        .unwrap();
+
+        upsert_pdf_fulltext(&conn, 11, "https://example.org/article.pdf", "indexed text").unwrap();
+        set_pdf_local_path(&conn, 11, Some("/tmp/article-11.pdf")).unwrap();
+        assert_eq!(
+            get_pdf_local_path(&conn, 11).unwrap().as_deref(),
+            Some("/tmp/article-11.pdf")
+        );
+
+        set_pdf_local_path(&conn, 11, None).unwrap();
+        assert_eq!(get_pdf_local_path(&conn, 11).unwrap(), None);
     }
 
     #[test]
