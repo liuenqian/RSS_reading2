@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "cento"
-version = "1.1.19"
+version = "1.1.20"
 dependencies = [
  "calamine",
  "csv",
