@@ -1,5 +1,8 @@
 use crate::db::DbState;
-use crate::models::{AiModelSummary, ApiTokenProfileList, DeepSeekBalance, DeepSeekSettings};
+use crate::models::{
+    AiModelSummary, ApiTokenProfileList, DeepSeekBalance, DeepSeekSettings,
+    TranslationRouteSettings,
+};
 use crate::services::{settings_service, translate_service};
 use tauri::State;
 
@@ -22,6 +25,23 @@ pub fn get_provider_settings(
 pub fn save_settings(state: State<DbState>, settings: DeepSeekSettings) -> Result<(), String> {
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
     settings_service::save_settings(&conn, &settings)
+}
+
+#[tauri::command]
+pub fn get_translation_route_settings(
+    state: State<DbState>,
+) -> Result<TranslationRouteSettings, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    Ok(settings_service::get_translation_route_settings(&conn))
+}
+
+#[tauri::command]
+pub fn save_translation_route_settings(
+    state: State<DbState>,
+    settings: TranslationRouteSettings,
+) -> Result<TranslationRouteSettings, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    settings_service::save_translation_route_settings(&conn, &settings)
 }
 
 #[tauri::command]

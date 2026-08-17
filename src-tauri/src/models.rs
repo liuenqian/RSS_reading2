@@ -644,6 +644,17 @@ pub struct DeepSeekSettings {
     pub read_retention_days: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TranslationRouteSettings {
+    #[serde(default)]
+    pub primary_ai_model_id: Option<String>,
+    #[serde(default)]
+    pub google_web_enabled: bool,
+    #[serde(default)]
+    pub google_web_first: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AiModelSummary {
     pub id: String,
@@ -830,6 +841,17 @@ pub struct ReadingStats {
     /// falls back to the snapshot otherwise.
     pub feed_read_counts: Vec<(i64, Option<String>, i64)>,
     pub growth_sources: Vec<LiteratureGrowthSource>,
+}
+
+/// Compact database-backed counts for the global library sidebar. These must
+/// not be derived from `list_entries`, which intentionally returns a limited
+/// page for responsiveness.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EntryOverviewCounts {
+    pub total: i64,
+    pub unread: i64,
+    pub starred: i64,
+    pub reading_notes: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -18,6 +18,7 @@ const PUBMED_SORT_VALUES = new Set([
   'rank',
 ]);
 const PUBMED_STAR_VALUES = new Set(['all', 'starred', 'unstarred']);
+const TRANSLATION_QUALITY_VALUES = new Set(['all', 'risk', 'title-risk', 'summary-risk']);
 
 export function createDefaultFilterScopeState() {
   return {
@@ -26,6 +27,7 @@ export function createDefaultFilterScopeState() {
     entrySortField: 'default',
     entrySortDirection: 'desc',
     metricFilters: { if: 'all', q: 'all', b: 'all', top: 'all' },
+    translationQualityFilter: 'all',
     pubmedFilters: {
       status: 'all',
       sort: 'publication-desc',
@@ -67,6 +69,11 @@ export function normalizeFilterScopeState(value) {
         key,
         allowedValue(metrics[key], allowed, defaults.metricFilters[key]),
       ])
+    ),
+    translationQualityFilter: allowedValue(
+      state.translationQualityFilter,
+      TRANSLATION_QUALITY_VALUES,
+      defaults.translationQualityFilter,
     ),
     pubmedFilters: {
       status: allowedValue(pubmed.status, PUBMED_STATUS_VALUES, defaults.pubmedFilters.status),

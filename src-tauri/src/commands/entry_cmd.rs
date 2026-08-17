@@ -1,7 +1,7 @@
 use crate::db::DbState;
 use crate::models::{
-    Entry, EntryIdentifiers, OpenAccessPdfDownloadReport, OpenAccessPdfDownloadResult,
-    ReadingStats, WordFrequencyResult, WordFrequencyTranslation,
+    Entry, EntryIdentifiers, EntryOverviewCounts, OpenAccessPdfDownloadReport,
+    OpenAccessPdfDownloadResult, ReadingStats, WordFrequencyResult, WordFrequencyTranslation,
 };
 use crate::services::{
     article_service, cost_service, entry_service, fulltext_service, settings_service,
@@ -19,6 +19,12 @@ const MAX_OPEN_ACCESS_PDF_DOWNLOADS: usize = 20;
 pub fn list_entries(state: State<DbState>, feed_id: Option<i64>) -> Result<Vec<Entry>, String> {
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
     entry_service::list_entries(&conn, feed_id)
+}
+
+#[tauri::command]
+pub fn get_entry_overview_counts(state: State<DbState>) -> Result<EntryOverviewCounts, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    entry_service::overview_counts(&conn)
 }
 
 #[tauri::command]

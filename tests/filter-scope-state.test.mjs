@@ -28,6 +28,7 @@ test('keeps every filter state isolated between scopes', () => {
     entrySortField: 'if',
     entrySortDirection: 'asc',
     metricFilters: { if: 'ge10', q: 'Q1', b: 'B2', top: 'top' },
+    translationQualityFilter: 'summary-risk',
     pubmedFilters: {
       status: 'keep',
       sort: 'if-desc',
@@ -45,6 +46,7 @@ test('keeps every filter state isolated between scopes', () => {
   assert.equal(readFilterScopeState(scopes, 'pubmed:3').entrySortField, 'if');
   assert.equal(readFilterScopeState(scopes, 'pubmed:3').entrySortDirection, 'asc');
   assert.equal(readFilterScopeState(scopes, 'pubmed:3').metricFilters.if, 'ge10');
+  assert.equal(readFilterScopeState(scopes, 'pubmed:3').translationQualityFilter, 'summary-risk');
   assert.equal(readFilterScopeState(scopes, 'pubmed:3').pubmedFilters.status, 'keep');
   assert.equal(readFilterScopeState(scopes, 'pubmed:3').pubmedSnapshotId, 'snapshot-3');
   assert.deepEqual(readFilterScopeState(scopes, 'pubmed:4'), createDefaultFilterScopeState());

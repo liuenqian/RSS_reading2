@@ -1,6 +1,6 @@
 use crate::models::{
-    DeepSeekSettings, Entry, LiteratureGrowthSource, ReadingStats, TokenUsage, WordFrequencyItem,
-    WordFrequencyResult,
+    DeepSeekSettings, Entry, EntryOverviewCounts, LiteratureGrowthSource, ReadingStats, TokenUsage,
+    WordFrequencyItem, WordFrequencyResult,
 };
 use crate::services::{article_service, pubmed_search_service, translate_service};
 use rusqlite::{params, types::Value, Connection, OptionalExtension};
@@ -74,6 +74,32 @@ pub fn list_entries(conn: &Connection, feed_id: Option<i64>) -> Result<Vec<Entry
     };
 
     Ok(entries)
+}
+
+pub fn overview_counts(conn: &Connection) -> Result<EntryOverviewCounts, String> {
+    conn.query_row(
+        "SELECT
+            COUNT(*) AS total,
+            COALESCE(SUM(CASE WHEN e.is_read = 0 THEN 1 ELSE 0 END), 0) AS unread,
+            COALESCE(SUM(CASE WHEN EXISTS(
+                SELECT 1 FROM entry_user_state eus
+                WHERE eus.entry_id = e.id AND eus.is_starred = 1
+            ) THEN 1 ELSE 0 END), 0) AS starred,
+            COALESCE(SUM(CASE WHEN EXISTS(
+                SELECT 1 FROM reading_notes rn WHERE rn.entry_id = e.id
+            ) THEN 1 ELSE 0 END), 0) AS reading_notes
+         FROM entries e",
+        [],
+        |row| {
+            Ok(EntryOverviewCounts {
+                total: row.get(0)?,
+                unread: row.get(1)?,
+                starred: row.get(2)?,
+                reading_notes: row.get(3)?,
+            })
+        },
+    )
+    .map_err(|error| format!("统计文献总览失败: {error}"))
 }
 
 pub fn search_entries(
@@ -1150,8 +1176,8 @@ mod tests {
     use super::{
         analyze_word_frequency, english_word_frequency_terms, escape_like_pattern,
         get_pdf_local_path, literature_growth_sources, normalize_entry_tag, normalize_search_terms,
-        parse_entry_tags, search_entries, set_pdf_local_path, source_reading_stats,
-        upsert_pdf_fulltext,
+        overview_counts, parse_entry_tags, search_entries, set_pdf_local_path,
+        source_reading_stats, upsert_pdf_fulltext,
     };
     use rusqlite::Connection;
 
@@ -1197,6 +1223,36 @@ mod tests {
             normalize_search_terms("  Sepsis 免疫  "),
             vec!["sepsis", "免疫"]
         );
+    }
+
+    #[test]
+    fn overview_counts_cover_the_full_library_without_duplicate_notes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE entries (
+                id INTEGER PRIMARY KEY,
+                is_read INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE entry_user_state (
+                entry_id INTEGER PRIMARY KEY,
+                is_starred INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE reading_notes (
+                entry_id INTEGER NOT NULL,
+                profile_id TEXT NOT NULL
+            );
+            INSERT INTO entries (id, is_read) VALUES (1, 0), (2, 1), (3, 0);
+            INSERT INTO entry_user_state (entry_id, is_starred) VALUES (1, 1), (2, 0);
+            INSERT INTO reading_notes (entry_id, profile_id)
+                VALUES (1, 'brief'), (1, 'deep'), (2, 'brief');",
+        )
+        .unwrap();
+
+        let counts = overview_counts(&conn).unwrap();
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.unread, 2);
+        assert_eq!(counts.starred, 1);
+        assert_eq!(counts.reading_notes, 2);
     }
 
     #[test]

@@ -32,6 +32,11 @@ import {
   writeFilterScopeState,
 } from './filter_scope.js';
 import {
+  TRANSLATION_QUALITY_FILTER_VALUES,
+  matchesTranslationQualityFilter,
+  translationQualityIssues,
+} from './translation_quality.js';
+import {
   SCREENING_TABLE_SCHEMA_VERSION,
   defaultScreeningTableConfig,
   normalizeScreeningTableConfig,
@@ -52,6 +57,7 @@ const markdownitFootnote = globalThis.markdownitFootnote;
 const DOMPurify = globalThis.DOMPurify;
 const MARKDOWN_LINK_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
 const MARKDOWN_IMAGE_PROTOCOLS = new Set(['http:', 'https:', 'data:']);
+const GOOGLE_WEB_TRANSLATION_MODEL_ID = '__google_web__';
 const markdownRenderer = createMarkdownRenderer();
 const READING_HIGHLIGHT_STORAGE_KEY = 'reading-highlights-v1';
 const READING_HIGHLIGHT_LAST_COLOR_KEY = 'reading-highlight-last-color-v1';
@@ -1740,6 +1746,7 @@ let btnToggleApiKey, btnTest, btnSaveSettings, btnSaveGeneral;
 let aiModelList, aiModelEmpty, aiModelEditor, aiModelEditorTitle, aiModelStatus;
 let btnAddAiModel, btnCancelAiModel;
 let settingsStatus, generalStatus;
+let translationPrimaryAiModel, googleWebTranslationEnabled, translationRouteOrder, translationRouteStatus, btnSaveTranslationRoute;
 let retentionSelect, themeControl, accentSwatches, fontscaleControl, titleDisplaySelect;
 let feedUrlInput, btnAddFeed, addFeedRow, addFeedIcon, feedListEl, globalStatusEl;
 let literatureSearchInput, btnClearLiteratureSearch, literatureSearchRow;
@@ -1757,9 +1764,9 @@ let annotationColorMeaningMenu, annotationColorMeaningRows, btnSaveColorMeanings
 let annotationNewColorInput, annotationNewColorHexInput, btnAddAnnotationColor;
 let entryItemsEl, entryFilter, screeningTableEl, btnScreeningTableToggle;
 let screeningWindowView, screeningWindowTitle, screeningWindowSubtitle, screeningWorkbookManagerEl, btnScreeningWindowClose;
-let entrySortSelect, entrySortDirection, entryMetricIfFilter, entryMetricQFilter, entryMetricBFilter, entryMetricTopFilter, entryTagFilter;
+let entrySortSelect, entrySortDirection, entryMetricIfFilter, entryMetricQFilter, entryMetricBFilter, entryMetricTopFilter, entryTagFilter, translationQualityFilterSelect;
 let entryMetricFilterSummaryCount;
-let entryBulkActions, entryBulkCount, btnEntrySelectMode, btnEntryBulkSelectAll, btnEntryBulkSelectUnnoted, btnEntryBulkSelectNoted, btnEntryBulkInvert, btnEntryBulkDeselect, entryBulkExportFormat, btnEntryBulkExport, entryBulkExistingMode, btnEntryBulkGenerate, btnEntryBulkClear;
+let entryBulkActions, entryBulkCount, btnEntrySelectMode, btnEntryBulkSelectAll, btnEntryBulkSelectUnnoted, btnEntryBulkSelectNoted, btnEntryBulkInvert, btnEntryBulkDeselect, entryBulkExportFormat, btnEntryBulkExport, entryBulkExistingMode, btnEntryBulkGenerate, btnEntryBulkRetranslateRisk, btnEntryBulkClear;
 let detailPanelEl, paperChatPanelEl, briefingDetailEl;
 let sciReviewWorkspaceEl;
 let sidebarResizerEl, listResizerEl, paperChatResizerEl;
@@ -1791,6 +1798,7 @@ let btnBriefingSaveNote;
 let currentEntry = null;
 let allEntries = [];
 let globalEntries = [];
+let overviewCounts = null;
 let allFeeds = [];
 let allPubmedSearches = [];
 let currentPubmedSearch = null;
@@ -1808,6 +1816,7 @@ let hasConfiguredApiKey = false;
 let sidebarCollapsed = false;
 let entryFilterValue = 'all';   // 'all' | 'unread' | 'starred' | 'reading-notes'
 let entryTagFilterValue = 'all';
+let translationQualityFilter = 'all';
 let entrySortMode = 'default-desc';
 let entrySortField = 'default';
 let entrySortDirectionMode = 'desc';
@@ -1960,8 +1969,10 @@ const PAPER_CHAT_MIN_APP_WIDTH = 1420;
 const DETAIL_PANEL_MIN_WIDTH = 420;
 const BRIEFING_DETAIL_MIN_WIDTH = 360;
 const PANEL_RESIZER_WIDTH = 12;
+const SIDEBAR_LIBRARY_COLLAPSED_STORAGE_KEY = 'sidebar-library-collapsed-v1';
 const SIDEBAR_SECTION_COLLAPSED_STORAGE_KEY = 'sidebar-section-collapsed-v2';
 const SIDEBAR_SECTION_ORDER_STORAGE_KEY = 'sidebar-section-order-v1';
+const PUBMED_SEARCH_ORDER_STORAGE_KEY = 'pubmed-search-order-v1';
 const SIDEBAR_SOURCE_SECTION_IDS = ['sci-review', 'pmc-gallery', 'pubmed', 'feeds'];
 const SIDEBAR_SOURCE_SECTION_LABELS = {
   'sci-review': 'SCI 综述项目',
@@ -2234,6 +2245,7 @@ function captureCurrentFilterScopeState() {
     entrySortField,
     entrySortDirection: entrySortDirectionMode,
     metricFilters: { ...entryMetricFilters },
+    translationQualityFilter,
     pubmedFilters: { ...pubmedFilters },
     pubmedSnapshotId: activePubmedSnapshotId,
   });
@@ -2246,11 +2258,13 @@ function applyFilterScopeState(state) {
   entrySortField = next.entrySortField;
   entrySortDirectionMode = next.entrySortDirection;
   Object.assign(entryMetricFilters, next.metricFilters);
+  translationQualityFilter = next.translationQualityFilter;
   Object.assign(pubmedFilters, next.pubmedFilters);
   activePubmedSnapshotId = next.pubmedSnapshotId;
   syncEntryFilterControls();
   syncEntrySortControl();
   syncEntryMetricFilterControls();
+  syncTranslationQualityFilterControl();
   syncPubmedFilterInputs();
   if (entryTagFilter) entryTagFilter.value = entryTagFilterValue;
   if (['pubmed', 'kept'].includes(mode)) refreshPubmedSnapshotControls();
@@ -2614,6 +2628,7 @@ function setAiModelStatus(message = '', type = '') {
 
 function renderAiModels(models) {
   aiModels = Array.isArray(models) ? models : [];
+  renderTranslationPrimaryModelOptions(translationPrimaryAiModel?.value || '');
   renderToolbarModels(aiModels);
   if (!aiModelList) return;
   aiModelList.replaceChildren();
@@ -2729,6 +2744,7 @@ async function deleteAiModel(configId) {
   if (!model || !window.confirm(`删除模型“${model.name}”？`)) return;
   try {
     renderAiModels(await invoke('delete_ai_model', { configId }));
+    await loadTranslationRouteSettings();
     setAiModelStatus('模型已删除', 'success');
     setTimeout(() => setAiModelStatus('', ''), 2500);
   } catch (error) {
@@ -2841,10 +2857,105 @@ async function loadSettings() {
     const s = await invoke('get_settings');
     editingAiModelId = s.config_id || null;
     applyProviderSettings(s, { includeGlobal: true });
+    await loadTranslationRouteSettings();
     setAiModelEditorVisible(!s.api_key, s.config_id ? '编辑模型' : '添加模型');
     updateView(!!s.api_key);
   } catch (e) {
     showSettingsStatus('加载设置失败: ' + e, 'error');
+  }
+}
+
+function setTranslationRouteStatus(message = '', type = '') {
+  if (!translationRouteStatus) return;
+  translationRouteStatus.textContent = message;
+  translationRouteStatus.className = `settings-status ${type}`.trim();
+}
+
+function translationPrimaryServiceLabel(modelId) {
+  if (modelId === GOOGLE_WEB_TRANSLATION_MODEL_ID) return 'Google 网页翻译';
+  if (!modelId) return '当前 AI 服务';
+  const model = aiModels.find(item => item.id === modelId);
+  return model?.name || model?.model || '已选 AI 服务';
+}
+
+function describeTranslationRoute(route) {
+  const primary = translationPrimaryServiceLabel(route.primaryAiModelId);
+  if (!route.googleWebEnabled) return `已生效：${primary}；Google 未启用`;
+  if (route.googleWebFirst) {
+    const fallback = route.primaryAiModelId === GOOGLE_WEB_TRANSLATION_MODEL_ID
+      ? '当前 AI 服务'
+      : primary;
+    return `已生效：Google 网页翻译优先；失败后使用 ${fallback}`;
+  }
+  return `已生效：${primary} 优先；Google 网页翻译备用`;
+}
+
+function renderTranslationPrimaryModelOptions(selectedId = '') {
+  if (!translationPrimaryAiModel) return;
+  const options = [
+    ['','当前 AI 模型'],
+    [GOOGLE_WEB_TRANSLATION_MODEL_ID, 'Google 网页翻译（实验性）'],
+    ...aiModels.map(model => {
+      const provider = AI_PROVIDER_META[model.provider]?.label || model.provider;
+      return [model.id, `${provider} · ${model.name || model.model}`];
+    }),
+  ];
+  translationPrimaryAiModel.replaceChildren(...options.map(([value, label]) => {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    return option;
+  }));
+  translationPrimaryAiModel.value = options.some(([value]) => value === selectedId) ? selectedId : '';
+}
+
+function syncTranslationPrimarySelection() {
+  const googlePrimary = translationPrimaryAiModel?.value === GOOGLE_WEB_TRANSLATION_MODEL_ID;
+  if (googlePrimary) {
+    if (googleWebTranslationEnabled) googleWebTranslationEnabled.checked = true;
+    if (translationRouteOrder) translationRouteOrder.value = 'google-first';
+  }
+  syncTranslationRouteControls();
+}
+
+function syncTranslationRouteControls() {
+  if (!translationRouteOrder) return;
+  const enabled = !!googleWebTranslationEnabled?.checked;
+  translationRouteOrder.disabled = !enabled;
+}
+
+async function loadTranslationRouteSettings() {
+  try {
+    const route = await invoke('get_translation_route_settings');
+    renderTranslationPrimaryModelOptions(route.primaryAiModelId || '');
+    if (googleWebTranslationEnabled) googleWebTranslationEnabled.checked = !!route.googleWebEnabled;
+    if (translationRouteOrder) translationRouteOrder.value = route.googleWebFirst ? 'google-first' : 'ai-first';
+    syncTranslationRouteControls();
+    setTranslationRouteStatus(describeTranslationRoute(route), 'success');
+  } catch (error) {
+    setTranslationRouteStatus('加载翻译路由失败: ' + error, 'error');
+  }
+}
+
+async function saveTranslationRouteSettings() {
+  const googlePrimary = translationPrimaryAiModel?.value === GOOGLE_WEB_TRANSLATION_MODEL_ID;
+  const settings = {
+    primaryAiModelId: translationPrimaryAiModel?.value || null,
+    googleWebEnabled: googlePrimary || !!googleWebTranslationEnabled?.checked,
+    googleWebFirst: googlePrimary || translationRouteOrder?.value === 'google-first',
+  };
+  btnSaveTranslationRoute.disabled = true;
+  try {
+    const saved = await invoke('save_translation_route_settings', { settings });
+    renderTranslationPrimaryModelOptions(saved.primaryAiModelId || '');
+    if (googleWebTranslationEnabled) googleWebTranslationEnabled.checked = !!saved.googleWebEnabled;
+    if (translationRouteOrder) translationRouteOrder.value = saved.googleWebFirst ? 'google-first' : 'ai-first';
+    syncTranslationRouteControls();
+    setTranslationRouteStatus(describeTranslationRoute(saved), 'success');
+  } catch (error) {
+    setTranslationRouteStatus('保存翻译路由失败: ' + error, 'error');
+  } finally {
+    btnSaveTranslationRoute.disabled = false;
   }
 }
 
@@ -3166,6 +3277,44 @@ function loadSidebarSourceSectionOrder() {
   }
 }
 
+function applyPubmedSearchOrder() {
+  const savedOrder = (() => {
+    try {
+      const value = JSON.parse(localStorage.getItem(PUBMED_SEARCH_ORDER_STORAGE_KEY) || '[]');
+      return Array.isArray(value) ? value.map(Number).filter(Number.isFinite) : [];
+    } catch {
+      return [];
+    }
+  })();
+  const position = new Map(savedOrder.map((id, index) => [id, index]));
+  allPubmedSearches.sort((left, right) => {
+    const leftPosition = position.get(Number(left.id));
+    const rightPosition = position.get(Number(right.id));
+    if (leftPosition === undefined && rightPosition === undefined) return 0;
+    if (leftPosition === undefined) return 1;
+    if (rightPosition === undefined) return -1;
+    return leftPosition - rightPosition;
+  });
+}
+
+function savePubmedSearchOrder() {
+  localStorage.setItem(
+    PUBMED_SEARCH_ORDER_STORAGE_KEY,
+    JSON.stringify(allPubmedSearches.map(search => Number(search.id)).filter(Number.isFinite)),
+  );
+}
+
+function movePubmedSearch(searchId, direction) {
+  const currentIndex = allPubmedSearches.findIndex(search => Number(search.id) === Number(searchId));
+  const targetIndex = currentIndex + direction;
+  if (currentIndex < 0 || targetIndex < 0 || targetIndex >= allPubmedSearches.length) return;
+
+  const [search] = allPubmedSearches.splice(currentIndex, 1);
+  allPubmedSearches.splice(targetIndex, 0, search);
+  savePubmedSearchOrder();
+  renderPubmedSearchList();
+}
+
 function sidebarSourceSectionOrder(container) {
   return normalizeSidebarSourceSectionOrder(
     [...container.querySelectorAll('[data-sidebar-source-section]')]
@@ -3186,6 +3335,32 @@ function applySidebarSourceSectionOrder(order = loadSidebarSourceSectionOrder())
   normalizeSidebarSourceSectionOrder(order).forEach(section => {
     const sectionEl = container.querySelector(`[data-sidebar-source-section="${section}"]`);
     if (sectionEl) container.appendChild(sectionEl);
+  });
+}
+
+function setSidebarLibraryCollapsed(collapsed, { persist = true } = {}) {
+  const toggle = document.querySelector('[data-sidebar-library-toggle]');
+  const listId = toggle?.getAttribute('aria-controls');
+  const list = listId ? document.getElementById(listId) : null;
+  if (!toggle || !list) return;
+
+  toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  toggle.title = `${collapsed ? '展开' : '折叠'}文献库`;
+  list.hidden = collapsed;
+  toggle.closest('.sidebar-overview-section')?.classList.toggle('is-collapsed', collapsed);
+  if (persist) localStorage.setItem(SIDEBAR_LIBRARY_COLLAPSED_STORAGE_KEY, collapsed ? '1' : '0');
+}
+
+function setupSidebarLibraryToggle() {
+  const toggle = document.querySelector('[data-sidebar-library-toggle]');
+  if (!toggle) return;
+
+  setSidebarLibraryCollapsed(
+    localStorage.getItem(SIDEBAR_LIBRARY_COLLAPSED_STORAGE_KEY) === '1',
+    { persist: false },
+  );
+  toggle.addEventListener('click', () => {
+    setSidebarLibraryCollapsed(toggle.getAttribute('aria-expanded') === 'true');
   });
 }
 
@@ -4269,6 +4444,7 @@ function syncCompactFilterSummaries() {
   ].filter(Boolean).length;
   const metricActiveCount = Object.values(entryMetricFilters).filter(value => value !== 'all').length
     + (entryTagFilterValue !== 'all' ? 1 : 0)
+    + (translationQualityFilter !== 'all' ? 1 : 0)
     + (['pubmed', 'kept'].includes(mode) && pubmedFilters.star !== 'all' ? 1 : 0);
   if (entryMetricFilterSummaryCount) {
     const activeCount = metricActiveCount + (['pubmed', 'kept'].includes(mode) ? pubmedActiveCount : 0);
@@ -4284,8 +4460,10 @@ function activatePubmedSnapshot(snapshotId) {
     Object.assign(pubmedFilters, snapshot.filters || {});
     Object.assign(entryMetricFilters, snapshot.metricFilters || {});
     entryTagFilterValue = snapshot.tagFilter || 'all';
+    translationQualityFilter = normalizeTranslationQualityFilter(snapshot.translationQualityFilter);
     syncPubmedFilterInputs();
     syncEntryMetricFilterControls();
+    syncTranslationQualityFilterControl();
     persistEntryMetricFilters();
     refreshEntryTagFilterOptions(allEntries);
     if (entryTagFilter) entryTagFilter.value = entryTagFilterValue;
@@ -4322,6 +4500,7 @@ async function saveCurrentPubmedSnapshot() {
     filters: { ...pubmedFilters },
     metricFilters: { ...entryMetricFilters },
     tagFilter: entryTagFilterValue,
+    translationQualityFilter,
     createdAt: now.toISOString(),
   };
   pubmedSnapshots.push(snapshot);
@@ -5521,6 +5700,7 @@ function setupPubmedSearchEvents() {
 async function loadPubmedSearches() {
   try {
     allPubmedSearches = await invoke('list_pubmed_searches');
+    applyPubmedSearchOrder();
     renderPubmedSearchList();
     renderPubmedSearchNameHistory();
     let keptCount = 0;
@@ -5571,6 +5751,9 @@ function renderPubmedSearchList() {
         <span class="pubmed-search-item-title">${escapeHtml(search.name)}</span>
       </span>
       <span class="pubmed-search-item-count">${search.total_entries || ''}</span>
+      <button class="pubmed-search-drag-handle" type="button" data-pubmed-search-drag-handle="${search.id}" title="拖动调整顺序" aria-label="拖动调整 ${escapeHtml(search.name)} 的顺序">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M5.5 4.5h.01M10.5 4.5h.01M5.5 8h.01M10.5 8h.01M5.5 11.5h.01M10.5 11.5h.01" /></svg>
+      </button>
     `;
     li.addEventListener('click', () => selectPubmedSearch(search.id));
     li.addEventListener('contextmenu', event => {
@@ -5578,6 +5761,78 @@ function renderPubmedSearchList() {
       showPubmedSearchContextMenu(event.clientX, event.clientY, search);
     });
     pubmedSearchListEl.appendChild(li);
+  });
+  setupPubmedSearchOrdering();
+}
+
+function setupPubmedSearchOrdering() {
+  if (!pubmedSearchListEl) return;
+  let draggedItem = null;
+  let activeHandle = null;
+  let activePointerId = null;
+  const items = () => [...pubmedSearchListEl.querySelectorAll('.pubmed-search-item')];
+  const clearMarkers = () => {
+    pubmedSearchListEl.querySelectorAll('.is-drag-over-before, .is-drag-over-after').forEach(item => {
+      item.classList.remove('is-drag-over-before', 'is-drag-over-after');
+    });
+  };
+  const finishDrag = () => {
+    clearMarkers();
+    draggedItem?.classList.remove('is-dragging');
+    activeHandle?.releasePointerCapture?.(activePointerId);
+    if (draggedItem) {
+      const order = items().map(item => Number(item.dataset.searchId)).filter(Number.isFinite);
+      const position = new Map(order.map((id, index) => [id, index]));
+      allPubmedSearches.sort((left, right) => position.get(Number(left.id)) - position.get(Number(right.id)));
+      savePubmedSearchOrder();
+      renderPubmedSearchList();
+    }
+    draggedItem = null;
+    activeHandle = null;
+    activePointerId = null;
+  };
+
+  pubmedSearchListEl.querySelectorAll('[data-pubmed-search-drag-handle]').forEach(handle => {
+    handle.addEventListener('pointerdown', event => {
+      if (event.button !== 0) return;
+      const item = handle.closest('.pubmed-search-item');
+      if (!item) return;
+      event.preventDefault();
+      event.stopPropagation();
+      draggedItem = item;
+      activeHandle = handle;
+      activePointerId = event.pointerId;
+      handle.setPointerCapture?.(event.pointerId);
+      item.classList.add('is-dragging');
+    });
+    handle.addEventListener('pointermove', event => {
+      if (!draggedItem || activePointerId !== event.pointerId) return;
+      event.preventDefault();
+      const target = items().filter(item => item !== draggedItem).find(item => {
+        const rect = item.getBoundingClientRect();
+        return event.clientY >= rect.top && event.clientY <= rect.bottom;
+      });
+      if (!target) return;
+      const rect = target.getBoundingClientRect();
+      const before = event.clientY < rect.top + rect.height / 2;
+      clearMarkers();
+      target.classList.toggle('is-drag-over-before', before);
+      target.classList.toggle('is-drag-over-after', !before);
+      const next = before ? target : target.nextSibling;
+      if (next !== draggedItem) pubmedSearchListEl.insertBefore(draggedItem, next);
+    });
+    handle.addEventListener('pointerup', event => {
+      if (activePointerId !== event.pointerId) return;
+      event.preventDefault();
+      finishDrag();
+    });
+    handle.addEventListener('pointercancel', finishDrag);
+    handle.addEventListener('keydown', event => {
+      if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+      event.preventDefault();
+      event.stopPropagation();
+      movePubmedSearch(handle.dataset.pubmedSearchDragHandle, event.key === 'ArrowUp' ? -1 : 1);
+    });
   });
 }
 
@@ -6591,8 +6846,15 @@ function formatCompactDateTime(value) {
 async function loadFeeds() {
   try {
     allFeeds = await invoke('list_feeds');
-    try { globalEntries = await invoke('list_entries', { feedId: null }); }
-    catch { globalEntries = []; }
+    const [entries, counts] = await Promise.all([
+      invoke('list_entries', { feedId: null }).catch(() => []),
+      invoke('get_entry_overview_counts').catch(error => {
+        console.warn('加载文献总览计数失败，暂时使用当前列表:', error);
+        return null;
+      }),
+    ]);
+    globalEntries = entries;
+    overviewCounts = counts;
     renderFeedList(allFeeds);
     updateOverviewCounts();
     syncBriefingSourceControls();
@@ -6619,18 +6881,24 @@ function updateOverviewCounts() {
   const elTopReadingNotes = document.getElementById('top-count-reading-notes');
   const elBriefing = document.getElementById('count-briefing');
   const stars = starredIds();
-  if (elAll) elAll.textContent = globalEntries.length || '';
-  if (elTopAll) elTopAll.textContent = globalEntries.length || '';
-  const unread = globalEntries.filter(e => !e.is_read).length;
+  const counts = overviewCounts || {
+    total: globalEntries.length,
+    unread: globalEntries.filter(e => !e.is_read).length,
+    starred: globalEntries.filter(e => stars.has(e.id)).length,
+    reading_notes: globalEntries.filter(e => e.has_reading_note).length,
+  };
+  if (elAll) elAll.textContent = counts.total || '';
+  if (elTopAll) elTopAll.textContent = counts.total || '';
+  const unread = counts.unread;
   if (elUnread) elUnread.textContent = unread || '';
   if (elTopUnread) elTopUnread.textContent = unread || '';
-  const readingNotes = globalEntries.filter(e => e.has_reading_note).length;
+  const readingNotes = counts.reading_notes;
   if (elReadingNotes) elReadingNotes.textContent = readingNotes || '';
   if (elTopReadingNotes) elTopReadingNotes.textContent = readingNotes || '';
   // Count only stars that point at live entries. Raw `stars.size` keeps growing
   // with orphan IDs (e.g. starred entries whose feed got deleted), so the badge
   // would refuse to hide even after the user has effectively "cleared" stars.
-  const liveStarCount = globalEntries.filter(e => stars.has(e.id)).length;
+  const liveStarCount = counts.starred;
   if (elStarred) {
     elStarred.textContent = liveStarCount || '';
   }
@@ -7488,6 +7756,7 @@ function showEntryContextMenu(x, y, entry) {
   const isBatch = targetEntries.length > 1;
   const titleEntries = targetEntries.filter(entryNeedsTitleTranslation);
   const summaryEntries = targetEntries.filter(entryNeedsSummaryTranslation);
+  const riskRetryTasks = getTranslationQualityRetryTasks(targetEntries);
 
   hideContextMenu();
   const menu = document.createElement('div');
@@ -7501,6 +7770,10 @@ function showEntryContextMenu(x, y, entry) {
     if (summaryEntries.length) {
       items += `<div class="context-item" data-action="translate-summary">${isBatch ? `翻译所选 ${summaryEntries.length} 篇摘要` : '翻译摘要'}</div>`;
     }
+    items += '<div class="context-separator"></div>';
+  }
+  if (riskRetryTasks.length) {
+    items += `<div class="context-item" data-action="retranslate-risk">${isBatch ? `清除后重译所选 ${riskRetryTasks.length} 个风险字段` : '清除后重译风险译文'}</div>`;
     items += '<div class="context-separator"></div>';
   }
   items += `<div class="context-item" data-action="download-pdf">${isBatch ? `下载所选 ${targetEntries.length} 篇 PDF` : '下载 PDF'}</div>`;
@@ -7537,6 +7810,8 @@ function showEntryContextMenu(x, y, entry) {
       await translateEntries(targetEntries, 'title');
     } else if (action === 'translate-summary') {
       await translateEntries(targetEntries, 'summary');
+    } else if (action === 'retranslate-risk') {
+      await retranslateTranslationQualityIssues(targetEntries);
     } else if (action === 'generate-briefing-selection') {
       await generateBriefingForEntries(targetEntries);
     } else if (action === 'mark-read') await setEntryRead(entry, true);
@@ -7568,6 +7843,9 @@ function getFilteredEntries(entries = allEntries) {
   else if (entryFilterValue === 'reading-notes') filtered = filtered.filter(e => e.has_reading_note);
   if (entryTagFilterValue !== 'all') {
     filtered = filtered.filter(entry => (entry.tags || []).includes(entryTagFilterValue));
+  }
+  if (translationQualityFilter !== 'all') {
+    filtered = filtered.filter(entry => matchesTranslationQualityFilter(entry, translationQualityFilter));
   }
 
   if (hasActiveEntryMetricFilters()) {
@@ -7609,6 +7887,9 @@ function getFilteredPubmedEntries(entries = allEntries) {
   }
   if (entryTagFilterValue !== 'all') {
     filtered = filtered.filter(entry => (entry.tags || []).includes(entryTagFilterValue));
+  }
+  if (translationQualityFilter !== 'all') {
+    filtered = filtered.filter(entry => matchesTranslationQualityFilter(entry, translationQualityFilter));
   }
   if (hasActiveEntryMetricFilters()) filtered = filtered.filter(matchesEntryMetricFilters);
 
@@ -7789,7 +8070,7 @@ function clearEntrySelection({ keepMode = false, render = true, syncPaperChat = 
 }
 
 function syncEntryBulkActions() {
-  if (!entryBulkCount || !btnEntrySelectMode || !btnEntryBulkSelectAll || !btnEntryBulkSelectUnnoted || !btnEntryBulkSelectNoted || !btnEntryBulkInvert || !btnEntryBulkDeselect || !entryBulkExistingMode || !btnEntryBulkGenerate || !btnEntryBulkClear) return;
+  if (!entryBulkCount || !btnEntrySelectMode || !btnEntryBulkSelectAll || !btnEntryBulkSelectUnnoted || !btnEntryBulkSelectNoted || !btnEntryBulkInvert || !btnEntryBulkDeselect || !entryBulkExistingMode || !btnEntryBulkGenerate || !btnEntryBulkRetranslateRisk || !btnEntryBulkClear) return;
   const count = selectedEntryIds.size;
   const visibleEntries = getFilteredEntries(allEntries);
   const unnotedEntries = getVisibleEntriesWithoutNotes();
@@ -7821,6 +8102,15 @@ function syncEntryBulkActions() {
   entryBulkExistingMode.value = entryBulkExistingStrategy;
   btnEntryBulkGenerate.classList.toggle('hidden', !entrySelectionMode);
   btnEntryBulkGenerate.disabled = count === 0 || !readingProfiles.length;
+  const riskRetryTasks = getTranslationQualityRetryTasks(getSelectedEntries());
+  btnEntryBulkRetranslateRisk.classList.toggle('hidden', !entrySelectionMode);
+  btnEntryBulkRetranslateRisk.disabled = riskRetryTasks.length === 0;
+  btnEntryBulkRetranslateRisk.textContent = riskRetryTasks.length
+    ? `重译风险译文（${riskRetryTasks.length}）`
+    : '重译风险译文';
+  btnEntryBulkRetranslateRisk.title = riskRetryTasks.length
+    ? `清除并重译所选文献中的 ${riskRetryTasks.length} 个高风险字段`
+    : '所选文献中没有可重译的高风险译文';
   btnEntryBulkClear.classList.toggle('hidden', !entrySelectionMode);
   btnEntrySelectMode.textContent = entrySelectionMode ? '退出多选' : '多选';
   btnEntrySelectMode.classList.toggle('active', entrySelectionMode);
@@ -8009,6 +8299,7 @@ async function translateEntries(entries, field, contextLabel = '') {
   let completed = 0;
   let translatedCount = 0;
   let skippedCount = 0;
+  const usedModels = new Set();
   const failures = [];
   const updateProgress = () => {
     const active = Math.min(DEFAULT_TRANSLATION_CONCURRENCY, total - completed);
@@ -8025,8 +8316,12 @@ async function translateEntries(entries, field, contextLabel = '') {
       onSettled: result => {
         completed += 1;
         if (result.ok) {
-          if (result.value) translatedCount += 1;
-          else skippedCount += 1;
+          if (result.value?.translated) {
+            translatedCount += 1;
+            if (result.value.model) usedModels.add(result.value.model);
+          } else {
+            skippedCount += 1;
+          }
         } else {
           failures.push({
             entry: result.item,
@@ -8041,8 +8336,9 @@ async function translateEntries(entries, field, contextLabel = '') {
   );
 
   if (!failures.length) {
+    const source = usedModels.size ? `（${[...usedModels].join('、')}）` : '';
     setGlobalStatus(
-      `${contextPrefix}${fieldLabel}处理完成：翻译 ${translatedCount} 篇，跳过 ${skippedCount} 篇`,
+      `${contextPrefix}${fieldLabel}处理完成：翻译 ${translatedCount} 篇${source}，跳过 ${skippedCount} 篇`,
       'success',
     );
     return;
@@ -8057,6 +8353,81 @@ async function translateEntries(entries, field, contextLabel = '') {
     `${contextPrefix}${fieldLabel}翻译完成：翻译 ${translatedCount} 篇，跳过 ${skippedCount} 篇，失败 ${failures.length} 篇。${preview}${suffix}`,
     'error',
   );
+}
+
+function getTranslationQualityRetryTasks(entries) {
+  return entries.flatMap(entry => {
+    const fields = [...new Set(translationQualityIssues(entry).map(issue => issue.field))];
+    return fields.map(field => ({ entry, field }));
+  });
+}
+
+async function retranslateTranslationQualityIssues(entries) {
+  const tasks = getTranslationQualityRetryTasks(entries);
+  if (!tasks.length) {
+    setGlobalStatus('所选文献中没有可重译的高风险译文', 'info');
+    return;
+  }
+  const uniqueEntries = new Set(tasks.map(task => task.entry.id)).size;
+  const confirmed = await confirmDialog(
+    `将清除所选 ${uniqueEntries} 篇文献中的 ${tasks.length} 个高风险翻译缓存，然后重新翻译。原始标题和摘要不会被删除。`,
+    { okLabel: '清除后重译', cancelLabel: '取消' },
+  );
+  if (!confirmed) return;
+
+  if (btnEntryBulkRetranslateRisk) btnEntryBulkRetranslateRisk.disabled = true;
+  let completed = 0;
+  const usedModels = new Set();
+  const failures = [];
+  const updateProgress = () => {
+    setGlobalStatus(`正在清除并重译风险译文：已完成 ${completed}/${tasks.length}`, 'progress');
+  };
+  updateProgress();
+  await runConcurrentQueue(
+    tasks,
+    async task => {
+      const entryId = task.entry.id;
+      await invoke('clear_entry_translation', { entryId, field: task.field });
+      applyEntryUpdate(entryId, item => {
+        if (task.field === 'title') item.title_translated = null;
+        else item.summary_translated = null;
+        item._translationErrors = { ...item._translationErrors, [task.field]: null };
+        item._transError = null;
+      });
+      return invoke(
+        task.field === 'title' ? 'translate_entry_title' : 'translate_entry_summary',
+        { entryId },
+      );
+    },
+    {
+      concurrency: DEFAULT_TRANSLATION_CONCURRENCY,
+      maxRetries: 2,
+      retryDelayMs: 800,
+      onSettled: result => {
+        completed += 1;
+        if (result.ok && result.value?.model) usedModels.add(result.value.model);
+        if (!result.ok) {
+          failures.push({
+            task: result.item,
+            message: typeof result.error === 'string'
+              ? result.error
+              : result.error?.message || '翻译失败',
+          });
+        }
+        if (completed < tasks.length) updateProgress();
+      },
+    },
+  );
+
+  if (failures.length) {
+    selectedEntryIds = new Set(failures.map(item => item.task.entry.id));
+    entrySelectionMode = true;
+    setGlobalStatus(`风险译文重译完成：成功 ${tasks.length - failures.length} 项，失败 ${failures.length} 项；失败项已保留为勾选状态。`, 'error');
+  } else {
+    const modelLabel = usedModels.size ? `（${[...usedModels].join('、')}）` : '';
+    setGlobalStatus(`风险译文已清除并重新翻译：${tasks.length} 项${modelLabel}`, 'success');
+  }
+  rerenderEntryListPreservingScroll();
 }
 
 function entryNeedsTitleTranslation(entry) {
@@ -8264,6 +8635,15 @@ function syncEntrySortControl() {
 function normalizeEntryMetricFilterValue(key, value) {
   const options = ENTRY_METRIC_FILTER_OPTIONS[key] || ['all'];
   return options.includes(value) ? value : 'all';
+}
+
+function normalizeTranslationQualityFilter(value) {
+  return TRANSLATION_QUALITY_FILTER_VALUES.has(value) ? value : 'all';
+}
+
+function syncTranslationQualityFilterControl() {
+  translationQualityFilter = normalizeTranslationQualityFilter(translationQualityFilter);
+  if (translationQualityFilterSelect) translationQualityFilterSelect.value = translationQualityFilter;
 }
 
 function persistEntryMetricFilters() {
@@ -10593,6 +10973,8 @@ function renderEntryList(entries, options = {}) {
 	    if (entry.has_free_fulltext) {
 	      badges.push(`<span class="pill pill-free">PMC全文</span>`);
 	    }
+	    const translationQualityBadge = translationQualityBadgeHtml(entry);
+	    if (translationQualityBadge) badges.push(translationQualityBadge);
 	    badges.push(...renderEntryTagBadges(entry.tags));
     const badgesHtml = badges.length ? `<div class="entry-badges">${badges.join('')}</div>` : '';
     const selectionControlHtml = entrySelectionMode
@@ -10707,6 +11089,8 @@ function renderPubmedEntryList(entries, options = {}) {
       const identityMeta = AUTHOR_IDENTITY_META[authorIdentityStatus];
       badges.push(`<span class="author-identity-badge ${identityMeta.className}">${identityMeta.label}</span>`);
     }
+    const translationQualityBadge = translationQualityBadgeHtml(entry);
+    if (translationQualityBadge) badges.push(translationQualityBadge);
     badges.push(...renderEntryTagBadges(entry.tags, { limit: 6 }));
     li.innerHTML = `
       <input class="pubmed-entry-checkbox" type="checkbox" ${selectedEntryIds.has(entry.id) ? 'checked' : ''} aria-label="选择第 ${index + 1} 篇文献" />
@@ -10801,6 +11185,12 @@ function restoreEntryListScrollTop(scrollTop) {
 function rerenderEntryListPreservingScroll() {
   const scrollTop = entryItemsEl?.scrollTop ?? 0;
   renderEntryList(allEntries, { preserveScrollTop: scrollTop });
+}
+
+function translationQualityBadgeHtml(entry) {
+  const labels = [...new Set(translationQualityIssues(entry).map(issue => issue.label))];
+  if (!labels.length) return '';
+  return `<span class="pill pill-translation-risk" title="自动质检提示：${escapeHtml(labels.join('、'))}">翻译质检：${escapeHtml(labels.join('、'))}</span>`;
 }
 
 function formatPubmedPublicationDate(entry) {
@@ -11866,28 +12256,39 @@ async function retrySummaryTranslation() {
     btnRetrySummary.disabled = true;
     btnRetrySummary.setAttribute('aria-busy', 'true');
   }
-  setGlobalStatus('正在翻译摘要…', 'progress');
+  setGlobalStatus('正在清除旧摘要翻译并重新翻译…', 'progress');
   // Mirror translation-progress events: clear the error pill across all
   // entry collections so the middle-column badge disappears immediately.
   applyEntryUpdate(entryId, x => {
     x._summaryTranslating = true;
+    x._translationErrors = { ...x._translationErrors, summary: null };
     x._transError = null;
   });
   updateRenderedTranslationEntry(entryId);
   if (currentEntry && currentEntry.id === entryId) renderSummary(currentEntry);
   try {
-    const translated = await invoke('translate_summary', { entryId });
+    await invoke('clear_entry_translation', { entryId, field: 'summary' });
+    applyEntryUpdate(entryId, x => {
+      x.summary_translated = null;
+    });
+    const result = await invoke('translate_summary', { entryId });
+    const translated = result.text;
     applyEntryUpdate(entryId, x => {
       x.summary_translated = translated;
       x._summaryTranslating = false;
+      x._translationErrors = { ...x._translationErrors, summary: null };
       x._transError = null;
     });
     addTranslationCost(translated.length);
-    setGlobalStatus('摘要翻译完成', 'success');
+    setGlobalStatus(
+      result.model ? `摘要翻译完成：${result.model}` : '摘要翻译完成（使用已有缓存）',
+      'success',
+    );
   } catch (e) {
     const msg = (typeof e === 'string') ? e : (e && e.message) || '翻译失败';
     applyEntryUpdate(entryId, x => {
       x._summaryTranslating = false;
+      x._translationErrors = { ...x._translationErrors, summary: msg };
       x._transError = msg;
     });
     setGlobalStatus(`摘要翻译失败：${msg}`, 'error');
@@ -11989,12 +12390,30 @@ function syncRenderedTranslationBadge(item, entry) {
   badgesEl.prepend(badge);
 }
 
+function syncRenderedTranslationQualityBadge(item, entry) {
+  item.querySelector('.pill-translation-risk')?.remove();
+  const badgeHtml = translationQualityBadgeHtml(entry);
+  if (!badgeHtml) return;
+  let badgesEl = item.querySelector('.entry-badges');
+  if (!badgesEl) {
+    const content = item.querySelector('.pubmed-entry-content, .entry-body');
+    if (!content) return;
+    badgesEl = document.createElement('div');
+    badgesEl.className = item.classList.contains('pubmed-entry-item')
+      ? 'entry-badges pubmed-entry-tags'
+      : 'entry-badges';
+    content.appendChild(badgesEl);
+  }
+  badgesEl.insertAdjacentHTML('beforeend', badgeHtml);
+}
+
 function updateRenderedTranslationEntry(entryId) {
   const entry = allEntries.find(item => item.id === entryId);
   const item = findRenderedEntryItem(entryId);
   if (!entry || !item) return;
   syncRenderedTranslationTitle(item, entry);
   syncRenderedTranslationBadge(item, entry);
+  syncRenderedTranslationQualityBadge(item, entry);
 }
 
 function loadPaperChatPanelWidth() {
@@ -12232,6 +12651,7 @@ function setupTranslationEvents() {
       applyEntryUpdate(id, x => {
         if (p.field === 'title') x._titleTranslating = true;
         else if (p.field === 'summary') x._summaryTranslating = true;
+        x._translationErrors = { ...x._translationErrors, [p.field]: null };
         x._transError = null;
       });
     } else if (p.kind === 'done') {
@@ -12243,6 +12663,7 @@ function setupTranslationEvents() {
           x.summary_translated = p.text;
           x._summaryTranslating = false;
         }
+        x._translationErrors = { ...x._translationErrors, [p.field]: null };
         x._transError = null;
       });
       if (p.text) addTranslationCost(p.text.length);
@@ -12250,6 +12671,7 @@ function setupTranslationEvents() {
       applyEntryUpdate(id, x => {
         if (p.field === 'title') x._titleTranslating = false;
         else if (p.field === 'summary') x._summaryTranslating = false;
+        x._translationErrors = { ...x._translationErrors, [p.field]: p.error || '翻译失败' };
         x._transError = p.error || '翻译失败';
       });
     } else if (p.kind === 'summary_fetched') {
@@ -12259,7 +12681,8 @@ function setupTranslationEvents() {
       });
     }
 
-    updateRenderedTranslationEntry(id);
+    if (translationQualityFilter !== 'all') rerenderEntryListPreservingScroll();
+    else updateRenderedTranslationEntry(id);
     updateOverviewCounts();
     if (currentEntry && currentEntry.id === id) {
       // Re-render only the parts that changed instead of resetting the panel
@@ -12595,7 +13018,7 @@ async function applyTrayVisibility(visible) {
   catch (e) { console.warn('set_tray_visible failed:', e); }
 }
 async function pushTrayUnread() {
-  const count = globalEntries.filter(e => !e.is_read).length;
+  const count = overviewCounts?.unread ?? globalEntries.filter(e => !e.is_read).length;
   try { await invoke('update_tray_unread', { count }); }
   catch (e) { /* tray may be off, ignore */ }
 }
@@ -15949,6 +16372,11 @@ window.addEventListener('DOMContentLoaded', () => {
   btnSaveGeneral    = document.getElementById('btn-save-general');
   settingsStatus    = document.getElementById('settings-status');
   generalStatus     = document.getElementById('general-status');
+  translationPrimaryAiModel = document.getElementById('translation-primary-ai-model');
+  googleWebTranslationEnabled = document.getElementById('google-web-translation-enabled');
+  translationRouteOrder = document.getElementById('translation-route-order');
+  translationRouteStatus = document.getElementById('translation-route-status');
+  btnSaveTranslationRoute = document.getElementById('btn-save-translation-route');
   themeControl      = document.getElementById('theme-control');
   accentSwatches    = document.getElementById('accent-swatches');
   fontscaleControl  = document.getElementById('fontscale-control');
@@ -15992,6 +16420,7 @@ window.addEventListener('DOMContentLoaded', () => {
   btnEntryBulkExport = document.getElementById('btn-entry-bulk-export');
   entryBulkExistingMode = document.getElementById('entry-bulk-existing-mode');
   btnEntryBulkGenerate = document.getElementById('btn-entry-bulk-generate');
+  btnEntryBulkRetranslateRisk = document.getElementById('btn-entry-bulk-retranslate-risk');
   btnEntryBulkClear = document.getElementById('btn-entry-bulk-clear');
   btnPubmedRemoveSelected = document.getElementById('btn-pubmed-remove-selected');
   entryMetricIfFilter = document.getElementById('entry-metric-if-filter');
@@ -15999,6 +16428,7 @@ window.addEventListener('DOMContentLoaded', () => {
   entryMetricBFilter = document.getElementById('entry-metric-b-filter');
   entryMetricTopFilter = document.getElementById('entry-metric-top-filter');
   entryTagFilter = document.getElementById('entry-tag-filter');
+  translationQualityFilterSelect = document.getElementById('translation-quality-filter');
   entryMetricFilterSummaryCount = document.getElementById('entry-metric-filter-summary-count');
   pubmedBatchHeader = document.getElementById('pubmed-batch-header');
   pubmedBatchMeta = document.getElementById('pubmed-batch-meta');
@@ -16159,6 +16589,7 @@ window.addEventListener('DOMContentLoaded', () => {
   setupSidebarResizer();
   setupSidebarSectionOrdering();
   setupSidebarSectionToggles();
+  setupSidebarLibraryToggle();
   loadPmcGalleryHistory();
   setupListResizer();
   setupPaperChatResizer();
@@ -16238,6 +16669,14 @@ window.addEventListener('DOMContentLoaded', () => {
   btnToggleApiKey.addEventListener('click', toggleApiKeyVisibility);
   btnTest.addEventListener('click', testConnection);
   btnSaveSettings.addEventListener('click', saveTranslationSettings);
+  translationPrimaryAiModel?.addEventListener('change', syncTranslationPrimarySelection);
+  googleWebTranslationEnabled?.addEventListener('change', () => {
+    if (!googleWebTranslationEnabled.checked && translationPrimaryAiModel?.value === GOOGLE_WEB_TRANSLATION_MODEL_ID) {
+      translationPrimaryAiModel.value = '';
+    }
+    syncTranslationRouteControls();
+  });
+  btnSaveTranslationRoute?.addEventListener('click', saveTranslationRouteSettings);
   btnSaveGeneral?.addEventListener('click', saveGeneralSettings);
   if (titleDisplaySelect) {
     titleDisplaySelect.value = titleDisplayMode();
@@ -16499,6 +16938,14 @@ window.addEventListener('DOMContentLoaded', () => {
     refreshPaperChatAfterScopeDataChange();
   });
 
+  translationQualityFilterSelect?.addEventListener('change', () => {
+    clearEntrySelection({ render: false, syncPaperChat: false });
+    translationQualityFilter = normalizeTranslationQualityFilter(translationQualityFilterSelect.value);
+    persistCurrentFilterScope();
+    renderEntryList(allEntries);
+    refreshPaperChatAfterScopeDataChange();
+  });
+
   entrySortSelect?.addEventListener('change', () => {
     clearEntrySelection({ render: false, syncPaperChat: false });
     entrySortField = entrySortSelect.value || 'default';
@@ -16682,6 +17129,10 @@ window.addEventListener('DOMContentLoaded', () => {
     }
     const rect = btnEntryBulkGenerate.getBoundingClientRect();
     showReadingProfilePickerMenu(rect.left, rect.bottom + 6, (profileId) => generateReadingNotesForEntries(entries, profileId));
+  });
+
+  btnEntryBulkRetranslateRisk?.addEventListener('click', () => {
+    void retranslateTranslationQualityIssues(getSelectedEntries());
   });
 
   document.addEventListener('keydown', (e) => {

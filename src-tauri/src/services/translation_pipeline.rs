@@ -12,7 +12,7 @@
 //     double-translating (the INSERT OR REPLACE is the de-dup point).
 
 use crate::db::DbState;
-use crate::models::DeepSeekSettings;
+use crate::models::{DeepSeekSettings, TranslationRouteSettings};
 use crate::services::{article_service, cost_service, settings_service, translate_service};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
@@ -51,12 +51,12 @@ pub fn spawn(app: AppHandle) {
 }
 
 async fn run(app: AppHandle) -> Result<(), String> {
-    let (tasks, settings) = {
+    let (tasks, settings, route) = {
         let state = app.state::<DbState>();
         collect_pending(state.inner())?
     };
 
-    if settings.api_key.is_empty() {
+    if settings.api_key.is_empty() && !route.google_web_enabled {
         info!("API key 未配置，跳过自动翻译");
         // Surface the reason to the UI so the user sees a clear banner
         // instead of wondering why nothing is being translated.
@@ -84,6 +84,7 @@ async fn run(app: AppHandle) -> Result<(), String> {
     let _ = app.emit(STATUS_EVENT, serde_json::json!({ "status": "ok" }));
 
     let settings = Arc::new(settings);
+    let route = Arc::new(route);
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let mut handles = vec![];
 
@@ -94,9 +95,10 @@ async fn run(app: AppHandle) -> Result<(), String> {
         };
         let app2 = app.clone();
         let settings2 = settings.clone();
+        let route2 = route.clone();
         handles.push(tauri::async_runtime::spawn(async move {
             let _permit = permit;
-            process_task(app2, task, &settings2).await;
+            process_task(app2, task, &settings2, &route2).await;
         }));
     }
 
@@ -107,9 +109,11 @@ async fn run(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn collect_pending(state: &DbState) -> Result<(Vec<PendingTask>, DeepSeekSettings), String> {
+fn collect_pending(
+    state: &DbState,
+) -> Result<(Vec<PendingTask>, DeepSeekSettings, TranslationRouteSettings), String> {
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
-    let settings = settings_service::get_settings(&conn);
+    let (settings, route) = settings_service::get_translation_settings(&conn);
 
     let mut stmt = conn
         .prepare(
@@ -167,7 +171,7 @@ fn collect_pending(state: &DbState) -> Result<(Vec<PendingTask>, DeepSeekSetting
         }
     }
 
-    Ok((tasks, settings))
+    Ok((tasks, settings, route))
 }
 
 fn summary_translation_allowed(has_rss_membership: bool, has_kept_search: bool) -> bool {
@@ -219,11 +223,45 @@ fn maybe_emit_auth_failure(app: &AppHandle, msg: &str) {
     }
 }
 
-async fn process_task(app: AppHandle, task: PendingTask, settings: &DeepSeekSettings) {
+async fn translate_with_route(
+    app: &AppHandle,
+    settings: &DeepSeekSettings,
+    route: &TranslationRouteSettings,
+    text: &str,
+) -> Result<translate_service::RoutedTranslationOutput, String> {
+    let char_count = text.chars().count();
+    let google_web_available = if route.google_web_enabled {
+        let state = app.state::<DbState>();
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        settings_service::google_web_translation_available(&conn, char_count)
+    } else {
+        false
+    };
+    let output = translate_service::translate_text_with_route(
+        settings,
+        route,
+        google_web_available,
+        text,
+    )
+    .await?;
+    if output.provider == "google_web" {
+        let state = app.state::<DbState>();
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        settings_service::record_google_web_translation(&conn, char_count)?;
+    }
+    Ok(output)
+}
+
+async fn process_task(
+    app: AppHandle,
+    task: PendingTask,
+    settings: &DeepSeekSettings,
+    route: &TranslationRouteSettings,
+) {
     // ── Title ──
     if !task.has_title_translation {
         emit(&app, "start", task.id, "title", None, None);
-        match translate_service::translate_text(settings, &task.title).await {
+        match translate_with_route(&app, settings, route, &task.title).await {
             Ok(out) => {
                 let saved = {
                     let state = app.state::<DbState>();
@@ -233,14 +271,14 @@ async fn process_task(app: AppHandle, task: PendingTask, settings: &DeepSeekSett
                         "title",
                         &task.title,
                         &out.content,
-                        &settings.model,
+                        &out.model,
                     );
                     if res.is_ok() {
                         if let Ok(conn) = state.conn.lock() {
                             let _ = cost_service::record_usage(
                                 &conn,
-                                &settings.provider,
-                                &settings.model,
+                                &out.provider,
+                                &out.model,
                                 &out.usage,
                             );
                         }
@@ -307,7 +345,7 @@ async fn process_task(app: AppHandle, task: PendingTask, settings: &DeepSeekSett
     }
 
     emit(&app, "start", task.id, "summary", None, None);
-    match translate_service::translate_text(settings, &summary).await {
+    match translate_with_route(&app, settings, route, &summary).await {
         Ok(out) => {
             let saved = {
                 let state = app.state::<DbState>();
@@ -317,14 +355,14 @@ async fn process_task(app: AppHandle, task: PendingTask, settings: &DeepSeekSett
                     "summary",
                     &summary,
                     &out.content,
-                    &settings.model,
+                    &out.model,
                 );
                 if res.is_ok() {
                     if let Ok(conn) = state.conn.lock() {
                         let _ = cost_service::record_usage(
                             &conn,
-                            &settings.provider,
-                            &settings.model,
+                            &out.provider,
+                            &out.model,
                             &out.usage,
                         );
                     }

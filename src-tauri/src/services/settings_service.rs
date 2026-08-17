@@ -1,7 +1,7 @@
 use crate::models::{
     AiModelSummary, ApiTokenProfileList, ApiTokenProfileSummary, DeepSeekSettings,
-    ReadingPromptProfile, DEFAULT_CONTEXT_INPUT_TOKENS, DEFAULT_CONTEXT_OUTPUT_TOKENS,
-    DEFAULT_TOOL_CALL_ROUNDS,
+    ReadingPromptProfile, TranslationRouteSettings, DEFAULT_CONTEXT_INPUT_TOKENS,
+    DEFAULT_CONTEXT_OUTPUT_TOKENS, DEFAULT_TOOL_CALL_ROUNDS,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,10 @@ const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 const AI_MODEL_CONFIGS_KEY: &str = "ai_model_configs";
 const ACTIVE_AI_MODEL_ID_KEY: &str = "active_ai_model_id";
+const TRANSLATION_ROUTE_SETTINGS_KEY: &str = "translation_route_settings";
+const GOOGLE_WEB_TRANSLATION_USAGE_KEY: &str = "google_web_translation_usage";
+pub const GOOGLE_WEB_TRANSLATION_MODEL_ID: &str = "__google_web__";
+pub const GOOGLE_WEB_DAILY_CHAR_LIMIT: usize = 20_000;
 const DEFAULT_PROMPT: &str = "你是一个专业的学术与新闻翻译助手。你的任务是将英文 RSS 标题和摘要翻译成简洁、准确的中文。\n\n翻译规则：\n1. 准确优先：专业术语必须使用学术界通用的中文译法。如果某个术语没有公认译法，保留英文原文并用括号简要解释。\n2. 人名不翻译：所有人名保留英文原文，不做音译。\n3. 机构与期刊名：优先使用官方中文名（如 \"Nature\" → \"《自然》\"）。没有官方中文名则保留英文。\n4. 简洁：标题翻译控制在 30 个汉字以内。摘要翻译保留所有关键信息，但删除冗余的修饰语、套话和背景铺垫。\n5. 语体风格：学术内容使用正式学术语言；新闻内容使用标准新闻语言。不添加任何原文中没有的意见、评价或补充说明。\n6. HTML 标签：如果原文包含 HTML 标签（如 <p>、<a>、<em>），移除它们，只翻译纯文本内容。\n7. 仅返回翻译结果：不要在回复中包含原文、解释、备注或任何其他内容。只输出翻译后的中文文本。";
 
 fn get_setting(conn: &Connection, key: &str) -> Option<String> {
@@ -889,6 +893,11 @@ pub fn delete_ai_model(conn: &Connection, config_id: &str) -> Result<Vec<AiModel
         return Err("模型配置不存在".to_string());
     }
     save_ai_model_configs(conn, &models)?;
+    let mut route = get_translation_route_settings(conn);
+    if route.primary_ai_model_id.as_deref() == Some(config_id) {
+        route.primary_ai_model_id = None;
+        save_translation_route_settings(conn, &route)?;
+    }
     Ok(list_ai_models(conn))
 }
 
@@ -1033,6 +1042,101 @@ pub fn save_settings(conn: &Connection, settings: &DeepSeekSettings) -> Result<(
     Ok(())
 }
 
+pub fn get_translation_route_settings(conn: &Connection) -> TranslationRouteSettings {
+    get_setting(conn, TRANSLATION_ROUTE_SETTINGS_KEY)
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_translation_route_settings(
+    conn: &Connection,
+    settings: &TranslationRouteSettings,
+) -> Result<TranslationRouteSettings, String> {
+    let sanitized = TranslationRouteSettings {
+        primary_ai_model_id: settings
+            .primary_ai_model_id
+            .as_deref()
+            .filter(|id| {
+                *id == GOOGLE_WEB_TRANSLATION_MODEL_ID
+                    || load_ai_model_configs(conn)
+                        .iter()
+                        .any(|model| model.config_id.as_deref() == Some(*id))
+            })
+            .map(ToOwned::to_owned),
+        google_web_enabled: settings.google_web_enabled
+            || settings.primary_ai_model_id.as_deref() == Some(GOOGLE_WEB_TRANSLATION_MODEL_ID),
+        google_web_first: (settings.google_web_enabled && settings.google_web_first)
+            || settings.primary_ai_model_id.as_deref() == Some(GOOGLE_WEB_TRANSLATION_MODEL_ID),
+    };
+    let value = serde_json::to_string(&sanitized)
+        .map_err(|error| format!("序列化翻译路由设置失败: {}", error))?;
+    set_setting(conn, TRANSLATION_ROUTE_SETTINGS_KEY, &value)?;
+    Ok(sanitized)
+}
+
+pub fn get_translation_settings(conn: &Connection) -> (DeepSeekSettings, TranslationRouteSettings) {
+    let mut route = get_translation_route_settings(conn);
+    let settings = match route.primary_ai_model_id.as_deref() {
+        Some(GOOGLE_WEB_TRANSLATION_MODEL_ID) | None => get_settings(conn),
+        Some(config_id) => get_ai_model(conn, config_id).unwrap_or_else(|_| {
+            route.primary_ai_model_id = None;
+            get_settings(conn)
+        }),
+    };
+    (settings, route)
+}
+
+fn google_web_usage_day() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 86_400
+}
+
+fn google_web_usage(conn: &Connection) -> (u64, usize) {
+    get_setting(conn, GOOGLE_WEB_TRANSLATION_USAGE_KEY)
+        .and_then(|value| {
+            let (day, chars) = value.split_once(':')?;
+            Some((day.parse().ok()?, chars.parse().ok()?))
+        })
+        .unwrap_or((google_web_usage_day(), 0))
+}
+
+pub fn google_web_translation_available(conn: &Connection, char_count: usize) -> bool {
+    if char_count == 0 || char_count > crate::services::translate_service::GOOGLE_WEB_MAX_TEXT_CHARS
+    {
+        return false;
+    }
+    let current_day = google_web_usage_day();
+    let (stored_day, used_chars) = google_web_usage(conn);
+    let used_chars = (stored_day == current_day)
+        .then_some(used_chars)
+        .unwrap_or(0);
+    used_chars.saturating_add(char_count) <= GOOGLE_WEB_DAILY_CHAR_LIMIT
+}
+
+pub fn record_google_web_translation(conn: &Connection, char_count: usize) -> Result<(), String> {
+    if !google_web_translation_available(conn, char_count) {
+        return Err(format!(
+            "Google 网页翻译已达到本机每日 {} 字符上限",
+            GOOGLE_WEB_DAILY_CHAR_LIMIT
+        ));
+    }
+    let current_day = google_web_usage_day();
+    let (stored_day, used_chars) = google_web_usage(conn);
+    let next_chars = if stored_day == current_day {
+        used_chars.saturating_add(char_count)
+    } else {
+        char_count
+    };
+    set_setting(
+        conn,
+        GOOGLE_WEB_TRANSLATION_USAGE_KEY,
+        &format!("{}:{}", current_day, next_chars),
+    )
+}
+
 pub fn get_reading_profiles(conn: &Connection) -> Vec<ReadingPromptProfile> {
     let raw = get_setting(conn, "reading_prompt_profiles");
     let parsed = raw
@@ -1168,6 +1272,129 @@ mod tests {
         assert_eq!(settings.context_input_tokens, 1_140_000);
         assert_eq!(settings.context_output_tokens, 16_000);
         assert_eq!(settings.tool_call_rounds, 500);
+    }
+
+    #[test]
+    fn translation_route_defaults_off_and_saves_google_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+
+        assert_eq!(
+            get_translation_route_settings(&conn),
+            TranslationRouteSettings::default()
+        );
+        let saved = save_translation_route_settings(
+            &conn,
+            &TranslationRouteSettings {
+                primary_ai_model_id: None,
+                google_web_enabled: true,
+                google_web_first: true,
+            },
+        )
+        .unwrap();
+
+        assert!(saved.google_web_enabled);
+        assert!(saved.google_web_first);
+        assert_eq!(get_translation_route_settings(&conn), saved);
+    }
+
+    #[test]
+    fn translation_route_uses_the_selected_saved_model() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        let mut model = get_provider_settings(&conn, "openai_compatible");
+        model.api_key = "model-key".to_string();
+        model.base_url = "https://example.com/v1".to_string();
+        model.model = "translation-model".to_string();
+        let model = save_ai_model(&conn, &model).unwrap();
+        let model_id = model.config_id.clone().unwrap();
+
+        save_translation_route_settings(
+            &conn,
+            &TranslationRouteSettings {
+                primary_ai_model_id: Some(model_id.clone()),
+                google_web_enabled: true,
+                google_web_first: false,
+            },
+        )
+        .unwrap();
+
+        let (selected, route) = get_translation_settings(&conn);
+        assert_eq!(selected.config_id.as_deref(), Some(model_id.as_str()));
+        assert_eq!(
+            route.primary_ai_model_id.as_deref(),
+            Some(model_id.as_str())
+        );
+    }
+
+    #[test]
+    fn translation_route_can_select_google_as_primary_service() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+
+        let saved = save_translation_route_settings(
+            &conn,
+            &TranslationRouteSettings {
+                primary_ai_model_id: Some(GOOGLE_WEB_TRANSLATION_MODEL_ID.to_string()),
+                google_web_enabled: false,
+                google_web_first: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            saved.primary_ai_model_id.as_deref(),
+            Some(GOOGLE_WEB_TRANSLATION_MODEL_ID)
+        );
+        assert!(saved.google_web_enabled);
+        assert!(saved.google_web_first);
+        let (_, loaded) = get_translation_settings(&conn);
+        assert_eq!(loaded, saved);
+    }
+
+    #[test]
+    fn translation_route_api_payload_uses_camel_case_fields() {
+        let route = TranslationRouteSettings {
+            primary_ai_model_id: Some(GOOGLE_WEB_TRANSLATION_MODEL_ID.to_string()),
+            google_web_enabled: true,
+            google_web_first: true,
+        };
+        let payload = serde_json::to_value(&route).unwrap();
+
+        assert_eq!(
+            payload
+                .get("primaryAiModelId")
+                .and_then(|value| value.as_str()),
+            Some(GOOGLE_WEB_TRANSLATION_MODEL_ID)
+        );
+        assert_eq!(
+            payload
+                .get("googleWebEnabled")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            payload
+                .get("googleWebFirst")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn google_web_usage_enforces_local_daily_limit() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+
+        for _ in 0..(GOOGLE_WEB_DAILY_CHAR_LIMIT / 5_000) {
+            assert!(google_web_translation_available(&conn, 5_000));
+            record_google_web_translation(&conn, 5_000).unwrap();
+        }
+        assert!(!google_web_translation_available(&conn, 1));
     }
 
     #[test]

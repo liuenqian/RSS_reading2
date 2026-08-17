@@ -1,4 +1,4 @@
-use crate::models::{DeepSeekBalance, DeepSeekSettings, TokenUsage};
+use crate::models::{DeepSeekBalance, DeepSeekSettings, TokenUsage, TranslationRouteSettings};
 use crate::services::settings_service;
 use reqwest::Client;
 use reqwest::StatusCode;
@@ -37,6 +37,23 @@ fn balance_client() -> Result<&'static Client, String> {
 pub struct TranslationOutput {
     pub content: String,
     pub usage: TokenUsage,
+}
+
+pub struct RoutedTranslationOutput {
+    pub content: String,
+    pub usage: TokenUsage,
+    pub provider: String,
+    pub model: String,
+}
+
+pub const GOOGLE_WEB_MAX_TEXT_CHARS: usize = 5_000;
+
+fn empty_usage() -> TokenUsage {
+    TokenUsage {
+        prompt_cache_hit_tokens: 0,
+        prompt_cache_miss_tokens: 0,
+        completion_tokens: 0,
+    }
 }
 
 fn parse_openai_usage(v: &Value) -> TokenUsage {
@@ -398,6 +415,129 @@ pub async fn translate_text(
     .await
 }
 
+fn parse_google_web_translation(response_body: &Value) -> Result<String, String> {
+    let segments = response_body
+        .get(0)
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Google 网页翻译返回格式不兼容".to_string())?;
+    let translated = segments
+        .iter()
+        .filter_map(|segment| segment.get(0).and_then(Value::as_str))
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if translated.is_empty() {
+        return Err("Google 网页翻译返回了空结果".to_string());
+    }
+    Ok(translated)
+}
+
+async fn translate_with_google_web(text: &str) -> Result<RoutedTranslationOutput, String> {
+    let char_count = text.chars().count();
+    if char_count == 0 {
+        return Err("没有可翻译的文本".to_string());
+    }
+    if char_count > GOOGLE_WEB_MAX_TEXT_CHARS {
+        return Err(format!(
+            "Google 网页翻译仅用于少量文本，单次最多 {} 字符",
+            GOOGLE_WEB_MAX_TEXT_CHARS
+        ));
+    }
+
+    let response = translation_client()?
+        .get("https://translate.google.com/translate_a/single")
+        .query(&[
+            ("client", "gtx"),
+            ("sl", "auto"),
+            ("tl", "zh-CN"),
+            ("dt", "t"),
+            ("q", text),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("Google 网页翻译请求失败: {}", error))?;
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("Google 网页翻译响应解析失败: {}", error))?;
+    if !status.is_success() {
+        return Err(format!("Google 网页翻译请求失败 ({})", status.as_u16()));
+    }
+
+    Ok(RoutedTranslationOutput {
+        content: parse_google_web_translation(&body)?,
+        usage: empty_usage(),
+        provider: "google_web".to_string(),
+        model: "Google Translate 网页接口（实验性）".to_string(),
+    })
+}
+
+fn routed_primary_output(
+    settings: &DeepSeekSettings,
+    output: TranslationOutput,
+) -> RoutedTranslationOutput {
+    RoutedTranslationOutput {
+        content: output.content,
+        usage: output.usage,
+        provider: settings.provider.clone(),
+        model: settings.model.clone(),
+    }
+}
+
+pub async fn translate_text_with_route(
+    settings: &DeepSeekSettings,
+    route: &TranslationRouteSettings,
+    google_web_available: bool,
+    text: &str,
+) -> Result<RoutedTranslationOutput, String> {
+    let google_enabled = route.google_web_enabled && google_web_available;
+    let primary_ready = !settings.api_key.trim().is_empty();
+
+    if google_enabled && route.google_web_first {
+        match translate_with_google_web(text).await {
+            Ok(output) => return Ok(output),
+            Err(google_error) if primary_ready => match translate_text(settings, text).await {
+                Ok(output) => return Ok(routed_primary_output(settings, output)),
+                Err(primary_error) => {
+                    return Err(format!(
+                        "Google 网页翻译失败：{}；当前 AI 服务也失败：{}",
+                        google_error, primary_error
+                    ));
+                }
+            },
+            Err(google_error) => return Err(google_error),
+        }
+    }
+
+    if primary_ready {
+        match translate_text(settings, text).await {
+            Ok(output) => return Ok(routed_primary_output(settings, output)),
+            Err(primary_error) if google_enabled => match translate_with_google_web(text).await {
+                Ok(output) => return Ok(output),
+                Err(google_error) => {
+                    return Err(format!(
+                        "当前 AI 服务失败：{}；Google 网页翻译也失败：{}",
+                        primary_error, google_error
+                    ));
+                }
+            },
+            Err(primary_error) => return Err(primary_error),
+        }
+    }
+
+    if google_enabled {
+        return translate_with_google_web(text).await;
+    }
+
+    if route.google_web_enabled {
+        return Err(
+            "Google 网页翻译已达到本机每日字符上限，请改用当前 AI 服务或稍后再试".to_string(),
+        );
+    }
+    Err("请先配置 API Key，或在翻译路由中启用 Google 网页翻译备用".to_string())
+}
+
 pub async fn test_connection(settings: &DeepSeekSettings) -> Result<bool, String> {
     complete_with_messages(
         settings,
@@ -467,6 +607,20 @@ pub async fn fetch_balance(settings: &DeepSeekSettings) -> Result<DeepSeekBalanc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_google_web_translation_segments() {
+        let value = serde_json::json!([[
+            ["你好", "hello", null, null, 1],
+            ["世界", "world", null, null, 1]
+        ]]);
+        assert_eq!(parse_google_web_translation(&value).unwrap(), "你好世界");
+    }
+
+    #[test]
+    fn rejects_google_web_translation_without_text() {
+        assert!(parse_google_web_translation(&serde_json::json!([[]])).is_err());
+    }
 
     #[test]
     fn parses_openai_compatible_usage() {

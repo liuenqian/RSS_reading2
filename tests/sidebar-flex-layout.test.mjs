@@ -36,6 +36,30 @@ test('source sidebar sections default collapsed and support manual ordering', ()
   assert.ok(main.indexOf('setupSidebarSectionOrdering();') < main.indexOf('setupSidebarSectionToggles();'));
 });
 
+test('library shortcuts are collected in a persistent collapsible group', () => {
+  assert.match(html, /class="sidebar-overview-section"/);
+  assert.match(html, /data-sidebar-library-toggle/);
+  assert.match(html, /aria-controls="sidebar-overview-list"/);
+  assert.match(html, /id="sidebar-overview-list" class="sidebar-overview"/);
+  assert.match(main, /SIDEBAR_LIBRARY_COLLAPSED_STORAGE_KEY = 'sidebar-library-collapsed-v1'/);
+  assert.match(main, /function setSidebarLibraryCollapsed\(collapsed/);
+  assert.match(main, /localStorage\.getItem\(SIDEBAR_LIBRARY_COLLAPSED_STORAGE_KEY\) === '1'/);
+  assert.match(main, /setupSidebarLibraryToggle\(\);/);
+  assert.match(styles, /\.sidebar-overview\[hidden\]\s*\{\s*display:\s*none;/);
+});
+
+test('PubMed searches support persistent drag reordering', () => {
+  assert.match(main, /PUBMED_SEARCH_ORDER_STORAGE_KEY = 'pubmed-search-order-v1'/);
+  assert.match(main, /function applyPubmedSearchOrder\(\)/);
+  assert.match(main, /function savePubmedSearchOrder\(\)/);
+  assert.match(main, /function setupPubmedSearchOrdering\(\)/);
+  assert.match(main, /data-pubmed-search-drag-handle/);
+  assert.match(main, /handle\.addEventListener\('pointerdown'/);
+  assert.match(main, /handle\.addEventListener\('keydown'/);
+  assert.match(main, /movePubmedSearch\(handle\.dataset\.pubmedSearchDragHandle/);
+  assert.match(styles, /\.pubmed-search-drag-handle\s*\{[\s\S]*touch-action:\s*none/);
+});
+
 test('monthly AI usage remains the final fixed sidebar block', () => {
   const sourceSections = html.indexOf('class="sidebar-source-sections"');
   const globalStatus = html.indexOf('id="global-status"');

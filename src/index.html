@@ -1026,6 +1026,50 @@
                             <p id="ai-model-status" class="settings-status ai-model-manager-status"></p>
                         </div>
 
+                        <div class="settings-card" id="translation-route-card">
+                            <div class="settings-card-header">
+                                翻译路由
+                                <div class="settings-card-subtitle">
+                                    只影响文献标题和摘要，不影响简报、论文问答等 AI 功能。
+                                </div>
+                            </div>
+                            <div class="settings-card-body">
+                                <div class="settings-row">
+                                    <label class="srow-label" for="translation-primary-ai-model">翻译主服务</label>
+                                    <select id="translation-primary-ai-model" class="settings-input">
+                                        <option value="">当前 AI 模型</option>
+                                    </select>
+                                    <div class="srow-hint">
+                                        可直接选择 Google 网页翻译，或选择固定 AI 模型；只影响文献标题和摘要翻译。
+                                    </div>
+                                </div>
+                                <div class="settings-row">
+                                    <label class="srow-label" for="google-web-translation-enabled">Google 网页翻译（实验性）</label>
+                                    <label class="checkbox-label">
+                                        <input id="google-web-translation-enabled" type="checkbox" />
+                                        启用少量翻译备用
+                                    </label>
+                                    <div class="srow-hint">
+                                        不需要 API Key；非官方接口，单次最多 5,000 字符，本机每日最多 20,000 字符。翻译文本会发送给 Google。选择上方 Google 主服务后会自动启用。
+                                    </div>
+                                </div>
+                                <div class="settings-row">
+                                    <label class="srow-label" for="translation-route-order">服务顺序</label>
+                                    <select id="translation-route-order" class="settings-input">
+                                        <option value="ai-first">当前 AI 服务优先，失败后尝试 Google</option>
+                                        <option value="google-first">Google 优先，失败后使用当前 AI 服务</option>
+                                    </select>
+                                    <div class="srow-hint">
+                                        只在网络、限流、空响应或服务错误时切换；已有翻译缓存不会被覆盖。
+                                    </div>
+                                </div>
+                                <div class="settings-action-bar settings-action-bar-inline">
+                                    <p id="translation-route-status" class="settings-status"></p>
+                                    <button type="button" id="btn-save-translation-route" class="btn btn-secondary">保存翻译路由</button>
+                                </div>
+                            </div>
+                        </div>
+
                         <div class="settings-card hidden" id="ai-model-editor">
                             <div class="settings-card-header" id="ai-model-editor-title">编辑模型</div>
                             <div class="settings-card-body">
@@ -2185,8 +2229,22 @@
                         </div>
                     </div>
 
-                    <!-- Overview rows -->
-                    <div class="sidebar-overview">
+                    <!-- Library shortcuts -->
+                    <section class="sidebar-overview-section">
+                        <div class="feed-section-label sidebar-overview-label">
+                            <button
+                                class="sidebar-section-toggle"
+                                type="button"
+                                data-sidebar-library-toggle
+                                aria-expanded="true"
+                                aria-controls="sidebar-overview-list"
+                                title="折叠文献库"
+                            >
+                                <svg class="sidebar-section-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
+                                <span>文献库</span>
+                            </button>
+                        </div>
+                        <div id="sidebar-overview-list" class="sidebar-overview">
                         <div class="sidebar-row" data-view="all">
                             <span class="sidebar-row-icon">
                                 <svg
@@ -2356,7 +2414,8 @@
                             <span class="sidebar-row-label">保留文献</span>
                             <span class="sidebar-row-count" id="count-kept"></span>
                         </div>
-                    </div>
+                        </div>
+                    </section>
 
                     <div class="sidebar-source-sections" data-sidebar-source-sections>
                         <section class="sidebar-source-section sci-review-sidebar-section" data-sidebar-source-section="sci-review">
@@ -2632,6 +2691,16 @@
                                         <option value="na">无 Top 数据</option>
                                     </select>
                                     <select
+                                        id="translation-quality-filter"
+                                        class="settings-select compact"
+                                        aria-label="翻译质检筛选"
+                                    >
+                                        <option value="all">翻译质检：全部</option>
+                                        <option value="risk">仅高风险译文</option>
+                                        <option value="title-risk">标题高风险</option>
+                                        <option value="summary-risk">摘要高风险</option>
+                                    </select>
+                                    <select
                                         id="pubmed-star-filter"
                                         class="settings-select compact pubmed-only-filter"
                                     >
@@ -2768,6 +2837,14 @@
                                     type="button"
                                 >
                                     批量笔记
+                                </button>
+                                <button
+                                    id="btn-entry-bulk-retranslate-risk"
+                                    class="btn btn-secondary btn-sm hidden"
+                                    type="button"
+                                    title="清除所选高风险翻译缓存后重新翻译"
+                                >
+                                    重译风险译文
                                 </button>
                                 <select id="pubmed-bulk-status" class="settings-select compact hidden">
                                     <option value="">设置筛选状态</option>
@@ -3299,7 +3376,7 @@
                                                             d="M13.5 2.6V5.2H10.9"
                                                         />
                                                     </svg>
-                                                    重新翻译
+                                                    清除后重新翻译
                                                 </button>
                                             </div>
                                             <div
