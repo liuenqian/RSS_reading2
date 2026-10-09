@@ -51,7 +51,7 @@ test('library shortcuts are collected in a persistent collapsible group', () => 
 test('PubMed searches support persistent drag reordering', () => {
   assert.match(main, /PUBMED_SEARCH_ORDER_STORAGE_KEY = 'pubmed-search-order-v1'/);
   assert.match(main, /function applyPubmedSearchOrder\(\)/);
-  assert.match(main, /function savePubmedSearchOrder\(\)/);
+  assert.match(main, /function savePubmedSearchOrder\(/);
   assert.match(main, /function setupPubmedSearchOrdering\(\)/);
   assert.match(main, /data-pubmed-search-drag-handle/);
   assert.match(main, /handle\.addEventListener\('pointerdown'/);

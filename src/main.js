@@ -3315,31 +3315,57 @@ function loadSidebarSourceSectionOrder() {
   }
 }
 
-function applyPubmedSearchOrder() {
-  const savedOrder = (() => {
-    try {
-      const value = JSON.parse(localStorage.getItem(PUBMED_SEARCH_ORDER_STORAGE_KEY) || '[]');
-      return Array.isArray(value) ? value.map(Number).filter(Number.isFinite) : [];
-    } catch {
-      return [];
-    }
-  })();
-  const position = new Map(savedOrder.map((id, index) => [id, index]));
+function readPubmedSearchOrder() {
+  try {
+    const value = JSON.parse(localStorage.getItem(PUBMED_SEARCH_ORDER_STORAGE_KEY) || '[]');
+    return Array.isArray(value) ? value.map(Number).filter(Number.isFinite) : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePubmedSearchOrder(order = allPubmedSearches.map(search => Number(search.id))) {
+  localStorage.setItem(
+    PUBMED_SEARCH_ORDER_STORAGE_KEY,
+    JSON.stringify(order.map(Number).filter(Number.isFinite)),
+  );
+}
+
+function syncPubmedSearchOrderFromDom(items) {
+  const order = items
+    .map(item => Number(item.dataset.searchId))
+    .filter(Number.isFinite);
+  const position = new Map(order.map((id, index) => [id, index]));
   allPubmedSearches.sort((left, right) => {
     const leftPosition = position.get(Number(left.id));
     const rightPosition = position.get(Number(right.id));
-    if (leftPosition === undefined && rightPosition === undefined) return 0;
-    if (leftPosition === undefined) return -1;
-    if (rightPosition === undefined) return 1;
-    return leftPosition - rightPosition;
+    return (leftPosition ?? Number.MAX_SAFE_INTEGER) - (rightPosition ?? Number.MAX_SAFE_INTEGER);
   });
+  savePubmedSearchOrder(order);
 }
 
-function savePubmedSearchOrder() {
-  localStorage.setItem(
-    PUBMED_SEARCH_ORDER_STORAGE_KEY,
-    JSON.stringify(allPubmedSearches.map(search => Number(search.id)).filter(Number.isFinite)),
-  );
+function applyPubmedSearchOrder() {
+  const savedOrder = readPubmedSearchOrder();
+  const currentIds = allPubmedSearches
+    .map(search => Number(search.id))
+    .filter(Number.isFinite);
+  const savedIds = new Set(savedOrder);
+  const currentIdsSet = new Set(currentIds);
+  // New searches keep the backend's creation order and are placed above the
+  // user's saved order. Saving the merged list makes this migration durable.
+  const mergedOrder = [
+    ...currentIds.filter(id => !savedIds.has(id)),
+    ...savedOrder.filter(id => currentIdsSet.has(id)),
+  ];
+  const position = new Map(mergedOrder.map((id, index) => [id, index]));
+  allPubmedSearches.sort((left, right) => {
+    const leftPosition = position.get(Number(left.id));
+    const rightPosition = position.get(Number(right.id));
+    return (leftPosition ?? Number.MAX_SAFE_INTEGER) - (rightPosition ?? Number.MAX_SAFE_INTEGER);
+  });
+  if (JSON.stringify(savedOrder) !== JSON.stringify(mergedOrder)) {
+    savePubmedSearchOrder(mergedOrder);
+  }
 }
 
 function movePubmedSearch(searchId, direction) {
@@ -5819,10 +5845,7 @@ function setupPubmedSearchOrdering() {
     draggedItem?.classList.remove('is-dragging');
     activeHandle?.releasePointerCapture?.(activePointerId);
     if (draggedItem) {
-      const order = items().map(item => Number(item.dataset.searchId)).filter(Number.isFinite);
-      const position = new Map(order.map((id, index) => [id, index]));
-      allPubmedSearches.sort((left, right) => position.get(Number(left.id)) - position.get(Number(right.id)));
-      savePubmedSearchOrder();
+      syncPubmedSearchOrderFromDom(items());
       renderPubmedSearchList();
     }
     draggedItem = null;
@@ -5857,7 +5880,13 @@ function setupPubmedSearchOrdering() {
       target.classList.toggle('is-drag-over-before', before);
       target.classList.toggle('is-drag-over-after', !before);
       const next = before ? target : target.nextSibling;
-      if (next !== draggedItem) pubmedSearchListEl.insertBefore(draggedItem, next);
+      if (next !== draggedItem) {
+        pubmedSearchListEl.insertBefore(draggedItem, next);
+        // Persist during the gesture as well as on pointerup. This prevents a
+        // subsequent row click or a transient list refresh from restoring the
+        // pre-drag order when WebKit misses the final pointer event.
+        syncPubmedSearchOrderFromDom(items());
+      }
     });
     handle.addEventListener('pointerup', event => {
       if (activePointerId !== event.pointerId) return;

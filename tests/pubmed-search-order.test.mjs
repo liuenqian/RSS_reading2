@@ -19,7 +19,7 @@ function orderHarness(newestFirstIds, savedOrder = null) {
     renderPubmedSearchList() {},
   };
   vm.createContext(context);
-  for (const name of ['applyPubmedSearchOrder', 'savePubmedSearchOrder', 'movePubmedSearch']) {
+  for (const name of ['readPubmedSearchOrder', 'applyPubmedSearchOrder', 'savePubmedSearchOrder', 'movePubmedSearch']) {
     const start = source.indexOf(`function ${name}(`);
     assert.ok(start >= 0, `missing function ${name}`);
     const end = source.indexOf('\n}\n', start);
@@ -36,13 +36,29 @@ test('without manual order, keeps the backend creation order with newest searche
   const harness = orderHarness([4, 3, 2, 1]);
   harness.context.applyPubmedSearchOrder();
   assert.deepEqual(harness.ids(), [4, 3, 2, 1]);
-  assert.equal(harness.saved(), undefined);
+  assert.deepEqual(JSON.parse(harness.saved()), [4, 3, 2, 1]);
 });
 
 test('new searches go above the saved manual order and keep their creation order', () => {
   const harness = orderHarness([5, 4, 3, 2, 1], '[2,1,3]');
   harness.context.applyPubmedSearchOrder();
   assert.deepEqual(harness.ids(), [5, 4, 2, 1, 3]);
+  assert.deepEqual(JSON.parse(harness.saved()), [5, 4, 2, 1, 3]);
+});
+
+test('a legacy order missing new searches is migrated before a selection refresh', () => {
+  const harness = orderHarness([42, 41, 40, 39, 38], '[40,39,38]');
+  harness.context.applyPubmedSearchOrder();
+  assert.deepEqual(harness.ids(), [42, 41, 40, 39, 38]);
+  assert.deepEqual(JSON.parse(harness.saved()), [42, 41, 40, 39, 38]);
+
+  // Selecting a row can reload the list from the backend. The migrated order
+  // must keep a manual move at the top after that reload.
+  harness.context.movePubmedSearch(41, -1);
+  assert.deepEqual(harness.ids(), [41, 42, 40, 39, 38]);
+  harness.context.allPubmedSearches = [42, 41, 40, 39, 38].map(id => ({ id }));
+  harness.context.applyPubmedSearchOrder();
+  assert.deepEqual(harness.ids(), [41, 42, 40, 39, 38]);
 });
 
 test('manual moves persist across reloads and the next new search still goes first', () => {
