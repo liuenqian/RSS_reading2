@@ -621,6 +621,16 @@ pub struct PubmedSearchProgress {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeepSeekSettings {
     #[serde(default)]
@@ -634,6 +644,8 @@ pub struct DeepSeekSettings {
     pub model: String,
     #[serde(default)]
     pub model_display_name: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default = "default_context_input_tokens")]
     pub context_input_tokens: i64,
     #[serde(default = "default_context_output_tokens")]
@@ -653,6 +665,8 @@ pub struct TranslationRouteSettings {
     pub google_web_enabled: bool,
     #[serde(default)]
     pub google_web_first: bool,
+    #[serde(default)]
+    pub google_web_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -93,13 +93,13 @@
                         <div class="cost-meter toolbar-cost-meter" id="cost-meter">
                             <div class="cost-meter-top">
                                 <span>本月 AI 用量</span>
-                                <span class="cost-meter-value" id="cost-value">¥ 0.00</span>
+                                <span class="cost-meter-value" id="cost-value">加载中…</span>
                             </div>
                             <div class="cost-meter-bar">
                                 <div class="cost-meter-fill" id="cost-fill"></div>
                             </div>
                             <div class="cost-meter-bot">
-                                <span id="cost-chars">0 tokens</span>
+                                <span id="cost-chars">— tokens</span>
                                 <span class="cost-meter-model" id="cost-model">deepseek-v4</span>
                             </div>
                         </div>
@@ -1047,7 +1047,7 @@
                                     <label class="srow-label" for="google-web-translation-enabled">Google 网页翻译（实验性）</label>
                                     <label class="checkbox-label">
                                         <input id="google-web-translation-enabled" type="checkbox" />
-                                        启用少量翻译备用
+                                        启用 Google 网页翻译
                                     </label>
                                     <div class="srow-hint">
                                         不需要 API Key；非官方接口，单次最多 5,000 字符，本机每日最多 20,000 字符。翻译文本会发送给 Google。选择上方 Google 主服务后会自动启用。
@@ -1058,9 +1058,10 @@
                                     <select id="translation-route-order" class="settings-input">
                                         <option value="ai-first">当前 AI 服务优先，失败后尝试 Google</option>
                                         <option value="google-first">Google 优先，失败后使用当前 AI 服务</option>
+                                        <option value="google-only">仅用 Google，失败就提示</option>
                                     </select>
                                     <div class="srow-hint">
-                                        只在网络、限流、空响应或服务错误时切换；已有翻译缓存不会被覆盖。
+                                        选择“仅用 Google”后，失败或超限只提示，不会切换到 AI；已有翻译缓存不会被覆盖。
                                     </div>
                                 </div>
                                 <div class="settings-action-bar settings-action-bar-inline">
@@ -1215,6 +1216,18 @@
                                                 />
                                                 <span id="model-display-name-count" class="input-counter">0/32</span>
                                             </div>
+                                        </div>
+                                        <div class="settings-row">
+                                            <label class="srow-label" for="reasoning-effort">思考等级</label>
+                                            <select id="reasoning-effort" class="settings-input" aria-describedby="reasoning-effort-hint">
+                                                <option value="">服务端默认</option>
+                                                <option value="low">低</option>
+                                                <option value="medium">中</option>
+                                                <option value="high">高</option>
+                                                <option value="xhigh">很高</option>
+                                                <option value="max">最高</option>
+                                            </select>
+                                            <div id="reasoning-effort-hint" class="srow-hint">仅适用于支持思考等级的 OpenAI 或自定义兼容接口。等级越高通常耗时更长、用量更多；具体支持范围由服务商和模型决定。</div>
                                         </div>
                                         <div class="settings-row">
                                             <span class="srow-label">上下文窗口</span>

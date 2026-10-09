@@ -1741,6 +1741,7 @@ let toolbarSubtitle, toolbarApiPicker, toolbarApiButton, toolbarApiLabel;
 let toolbarApiMenu, toolbarApiList, btnManageAiModels;
 let providerSelect, apiKeyInput, baseUrlInput, modelInput, modelPresetSelect, customModelInput, systemPromptInput;
 let modelDisplayNameInput, modelDisplayNameCount, contextInputTokensInput, contextOutputTokensInput, toolCallRoundsInput;
+let reasoningEffortSelect;
 let btnApiModeProvider, btnApiModeCustom, apiProviderPanel, apiCustomPanel;
 let btnToggleApiKey, btnTest, btnSaveSettings, btnSaveGeneral;
 let aiModelList, aiModelEmpty, aiModelEditor, aiModelEditorTitle, aiModelStatus;
@@ -2350,6 +2351,7 @@ function setupWindowDragFallback() {
 // stays as a no-op so existing call sites continue to compile cleanly while
 // the real number streams in via the event listener below.
 let currentCostSummary = null;
+let costSummaryLoadFailed = false;
 function addTranslationCost() { /* no-op: backend handles accounting */ }
 
 // Format CNY adaptively. The old localStorage estimate over-counted by ~3×
@@ -2368,21 +2370,23 @@ function updateCostMeter() {
   if (!el('cost-value')) return;
   const summary = currentCostSummary;
   const total = summary?.total_cny;
-  const tokens = (summary?.breakdown || []).reduce((acc, row) =>
+  const breakdown = summary?.breakdown || [];
+  const tokens = breakdown.reduce((acc, row) =>
     acc + row.prompt_cache_hit_tokens + row.prompt_cache_miss_tokens + row.completion_tokens,
   0);
-  el('cost-value').textContent = total == null ? '未计价' : formatCny(total);
+  el('cost-value').textContent = !summary
+    ? (costSummaryLoadFailed ? '加载失败' : '加载中…')
+    : (total == null ? '缺少价格' : formatCny(total));
   // Tokens accumulate visibly with every translation — much more responsive
   // than the ¥ value for tracking "did my translations register". For
   // Chinese output, one token ≈ one Chinese character, so the count also
   // reads naturally to the user.
-  el('cost-chars').textContent = `${tokens.toLocaleString()} tokens`;
+  el('cost-chars').textContent = summary ? `${tokens.toLocaleString()} tokens` : '— tokens';
   // The progress bar is now scaled against a 20 ¥/month soft cap — a
   // reasonable monthly budget for a heavy reader. Adjust if needed; this
   // ratio is presentation-only and doesn't affect billing.
   const pct = total == null ? 0 : Math.min(100, total / 20 * 100);
   el('cost-fill').style.width = pct + '%';
-  const breakdown = summary?.breakdown || [];
   const activeProvider = activeProviderId();
   const activeMeta = AI_PROVIDER_META[activeProvider] || AI_PROVIDER_META.deepseek;
   const costModel = el('cost-model');
@@ -2395,25 +2399,36 @@ function updateCostMeter() {
   // (cache hit/miss/output tokens per model).
   const meter = document.getElementById('cost-meter');
   if (meter) {
-    if (breakdown.length === 0) {
-      meter.title = '本月暂无翻译用量';
+    if (!summary) {
+      meter.title = costSummaryLoadFailed ? '本月用量加载失败，请稍后重试' : '正在加载本月用量';
+    } else if (breakdown.length === 0) {
+      meter.title = '本月暂无 AI 用量';
     } else {
       meter.title = breakdown
         .map(b =>
           `${AI_PROVIDER_META[b.provider]?.label || b.provider} · ${b.model}: 缓存输入 ${b.prompt_cache_hit_tokens.toLocaleString()} · `
           + `非缓存输入 ${b.prompt_cache_miss_tokens.toLocaleString()} · `
           + `输出 ${b.completion_tokens.toLocaleString()}`
-          + (b.cny == null ? ' · 未计价' : ` = ${formatCny(b.cny)}`)
+          + (b.cny == null ? ' · 缺少该服务的模型价格' : ` = ${formatCny(b.cny)}`)
         )
         .join('\n');
+      if (total == null) {
+        meter.title += '\n部分模型缺少价格信息，无法计算本月总额；不代表未扣费，请以服务商账单为准。';
+      }
+    }
+    if (summary && costSummaryLoadFailed) {
+      meter.title += '\n用量刷新失败，当前显示上次统计。';
     }
   }
 }
 async function loadCostSummary() {
   try {
     currentCostSummary = await invoke('get_cost_summary');
+    costSummaryLoadFailed = false;
     updateCostMeter();
   } catch (e) {
+    costSummaryLoadFailed = true;
+    updateCostMeter();
     console.warn('get_cost_summary failed:', e);
   }
 }
@@ -2422,6 +2437,7 @@ function setupCostEvents() {
   if (!event?.listen) return;
   event.listen('cost-updated', (e) => {
     currentCostSummary = e.payload;
+    costSummaryLoadFailed = false;
     updateCostMeter();
   });
 }
@@ -2565,6 +2581,7 @@ function selectApiConfigMode(mode) {
 
 function syncProviderUi() {
   const provider = activeProviderId();
+  syncReasoningEffortControls();
   const meta = AI_PROVIDER_META[provider] || AI_PROVIDER_META.deepseek;
   if (baseUrlInput) baseUrlInput.placeholder = meta.baseUrl;
   if (customModelInput) customModelInput.placeholder = meta.model;
@@ -2594,6 +2611,13 @@ function syncProviderUi() {
   updateCostMeter();
 }
 
+function syncReasoningEffortControls() {
+  if (!reasoningEffortSelect) return;
+  const supported = ['openai', 'openai_compatible'].includes(activeProviderId());
+  reasoningEffortSelect.disabled = !supported;
+  if (!supported) reasoningEffortSelect.value = '';
+}
+
 function applyProviderSettings(settings, { includeGlobal = false } = {}) {
   const displayProvider = displayProviderId(settings);
   if (providerSelect) providerSelect.value = displayProvider;
@@ -2602,6 +2626,7 @@ function applyProviderSettings(settings, { includeGlobal = false } = {}) {
   baseUrlInput.value = settings.base_url || '';
   modelInput.value = settings.model || '';
   modelDisplayNameInput.value = settings.model_display_name || '';
+  reasoningEffortSelect.value = settings.reasoning_effort || '';
   contextInputTokensInput.value = String(settings.context_input_tokens || 1140000);
   contextOutputTokensInput.value = String(settings.context_output_tokens || 16000);
   toolCallRoundsInput.value = String(settings.tool_call_rounds || 500);
@@ -2702,6 +2727,7 @@ async function beginAddAiModel() {
   baseUrlInput.value = SENSENOVA_PRESET.baseUrl;
   modelInput.value = SENSENOVA_PRESET.model;
   modelDisplayNameInput.value = '';
+  reasoningEffortSelect.value = '';
   contextInputTokensInput.value = '1140000';
   contextOutputTokensInput.value = '16000';
   toolCallRoundsInput.value = '500';
@@ -2843,6 +2869,7 @@ function collectAiSettings() {
     base_url: baseUrlInput.value.trim(),
     model: modelInput.value.trim(),
     model_display_name: modelDisplayNameInput.value.trim(),
+    reasoning_effort: reasoningEffortSelect.disabled ? null : reasoningEffortSelect.value || null,
     context_input_tokens: positiveIntegerValue(contextInputTokensInput, 1140000),
     context_output_tokens: positiveIntegerValue(contextOutputTokensInput, 16000),
     tool_call_rounds: positiveIntegerValue(toolCallRoundsInput, 500),
@@ -2879,6 +2906,7 @@ function translationPrimaryServiceLabel(modelId) {
 }
 
 function describeTranslationRoute(route) {
+  if (route.googleWebOnly) return '已生效：仅用 Google 网页翻译；失败或超限只提示，不会调用 AI API';
   const primary = translationPrimaryServiceLabel(route.primaryAiModelId);
   if (!route.googleWebEnabled) return `已生效：${primary}；Google 未启用`;
   if (route.googleWebFirst) {
@@ -2888,6 +2916,11 @@ function describeTranslationRoute(route) {
     return `已生效：Google 网页翻译优先；失败后使用 ${fallback}`;
   }
   return `已生效：${primary} 优先；Google 网页翻译备用`;
+}
+
+function translationRouteOrderValue(route) {
+  if (route.googleWebOnly) return 'google-only';
+  return route.googleWebFirst ? 'google-first' : 'ai-first';
 }
 
 function renderTranslationPrimaryModelOptions(selectedId = '') {
@@ -2913,7 +2946,9 @@ function syncTranslationPrimarySelection() {
   const googlePrimary = translationPrimaryAiModel?.value === GOOGLE_WEB_TRANSLATION_MODEL_ID;
   if (googlePrimary) {
     if (googleWebTranslationEnabled) googleWebTranslationEnabled.checked = true;
-    if (translationRouteOrder) translationRouteOrder.value = 'google-first';
+    if (translationRouteOrder && translationRouteOrder.value !== 'google-only') {
+      translationRouteOrder.value = 'google-first';
+    }
   }
   syncTranslationRouteControls();
 }
@@ -2929,7 +2964,7 @@ async function loadTranslationRouteSettings() {
     const route = await invoke('get_translation_route_settings');
     renderTranslationPrimaryModelOptions(route.primaryAiModelId || '');
     if (googleWebTranslationEnabled) googleWebTranslationEnabled.checked = !!route.googleWebEnabled;
-    if (translationRouteOrder) translationRouteOrder.value = route.googleWebFirst ? 'google-first' : 'ai-first';
+    if (translationRouteOrder) translationRouteOrder.value = translationRouteOrderValue(route);
     syncTranslationRouteControls();
     setTranslationRouteStatus(describeTranslationRoute(route), 'success');
   } catch (error) {
@@ -2939,17 +2974,20 @@ async function loadTranslationRouteSettings() {
 
 async function saveTranslationRouteSettings() {
   const googlePrimary = translationPrimaryAiModel?.value === GOOGLE_WEB_TRANSLATION_MODEL_ID;
+  const googleEnabled = googlePrimary || !!googleWebTranslationEnabled?.checked;
+  const googleOnly = googleEnabled && translationRouteOrder?.value === 'google-only';
   const settings = {
     primaryAiModelId: translationPrimaryAiModel?.value || null,
-    googleWebEnabled: googlePrimary || !!googleWebTranslationEnabled?.checked,
-    googleWebFirst: googlePrimary || translationRouteOrder?.value === 'google-first',
+    googleWebEnabled: googleEnabled,
+    googleWebFirst: googleOnly || googlePrimary || translationRouteOrder?.value === 'google-first',
+    googleWebOnly: googleOnly,
   };
   btnSaveTranslationRoute.disabled = true;
   try {
     const saved = await invoke('save_translation_route_settings', { settings });
     renderTranslationPrimaryModelOptions(saved.primaryAiModelId || '');
     if (googleWebTranslationEnabled) googleWebTranslationEnabled.checked = !!saved.googleWebEnabled;
-    if (translationRouteOrder) translationRouteOrder.value = saved.googleWebFirst ? 'google-first' : 'ai-first';
+    if (translationRouteOrder) translationRouteOrder.value = translationRouteOrderValue(saved);
     syncTranslationRouteControls();
     setTranslationRouteStatus(describeTranslationRoute(saved), 'success');
   } catch (error) {
@@ -3291,8 +3329,8 @@ function applyPubmedSearchOrder() {
     const leftPosition = position.get(Number(left.id));
     const rightPosition = position.get(Number(right.id));
     if (leftPosition === undefined && rightPosition === undefined) return 0;
-    if (leftPosition === undefined) return 1;
-    if (rightPosition === undefined) return -1;
+    if (leftPosition === undefined) return -1;
+    if (rightPosition === undefined) return 1;
     return leftPosition - rightPosition;
   });
 }
@@ -8350,7 +8388,7 @@ async function translateEntries(entries, field, contextLabel = '') {
     .join('；');
   const suffix = failures.length > 3 ? ` 等 ${failures.length} 篇` : '';
   setGlobalStatus(
-    `${contextPrefix}${fieldLabel}翻译完成：翻译 ${translatedCount} 篇，跳过 ${skippedCount} 篇，失败 ${failures.length} 篇。${preview}${suffix}`,
+    `${contextPrefix}${fieldLabel}翻译完成：翻译 ${translatedCount} 篇，跳过 ${skippedCount} 篇，失败 ${failures.length} 篇。首个错误：${failures[0].message}。${preview}${suffix}`,
     'error',
   );
 }
@@ -16349,6 +16387,7 @@ window.addEventListener('DOMContentLoaded', () => {
   customModelInput  = document.getElementById('custom-model');
   modelDisplayNameInput = document.getElementById('model-display-name');
   modelDisplayNameCount = document.getElementById('model-display-name-count');
+  reasoningEffortSelect = document.getElementById('reasoning-effort');
   contextInputTokensInput = document.getElementById('context-input-tokens');
   contextOutputTokensInput = document.getElementById('context-output-tokens');
   toolCallRoundsInput = document.getElementById('tool-call-rounds');

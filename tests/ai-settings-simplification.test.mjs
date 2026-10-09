@@ -35,6 +35,7 @@ test('AI settings keep required fields visible and advanced controls grouped', (
     'custom-model',
     'model-display-name',
     'model-display-name-count',
+    'reasoning-effort',
     'context-input-tokens',
     'context-output-tokens',
     'tool-call-rounds',

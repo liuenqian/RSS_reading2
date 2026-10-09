@@ -964,6 +964,8 @@ pub fn get_provider_settings(conn: &Connection, provider: &str) -> DeepSeekSetti
         )
         .map(|value| sanitized_model_display_name(&value))
         .unwrap_or_default(),
+        reasoning_effort: get_setting(conn, &provider_setting_key(&provider, "reasoning_effort"))
+            .and_then(|value| serde_json::from_str(&value).ok()),
         context_input_tokens: positive_provider_setting(
             conn,
             &provider,
@@ -990,7 +992,22 @@ pub fn get_provider_settings(conn: &Connection, provider: &str) -> DeepSeekSetti
     }
 }
 
+pub fn validate_reasoning_effort(settings: &DeepSeekSettings) -> Result<(), String> {
+    if settings.reasoning_effort.is_some()
+        && !matches!(
+            normalize_provider_id(&settings.provider),
+            "openai" | "openai_compatible"
+        )
+    {
+        return Err(
+            "思考等级目前仅支持 OpenAI 和自定义 OpenAI 兼容接口，请选择服务端默认".to_string(),
+        );
+    }
+    Ok(())
+}
+
 pub fn save_settings(conn: &Connection, settings: &DeepSeekSettings) -> Result<(), String> {
+    validate_reasoning_effort(settings)?;
     let provider = normalize_provider_id(&settings.provider);
     set_setting(conn, "active_ai_provider", provider)?;
     set_setting(
@@ -1012,6 +1029,12 @@ pub fn save_settings(conn: &Connection, settings: &DeepSeekSettings) -> Result<(
         conn,
         &provider_setting_key(provider, "model_display_name"),
         &sanitized_model_display_name(&settings.model_display_name),
+    )?;
+    set_setting(
+        conn,
+        &provider_setting_key(provider, "reasoning_effort"),
+        &serde_json::to_string(&settings.reasoning_effort)
+            .map_err(|error| format!("序列化思考等级失败: {}", error))?,
     )?;
     set_setting(
         conn,
@@ -1064,9 +1087,12 @@ pub fn save_translation_route_settings(
             })
             .map(ToOwned::to_owned),
         google_web_enabled: settings.google_web_enabled
+            || settings.google_web_only
             || settings.primary_ai_model_id.as_deref() == Some(GOOGLE_WEB_TRANSLATION_MODEL_ID),
         google_web_first: (settings.google_web_enabled && settings.google_web_first)
+            || settings.google_web_only
             || settings.primary_ai_model_id.as_deref() == Some(GOOGLE_WEB_TRANSLATION_MODEL_ID),
+        google_web_only: settings.google_web_only,
     };
     let value = serde_json::to_string(&sanitized)
         .map_err(|error| format!("序列化翻译路由设置失败: {}", error))?;
@@ -1214,6 +1240,97 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_settings_round_trip_and_reset_without_affecting_other_providers() {
+        use crate::models::ReasoningEffort;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        let mut settings = get_provider_settings(&conn, "openai_compatible");
+        assert_eq!(settings.reasoning_effort, None);
+        settings.reasoning_effort = Some(ReasoningEffort::Xhigh);
+        save_settings(&conn, &settings).unwrap();
+        assert_eq!(
+            get_provider_settings(&conn, "openai_compatible").reasoning_effort,
+            Some(ReasoningEffort::Xhigh)
+        );
+        assert_eq!(
+            get_provider_settings(&conn, "openai").reasoning_effort,
+            None
+        );
+        settings.reasoning_effort = None;
+        save_settings(&conn, &settings).unwrap();
+        assert_eq!(
+            get_provider_settings(&conn, "openai_compatible").reasoning_effort,
+            None
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_stays_with_each_saved_model_and_translation_route() {
+        use crate::models::ReasoningEffort;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        let mut first = get_provider_settings(&conn, "openai_compatible");
+        first.base_url = "https://example.com/v1".to_string();
+        first.model = "gpt-6.1-sol".to_string();
+        first.reasoning_effort = Some(ReasoningEffort::Low);
+        let first = save_ai_model(&conn, &first).unwrap();
+        let mut second = first.clone();
+        second.config_id = None;
+        second.reasoning_effort = Some(ReasoningEffort::High);
+        let second = save_ai_model(&conn, &second).unwrap();
+        assert_eq!(
+            get_settings(&conn).reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+        activate_ai_model(&conn, first.config_id.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            get_settings(&conn).reasoning_effort,
+            Some(ReasoningEffort::Low)
+        );
+        save_translation_route_settings(
+            &conn,
+            &TranslationRouteSettings {
+                primary_ai_model_id: second.config_id.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            get_translation_settings(&conn).0.reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+
+        let mut legacy_json = serde_json::to_value(vec![first.clone()]).unwrap();
+        legacy_json[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoning_effort");
+        set_setting(&conn, AI_MODEL_CONFIGS_KEY, &legacy_json.to_string()).unwrap();
+        assert_eq!(
+            get_ai_model(&conn, first.config_id.as_deref().unwrap())
+                .unwrap()
+                .reasoning_effort,
+            None
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_validation_does_not_write_invalid_settings() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        let mut settings = get_provider_settings(&conn, "deepseek");
+        settings.reasoning_effort = Some(crate::models::ReasoningEffort::High);
+        assert!(save_ai_model(&conn, &settings)
+            .unwrap_err()
+            .contains("思考等级目前仅支持"));
+        assert_eq!(get_setting(&conn, AI_MODEL_CONFIGS_KEY), None);
+        assert_eq!(get_setting(&conn, "active_ai_provider"), None);
+    }
+
+    #[test]
     fn provider_settings_are_stored_independently() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
@@ -1275,6 +1392,45 @@ mod tests {
     }
 
     #[test]
+    fn translation_route_google_only_round_trips_and_enables_google() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        let saved = save_translation_route_settings(
+            &conn,
+            &TranslationRouteSettings {
+                google_web_only: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(saved.google_web_only);
+        assert!(saved.google_web_enabled);
+        assert!(saved.google_web_first);
+        assert_eq!(get_translation_route_settings(&conn), saved);
+        assert_eq!(serde_json::to_value(&saved).unwrap()["googleWebOnly"], true);
+
+        let mut fallback = saved;
+        fallback.google_web_only = false;
+        let saved = save_translation_route_settings(&conn, &fallback).unwrap();
+        assert!(!saved.google_web_only);
+        assert!(saved.google_web_first);
+        assert_eq!(get_translation_route_settings(&conn), saved);
+    }
+
+    #[test]
+    fn translation_route_legacy_settings_keep_the_existing_fallback_policy() {
+        let route: TranslationRouteSettings = serde_json::from_value(serde_json::json!({
+            "primaryAiModelId": "__google_web__",
+            "googleWebEnabled": true,
+            "googleWebFirst": true
+        }))
+        .unwrap();
+        assert!(!route.google_web_only);
+        assert!(route.google_web_first);
+    }
+
+    #[test]
     fn translation_route_defaults_off_and_saves_google_order() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
@@ -1290,6 +1446,7 @@ mod tests {
                 primary_ai_model_id: None,
                 google_web_enabled: true,
                 google_web_first: true,
+                google_web_only: false,
             },
         )
         .unwrap();
@@ -1317,6 +1474,7 @@ mod tests {
                 primary_ai_model_id: Some(model_id.clone()),
                 google_web_enabled: true,
                 google_web_first: false,
+                google_web_only: false,
             },
         )
         .unwrap();
@@ -1341,6 +1499,7 @@ mod tests {
                 primary_ai_model_id: Some(GOOGLE_WEB_TRANSLATION_MODEL_ID.to_string()),
                 google_web_enabled: false,
                 google_web_first: false,
+                google_web_only: false,
             },
         )
         .unwrap();
@@ -1361,6 +1520,7 @@ mod tests {
             primary_ai_model_id: Some(GOOGLE_WEB_TRANSLATION_MODEL_ID.to_string()),
             google_web_enabled: true,
             google_web_first: true,
+            google_web_only: false,
         };
         let payload = serde_json::to_value(&route).unwrap();
 

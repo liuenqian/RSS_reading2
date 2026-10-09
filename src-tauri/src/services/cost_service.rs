@@ -153,11 +153,15 @@ pub fn current_month_summary(conn: &Connection) -> Result<CostSummary, String> {
     for r in rows.flatten() {
         let (usage_key, hit, miss, comp) = r;
         let (provider, model) = split_usage_key(&usage_key);
-        let cny = rates_for(&provider, &model).map(|rates| {
-            price(hit, rates.cache_hit_per_m)
-                + price(miss, rates.cache_miss_per_m)
-                + price(comp, rates.completion_per_m)
-        });
+        let cny = if provider == "google_web" {
+            Some(0.0)
+        } else {
+            rates_for(&provider, &model).map(|rates| {
+                price(hit, rates.cache_hit_per_m)
+                    + price(miss, rates.cache_miss_per_m)
+                    + price(comp, rates.completion_per_m)
+            })
+        };
         if let Some(value) = cny {
             total += value;
         } else {
@@ -182,6 +186,90 @@ pub fn current_month_summary(conn: &Connection) -> Result<CostSummary, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_connection() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cost_log (
+                month TEXT NOT NULL,
+                model TEXT NOT NULL,
+                prompt_cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+                prompt_cache_miss_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(month, model)
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn add_usage(conn: &Connection, provider: &str, model: &str, miss: i64, output: i64) {
+        record_usage(
+            conn,
+            provider,
+            model,
+            &TokenUsage {
+                prompt_cache_hit_tokens: 0,
+                prompt_cache_miss_tokens: miss,
+                completion_tokens: output,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn empty_month_has_zero_cost() {
+        let summary = current_month_summary(&test_connection()).unwrap();
+        assert_eq!(summary.total_cny, Some(0.0));
+        assert!(summary.breakdown.is_empty());
+    }
+
+    #[test]
+    fn google_web_only_has_zero_cost() {
+        let conn = test_connection();
+        add_usage(&conn, "google_web", "Google Translate", 0, 0);
+        let summary = current_month_summary(&conn).unwrap();
+        assert_eq!(summary.total_cny, Some(0.0));
+        assert_eq!(summary.breakdown.len(), 1);
+        assert_eq!(summary.breakdown[0].cny, Some(0.0));
+    }
+
+    #[test]
+    fn google_web_does_not_hide_known_api_cost() {
+        let conn = test_connection();
+        add_usage(&conn, "google_web", "Google Translate", 0, 0);
+        add_usage(&conn, "deepseek", "deepseek-chat", 1000, 500);
+        let summary = current_month_summary(&conn).unwrap();
+        assert!((summary.total_cny.unwrap() - 0.006).abs() < 1e-10);
+        assert_eq!(summary.breakdown.len(), 2);
+    }
+
+    #[test]
+    fn unknown_api_price_keeps_total_unknown_and_preserves_tokens() {
+        let conn = test_connection();
+        add_usage(&conn, "google_web", "Google Translate", 0, 0);
+        add_usage(&conn, "deepseek", "deepseek-chat", 1000, 500);
+        add_usage(&conn, "openai_compatible", "custom-model", 112781, 36982);
+        let summary = current_month_summary(&conn).unwrap();
+        assert_eq!(summary.total_cny, None);
+        let row = summary
+            .breakdown
+            .iter()
+            .find(|row| row.provider == "openai_compatible")
+            .unwrap();
+        assert_eq!(row.cny, None);
+        assert_eq!(row.prompt_cache_miss_tokens, 112781);
+        assert_eq!(row.completion_tokens, 36982);
+    }
+
+    #[test]
+    fn zero_tokens_from_unknown_api_do_not_imply_free_usage() {
+        let conn = test_connection();
+        add_usage(&conn, "openai_compatible", "custom-model", 0, 0);
+        let summary = current_month_summary(&conn).unwrap();
+        assert_eq!(summary.total_cny, None);
+        assert_eq!(summary.breakdown[0].cny, None);
+    }
 
     #[test]
     fn legacy_usage_keys_are_deepseek() {

@@ -260,12 +260,13 @@ fn capped_max_tokens(requested: i64, configured_limit: i64) -> i64 {
     requested.max(1).min(configured_limit.max(1))
 }
 
-pub async fn complete_with_messages(
+fn build_completion_request(
     settings: &DeepSeekSettings,
     messages: Vec<(String, String)>,
     temperature: f64,
     max_tokens: i64,
-) -> Result<TranslationOutput, String> {
+) -> Result<(String, Value), String> {
+    settings_service::validate_reasoning_effort(settings)?;
     let provider = settings_service::normalize_provider_id(&settings.provider);
     let max_tokens = capped_max_tokens(max_tokens, settings.context_output_tokens);
     if settings.base_url.trim().is_empty() {
@@ -350,10 +351,24 @@ pub async fn complete_with_messages(
                 body["max_tokens"] = Value::from(max_tokens);
                 body["temperature"] = Value::from(temperature);
             }
+            if let Some(effort) = settings.reasoning_effort {
+                body["reasoning_effort"] = serde_json::to_value(effort)
+                    .map_err(|error| format!("序列化思考等级失败: {}", error))?;
+            }
             (endpoint(&settings.base_url, "chat/completions"), body)
         }
     };
+    Ok((url, body))
+}
 
+pub async fn complete_with_messages(
+    settings: &DeepSeekSettings,
+    messages: Vec<(String, String)>,
+    temperature: f64,
+    max_tokens: i64,
+) -> Result<TranslationOutput, String> {
+    let provider = settings_service::normalize_provider_id(&settings.provider);
+    let (url, body) = build_completion_request(settings, messages, temperature, max_tokens)?;
     let client = translation_client()?;
 
     let request = client.post(&url).header("Content-Type", "application/json");
@@ -491,13 +506,64 @@ pub async fn translate_text_with_route(
     google_web_available: bool,
     text: &str,
 ) -> Result<RoutedTranslationOutput, String> {
+    translate_text_with_route_using(
+        settings,
+        route,
+        google_web_available,
+        text,
+        || translate_with_google_web(text),
+        || translate_text(settings, text),
+    )
+    .await
+}
+
+async fn translate_text_with_route_using<G, A, GF, AF>(
+    settings: &DeepSeekSettings,
+    route: &TranslationRouteSettings,
+    google_web_available: bool,
+    text: &str,
+    google_translate: G,
+    ai_translate: A,
+) -> Result<RoutedTranslationOutput, String>
+where
+    G: Fn() -> GF,
+    A: Fn() -> AF,
+    GF: std::future::Future<Output = Result<RoutedTranslationOutput, String>>,
+    AF: std::future::Future<Output = Result<TranslationOutput, String>>,
+{
+    if route.google_web_only {
+        let only_error = |message| format!("仅用 Google 模式：{}；未调用 AI API", message);
+        if !route.google_web_enabled {
+            return Err(only_error(
+                "Google 网页翻译未启用，请检查翻译设置".to_string(),
+            ));
+        }
+        let char_count = text.chars().count();
+        if char_count == 0 {
+            return Err(only_error("没有可翻译的文本".to_string()));
+        }
+        if char_count > GOOGLE_WEB_MAX_TEXT_CHARS {
+            return Err(only_error(format!(
+                "Google 网页翻译单次最多 {} 字符，当前 {} 字符；可改用 XLSX 网页文档翻译",
+                GOOGLE_WEB_MAX_TEXT_CHARS, char_count
+            )));
+        }
+        if !google_web_available {
+            return Err(only_error(format!(
+                "Google 网页翻译本机每日 {} 字符额度不足或已用尽，请稍后重试，或使用 XLSX 网页文档翻译",
+                settings_service::GOOGLE_WEB_DAILY_CHAR_LIMIT
+            )));
+        }
+        return google_translate().await.map_err(only_error);
+    }
+
     let google_enabled = route.google_web_enabled && google_web_available;
     let primary_ready = !settings.api_key.trim().is_empty();
 
     if google_enabled && route.google_web_first {
-        match translate_with_google_web(text).await {
+        match google_translate().await {
             Ok(output) => return Ok(output),
-            Err(google_error) if primary_ready => match translate_text(settings, text).await {
+            Err(google_error) if primary_ready => match ai_translate().await {
                 Ok(output) => return Ok(routed_primary_output(settings, output)),
                 Err(primary_error) => {
                     return Err(format!(
@@ -511,9 +577,9 @@ pub async fn translate_text_with_route(
     }
 
     if primary_ready {
-        match translate_text(settings, text).await {
+        match ai_translate().await {
             Ok(output) => return Ok(routed_primary_output(settings, output)),
-            Err(primary_error) if google_enabled => match translate_with_google_web(text).await {
+            Err(primary_error) if google_enabled => match google_translate().await {
                 Ok(output) => return Ok(output),
                 Err(google_error) => {
                     return Err(format!(
@@ -527,7 +593,7 @@ pub async fn translate_text_with_route(
     }
 
     if google_enabled {
-        return translate_with_google_web(text).await;
+        return google_translate().await;
     }
 
     if route.google_web_enabled {
@@ -607,6 +673,263 @@ pub async fn fetch_balance(settings: &DeepSeekSettings) -> Result<DeepSeekBalanc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn route_test_settings() -> DeepSeekSettings {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut settings = settings_service::get_provider_settings(&conn, "openai_compatible");
+        settings.api_key = "paid-api-test-key".to_string();
+        settings.base_url = "https://example.com/v1".to_string();
+        settings.model = "test-model".to_string();
+        settings
+    }
+
+    fn test_google_output() -> RoutedTranslationOutput {
+        RoutedTranslationOutput {
+            content: "Google 译文".to_string(),
+            usage: empty_usage(),
+            provider: "google_web".to_string(),
+            model: "Google Translate 网页接口（实验性）".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn translation_route_google_only_never_calls_ai_after_google_failures() {
+        use std::cell::Cell;
+        use std::future::ready;
+        let settings = route_test_settings();
+        let route = TranslationRouteSettings {
+            google_web_enabled: true,
+            google_web_first: true,
+            google_web_only: true,
+            ..Default::default()
+        };
+        for failure in [
+            "Google 网页翻译请求失败: network error".to_string(),
+            "Google 网页翻译请求失败 (429)".to_string(),
+            parse_google_web_translation(&serde_json::json!([[]]))
+                .err()
+                .unwrap(),
+        ] {
+            let google_calls = Cell::new(0);
+            let ai_calls = Cell::new(0);
+            let result = translate_text_with_route_using(
+                &settings,
+                &route,
+                true,
+                "hello",
+                || {
+                    google_calls.set(google_calls.get() + 1);
+                    ready(Err(failure.clone()))
+                },
+                || {
+                    ai_calls.set(ai_calls.get() + 1);
+                    ready(Ok(TranslationOutput {
+                        content: "付费译文".to_string(),
+                        usage: empty_usage(),
+                    }))
+                },
+            )
+            .await;
+            let error = result
+                .err()
+                .expect("Google-only failure must not fall back to AI");
+            assert!(error.contains(&failure));
+            assert!(error.contains("未调用 AI API"));
+            assert_eq!(google_calls.get(), 1);
+            assert_eq!(ai_calls.get(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn translation_route_google_only_rejects_limits_without_any_provider_requests() {
+        use std::cell::Cell;
+        use std::future::ready;
+        let settings = route_test_settings();
+        for (enabled, available, text, expected) in [
+            (true, false, "hello".to_string(), "每日 20000 字符额度"),
+            (
+                true,
+                false,
+                "a".repeat(GOOGLE_WEB_MAX_TEXT_CHARS + 1),
+                "单次最多 5000 字符",
+            ),
+            (true, false, String::new(), "没有可翻译的文本"),
+            (false, false, "hello".to_string(), "未启用"),
+        ] {
+            let route = TranslationRouteSettings {
+                google_web_enabled: enabled,
+                google_web_only: true,
+                ..Default::default()
+            };
+            let google_calls = Cell::new(0);
+            let ai_calls = Cell::new(0);
+            let result = translate_text_with_route_using(
+                &settings,
+                &route,
+                available,
+                &text,
+                || {
+                    google_calls.set(google_calls.get() + 1);
+                    ready(Ok(test_google_output()))
+                },
+                || {
+                    ai_calls.set(ai_calls.get() + 1);
+                    ready(Ok(TranslationOutput {
+                        content: "付费译文".to_string(),
+                        usage: empty_usage(),
+                    }))
+                },
+            )
+            .await;
+            let error = result.err().expect("limits must prevent provider requests");
+            assert!(error.contains(expected), "{error}");
+            assert!(error.contains("未调用 AI API"));
+            assert_eq!(google_calls.get(), 0);
+            assert_eq!(ai_calls.get(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn translation_route_google_only_uses_google_even_if_ai_is_first() {
+        use std::cell::Cell;
+        use std::future::ready;
+        let settings = route_test_settings();
+        let route = TranslationRouteSettings {
+            google_web_enabled: true,
+            google_web_only: true,
+            ..Default::default()
+        };
+        let google_calls = Cell::new(0);
+        let ai_calls = Cell::new(0);
+        let output = translate_text_with_route_using(
+            &settings,
+            &route,
+            true,
+            "hello",
+            || {
+                google_calls.set(google_calls.get() + 1);
+                ready(Ok(test_google_output()))
+            },
+            || {
+                ai_calls.set(ai_calls.get() + 1);
+                ready(Ok(TranslationOutput {
+                    content: "付费译文".to_string(),
+                    usage: empty_usage(),
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.provider, "google_web");
+        assert_eq!(output.content, "Google 译文");
+        assert_eq!(google_calls.get(), 1);
+        assert_eq!(ai_calls.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn translation_route_google_first_still_allows_explicit_ai_fallback() {
+        use std::cell::Cell;
+        use std::future::ready;
+        let settings = route_test_settings();
+        let route = TranslationRouteSettings {
+            google_web_enabled: true,
+            google_web_first: true,
+            ..Default::default()
+        };
+        let ai_calls = Cell::new(0);
+        let output = translate_text_with_route_using(
+            &settings,
+            &route,
+            true,
+            "hello",
+            || ready(Err("Google unavailable".to_string())),
+            || {
+                ai_calls.set(ai_calls.get() + 1);
+                ready(Ok(TranslationOutput {
+                    content: "付费译文".to_string(),
+                    usage: empty_usage(),
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.provider, settings.provider);
+        assert_eq!(output.content, "付费译文");
+        assert_eq!(ai_calls.get(), 1);
+    }
+
+    #[test]
+    fn reasoning_effort_is_optional_for_legacy_settings_and_requests() {
+        let settings: DeepSeekSettings = serde_json::from_value(serde_json::json!({
+            "provider": "openai_compatible",
+            "api_key": "test-key",
+            "base_url": "https://example.com/v1",
+            "model": "gpt-6.1-sol",
+            "system_prompt": "Translate to Chinese",
+            "read_retention_days": 0
+        }))
+        .unwrap();
+        assert_eq!(settings.reasoning_effort, None);
+
+        let (url, body) = build_completion_request(
+            &settings,
+            vec![("user".to_string(), "hello".to_string())],
+            0.2,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(url, "https://example.com/v1/chat/completions");
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["messages"][0]["content"], "hello");
+        assert_eq!(body["max_tokens"], 1000);
+    }
+
+    #[test]
+    fn reasoning_effort_is_sent_for_openai_and_custom_requests() {
+        use crate::models::ReasoningEffort;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for provider in ["openai", "openai_compatible"] {
+            let mut settings = settings_service::get_provider_settings(&conn, provider);
+            settings.base_url = "https://example.com/v1".to_string();
+            settings.model = "gpt-6.1-sol".to_string();
+            for (effort, expected) in [
+                (ReasoningEffort::Low, "low"),
+                (ReasoningEffort::Medium, "medium"),
+                (ReasoningEffort::High, "high"),
+                (ReasoningEffort::Xhigh, "xhigh"),
+                (ReasoningEffort::Max, "max"),
+            ] {
+                settings.reasoning_effort = Some(effort);
+                let (_, body) = build_completion_request(
+                    &settings,
+                    vec![("user".to_string(), "hello".to_string())],
+                    0.2,
+                    1000,
+                )
+                .unwrap();
+                assert_eq!(body["reasoning_effort"], expected);
+                let token_key = if provider == "openai" {
+                    "max_completion_tokens"
+                } else {
+                    "max_tokens"
+                };
+                assert_eq!(body[token_key], 1000);
+            }
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_is_rejected_for_unsupported_providers_before_requests() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for provider in ["deepseek", "anthropic", "gemini"] {
+            let mut settings = settings_service::get_provider_settings(&conn, provider);
+            let (_, body) = build_completion_request(&settings, vec![], 0.2, 1000).unwrap();
+            assert!(body.get("reasoning_effort").is_none());
+            settings.reasoning_effort = Some(crate::models::ReasoningEffort::High);
+            let error = build_completion_request(&settings, vec![], 0.2, 1000).unwrap_err();
+            assert!(error.contains("思考等级目前仅支持"));
+        }
+    }
 
     #[test]
     fn parses_google_web_translation_segments() {
